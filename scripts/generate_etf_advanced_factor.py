@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""Generate advanced factor parquet files for A-share minute data."""
+"""Generate advanced factor parquet files for ETF minute data."""
 
 import argparse
 import logging
@@ -26,23 +26,25 @@ from factor.advanced_runtime import (  # noqa: E402
 )
 
 
-LOGGER = logging.getLogger("generate_stock_advanced_factor")
+LOGGER = logging.getLogger("generate_etf_advanced_factor")
 
-DEFAULT_MINUTE_ROOT = Path(r"D:\workspace\stockdata\a-share-data")
+DEFAULT_MINUTE_ROOT = Path(r"D:\workspace\stockdata\etf-data")
 DEFAULT_TICK_ROOT = Path(r"E:\逐笔数据")
-DEFAULT_OUTPUT_ROOT = Path(r"D:\workspace\stockdata\a-share-data\stock_advanced_factors")
+DEFAULT_OUTPUT_ROOT = Path(
+    r"D:\workspace\stockdata\etf-data\etf_1min_advanced_factors"
+)
 SYMBOL_FILE_PATTERN = re.compile(r"^\d{6}\.[A-Z]{2}$")
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Generate advanced factor parquet files from stock minute data."
+        description="Generate advanced factor parquet files from ETF minute data."
     )
     parser.add_argument(
         "--minute-root",
         type=Path,
         default=DEFAULT_MINUTE_ROOT,
-        help="Directory containing stock minute parquet files, or the parent that holds stock_1min.",
+        help="Directory containing ETF minute parquet files, or the parent that holds etf_1min.",
     )
     parser.add_argument(
         "--tick-root",
@@ -60,7 +62,7 @@ def parse_args() -> argparse.Namespace:
         "--symbols",
         nargs="*",
         default=None,
-        help="Optional symbols such as 000001.SZ 600000.SH.",
+        help="Optional ETF symbols such as 159001.SZ 510300.SH.",
     )
     parser.add_argument(
         "--limit",
@@ -113,7 +115,7 @@ def configure_logging() -> None:
 
 
 def resolve_minute_root(minute_root: Path) -> Path:
-    candidate = minute_root / "stock_1min"
+    candidate = minute_root / "etf_1min"
     if candidate.exists() and candidate.is_dir():
         return candidate
     return minute_root
@@ -165,7 +167,7 @@ def main() -> int:
     if not args.skip_tick_check and not args.tick_root.exists():
         LOGGER.warning("Tick root does not exist: %s", args.tick_root)
 
-    LOGGER.info("Processing %s stock minute parquet files", len(files))
+    LOGGER.info("Processing %s ETF minute parquet files", len(files))
     if date_from or date_to:
         LOGGER.info(
             "Applying trade-date filter: [%s, %s]",
