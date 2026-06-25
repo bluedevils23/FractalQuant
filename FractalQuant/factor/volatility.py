@@ -7,28 +7,36 @@ from typing import List, Dict, Optional
 from scipy import stats
 from .base import VolatilityFactor
 
+# A股每个交易日的分钟bar数（4小时交易时段）。年化时使用 252 个交易日。
+# 这些因子运行在分钟频率数据上，因此年化基准为 sqrt(252 * 240)。
+TRADING_DAYS_PER_YEAR = 252
+BARS_PER_DAY = 240
+PERIODS_PER_YEAR = TRADING_DAYS_PER_YEAR * BARS_PER_DAY
+
 class HistoricalVolatilityFactor(VolatilityFactor):
     """历史波动率因子"""
-    
-    def __init__(self, window: int = 20):
+
+    def __init__(self, window: int = 20, periods_per_year: int = PERIODS_PER_YEAR):
         super().__init__('historical_volatility', window)
-        
+        self.periods_per_year = periods_per_year
+
     def calculate(self, df: pd.DataFrame) -> pd.Series:
-        """计算历史波动率"""
+        """计算历史波动率（按分钟频率年化）"""
         log_returns = np.log(df['close'] / df['close'].shift(1))
-        volatility = log_returns.rolling(window=self.window).std() * np.sqrt(252 * 24 * 60)
+        volatility = log_returns.rolling(window=self.window).std() * np.sqrt(self.periods_per_year)
         return volatility
 
 class AnnualizedVolatilityFactor(VolatilityFactor):
     """年化波动率因子"""
-    
-    def __init__(self, window: int = 20):
+
+    def __init__(self, window: int = 20, periods_per_year: int = PERIODS_PER_YEAR):
         super().__init__('annualized_volatility', window)
-        
+        self.periods_per_year = periods_per_year
+
     def calculate(self, df: pd.DataFrame) -> pd.Series:
-        """计算年化波动率"""
+        """计算年化波动率（按分钟频率年化）"""
         log_returns = np.log(df['close'] / df['close'].shift(1))
-        volatility = log_returns.rolling(window=self.window).std() * np.sqrt(252)
+        volatility = log_returns.rolling(window=self.window).std() * np.sqrt(self.periods_per_year)
         return volatility
 
 class RealizedVolatilityFactor(VolatilityFactor):
@@ -65,11 +73,14 @@ class GarmanKlassVolatilityFactor(VolatilityFactor):
         """计算Garman-Klass波动率"""
         log_high_low = np.log(df['high'] / df['low'])
         log_close_open = np.log(df['close'] / df['open'])
-        
-        volatility = np.sqrt(
-            0.5 * (log_high_low ** 2).rolling(window=self.window).mean() - 
+
+        variance = (
+            0.5 * (log_high_low ** 2).rolling(window=self.window).mean() -
             (2 * np.log(2) - 1) * (log_close_open ** 2).rolling(window=self.window).mean()
         )
+        # GK方差在close-open跳动远大于high-low时可能为负，开方前先截断到0，
+        # 避免 sqrt(负数) 静默产生NaN而丢失信息。
+        volatility = np.sqrt(variance.clip(lower=0.0))
         return volatility
 
 class BollingerBandWidthFactor(VolatilityFactor):
@@ -115,8 +126,8 @@ class VolatilityRegimeFactor(VolatilityFactor):
         
     def calculate(self, df: pd.DataFrame) -> pd.Series:
         """计算波动率 regimes"""
-        short_vol = df['close'].pct_change().rolling(window=self.short_window).std()
-        long_vol = df['close'].pct_change().rolling(window=self.long_window).std()
+        short_vol = df['close'].pct_change(fill_method=None).rolling(window=self.short_window).std()
+        long_vol = df['close'].pct_change(fill_method=None).rolling(window=self.long_window).std()
         
         regime = short_vol / long_vol
         return regime

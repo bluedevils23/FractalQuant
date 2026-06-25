@@ -9,6 +9,88 @@ from scipy.signal import savgol_filter
 from scipy.ndimage import gaussian_filter1d
 from .base import BaseFactor
 
+
+def _embed_series(values: np.ndarray, dim: int, delay: int = 1) -> np.ndarray:
+    """Build a simple delay embedding matrix."""
+    n_vectors = len(values) - (dim - 1) * delay
+    if n_vectors <= 0:
+        return np.empty((0, dim))
+    return np.column_stack(
+        [values[i * delay:i * delay + n_vectors] for i in range(dim)]
+    )
+
+
+def _pairwise_distances(points: np.ndarray) -> np.ndarray:
+    """Compute Euclidean pairwise distances for a small matrix."""
+    deltas = points[:, None, :] - points[None, :, :]
+    return np.sqrt(np.sum(deltas * deltas, axis=2))
+
+
+class FutureReturnsFactor(BaseFactor):
+    """Forward return label used by factor analysis workflows."""
+
+    def __init__(self, window: int = 5):
+        super().__init__('future_returns', window)
+
+    def calculate(self, df: pd.DataFrame) -> pd.Series:
+        close = np.log(df['close'].astype(float))
+        return close.shift(-self.window) / close - 1
+
+
+class CorrelationFactor(BaseFactor):
+    """Rolling autocorrelation of returns."""
+
+    def __init__(self, window: int = 20, lag: int = 1):
+        super().__init__('correlation', window)
+        self.lag = lag
+
+    def calculate(self, df: pd.DataFrame) -> pd.Series:
+        returns = df['close'].pct_change(fill_method=None)
+        return returns.rolling(window=self.window).corr(returns.shift(self.lag))
+
+
+class HurstExponentFactor(BaseFactor):
+    """Estimate the Hurst exponent from lagged log-price differences."""
+
+    def __init__(self, window: int = 50, max_lag: Optional[int] = None):
+        super().__init__('hurst_exponent', window)
+        self.max_lag = max_lag
+
+    def calculate(self, df: pd.DataFrame) -> pd.Series:
+        log_price = np.log(df['close'].astype(float))
+
+        def calc_hurst(x: np.ndarray) -> float:
+            values = np.asarray(x, dtype=float)
+            if len(values) < 20:
+                return 0.5
+
+            max_lag = self.max_lag or min(20, len(values) // 2)
+            if max_lag < 4:
+                return 0.5
+
+            lags = []
+            tau = []
+
+            for lag in range(2, max_lag + 1):
+                diff = values[lag:] - values[:-lag]
+                if len(diff) < 2:
+                    continue
+
+                std = np.std(diff)
+                if std <= 0 or not np.isfinite(std):
+                    continue
+
+                lags.append(lag)
+                tau.append(np.sqrt(std))
+
+            if len(tau) < 3:
+                return 0.5
+
+            slope = np.polyfit(np.log(lags), np.log(tau), 1)[0]
+            return float(np.clip(slope, 0.0, 1.5))
+
+        return log_price.rolling(window=self.window).apply(calc_hurst, raw=True)
+
 class LyapunovExponentFactor(BaseFactor):
     """李雅普诺夫指数因子（混沌理论）"""
     
@@ -18,27 +100,67 @@ class LyapunovExponentFactor(BaseFactor):
         
     def calculate(self, df: pd.DataFrame) -> pd.Series:
         """计算李雅普诺夫指数（衡量系统混沌程度）"""
-        log_price = np.log(df['close'])
-        
-        def calc_lyapunov(x):
-            if len(x) < 20:
-                return 0
-            
-            n = len(x)
-            diffs = np.diff(x)
-            log_diffs = np.log(np.abs(diffs) + self.min_separation)
-            
-            if len(log_diffs) < 10:
-                return 0
-                
-            try:
-                slope, _ = stats.linregress(np.arange(len(log_diffs)), log_diffs)[:2]
-                return slope
-            except:
-                return 0
-        
-        lyapunov = log_price.rolling(window=self.window).apply(calc_lyapunov)
-        return lyapunov
+        log_price = np.log(df['close'].astype(float))
+
+        def calc_lyapunov(x: np.ndarray) -> float:
+            values = np.asarray(x, dtype=float)
+            if len(values) < 20:
+                return 0.0
+
+            scale = np.std(values)
+            if scale <= 0 or not np.isfinite(scale):
+                return 0.0
+
+            normalized = (values - np.mean(values)) / scale
+            embedded = _embed_series(normalized, dim=2)
+            if len(embedded) < 10:
+                return 0.0
+
+            max_horizon = min(5, len(embedded) // 3)
+            if max_horizon < 2:
+                return 0.0
+
+            horizons = []
+            divergences = []
+
+            for horizon in range(1, max_horizon + 1):
+                usable = len(embedded) - horizon
+                if usable < 5:
+                    break
+
+                step_logs = []
+                for i in range(usable):
+                    distances = np.linalg.norm(embedded[:usable] - embedded[i], axis=1)
+                    distances[max(0, i - 2):min(usable, i + 3)] = np.inf
+
+                    neighbor = int(np.argmin(distances))
+                    initial_distance = distances[neighbor]
+                    if not np.isfinite(initial_distance) or initial_distance <= self.min_separation:
+                        continue
+
+                    future_distance = np.linalg.norm(
+                        embedded[i + horizon] - embedded[neighbor + horizon]
+                    )
+                    if future_distance <= 0 or not np.isfinite(future_distance):
+                        continue
+
+                    step_logs.append(
+                        np.log(
+                            (future_distance + self.min_separation)
+                            / (initial_distance + self.min_separation)
+                        )
+                    )
+
+                if step_logs:
+                    horizons.append(horizon)
+                    divergences.append(float(np.mean(step_logs)))
+
+            if len(divergences) < 2:
+                return 0.0
+
+            return float(np.polyfit(horizons, divergences, 1)[0])
+
+        return log_price.rolling(window=self.window).apply(calc_lyapunov, raw=True)
 
 class RecurrenceRateFactor(BaseFactor):
     """复发率因子（非线性动力学）"""
@@ -49,25 +171,24 @@ class RecurrenceRateFactor(BaseFactor):
         
     def calculate(self, df: pd.DataFrame) -> pd.Series:
         """计算复发率（衡量系统重复状态的频率）"""
-        close = df['close']
-        
-        def calc_recurrence(x):
-            if len(x) < 10:
-                return 0
-            
-            n = len(x)
-            recurrence_count = 0
-            
-            for i in range(n - 5):
-                for j in range(i + 5, n):
-                    if abs(x[i] - x[j]) < self.threshold * np.std(x):
-                        recurrence_count += 1
-            
-            total_pairs = n * (n - 1) / 2
-            return recurrence_count / total_pairs if total_pairs > 0 else 0
-        
-        recurrence = close.rolling(window=self.window).apply(calc_recurrence)
-        return recurrence
+        close = np.log(df['close'].astype(float))
+
+        def calc_recurrence(x: np.ndarray) -> float:
+            values = np.asarray(x, dtype=float)
+            if len(values) < 10:
+                return 0.0
+
+            scale = np.std(values)
+            if scale <= 0 or not np.isfinite(scale):
+                return 0.0
+
+            normalized = (values - np.mean(values)) / scale
+            distances = np.abs(normalized[:, None] - normalized[None, :])
+            np.fill_diagonal(distances, np.inf)
+            recurrence = distances < self.threshold
+            return float(recurrence.sum() / (len(values) * (len(values) - 1)))
+
+        return close.rolling(window=self.window).apply(calc_recurrence, raw=True)
 
 class EmbeddingDimensionFactor(BaseFactor):
     """嵌入维度因子（相空间重构）"""
@@ -78,50 +199,55 @@ class EmbeddingDimensionFactor(BaseFactor):
         
     def calculate(self, df: pd.DataFrame) -> pd.Series:
         """计算嵌入维度（用于相空间重构）"""
-        close = df['close']
-        
-        def calc_embedding_dim(x):
-            if len(x) < 20:
-                return 5
-            
-            n = len(x)
+        close = np.log(df['close'].astype(float))
+
+        def calc_embedding_dim(x: np.ndarray) -> float:
+            values = np.asarray(x, dtype=float)
+            if len(values) < 20:
+                return 2.0
+
+            scale = np.std(values)
+            if scale <= 0 or not np.isfinite(scale):
+                return 2.0
+
+            normalized = (values - np.mean(values)) / scale
             min_dim = 2
-            max_dim = min(self.max_dim, n // 3)
-            
+            max_dim = min(self.max_dim, len(normalized) // 4)
+
             if max_dim < min_dim:
-                return 5
-            
-            false_neighbors = []
-            
+                return float(min_dim)
+
             for dim in range(min_dim, max_dim + 1):
-                embedded = np.array([x[i:i+dim] for i in range(n - dim)])
-                
-                false_count = 0
-                total_count = len(embedded)
-                
-                for i in range(len(embedded)):
-                    distances = np.linalg.norm(embedded - embedded[i], axis=1)
-                    nearest_idx = np.argsort(distances)[1]
-                    
-                    if i + 1 < len(embedded):
-                        embedded_next = np.array([x[i:i+dim+1] for i in range(n - dim - 1)])
-                        if len(embedded_next) > nearest_idx:
-                            dist_high = np.linalg.norm(embedded_next[i] - embedded_next[nearest_idx])
-                            dist_low = distances[nearest_idx]
-                            
-                            if dist_high > 2 * dist_low:
-                                false_count += 1
-                
-                false_rate = false_count / total_count if total_count > 0 else 1
-                false_neighbors.append(false_rate)
-                
-                if false_rate < 0.1 and dim > min_dim:
-                    return dim
-            
-            return max_dim if false_neighbors else 5
-        
-        embedding_dim = close.rolling(window=self.window).apply(calc_embedding_dim)
-        return embedding_dim
+                embedded = _embed_series(normalized, dim)
+                embedded_next = _embed_series(normalized, dim + 1)
+                usable = min(len(embedded), len(embedded_next))
+
+                if usable < 8:
+                    break
+
+                embedded = embedded[:usable]
+                embedded_next = embedded_next[:usable]
+                distances = _pairwise_distances(embedded)
+                np.fill_diagonal(distances, np.inf)
+
+                nearest_idx = np.argmin(distances, axis=1)
+                base_distance = distances[np.arange(usable), nearest_idx]
+                high_distance = np.linalg.norm(
+                    embedded_next - embedded_next[nearest_idx],
+                    axis=1,
+                )
+
+                valid = np.isfinite(base_distance) & (base_distance > 1e-12)
+                if not np.any(valid):
+                    continue
+
+                false_rate = np.mean((high_distance[valid] / base_distance[valid]) > 10.0)
+                if false_rate < 0.1:
+                    return float(dim)
+
+            return float(max_dim)
+
+        return close.rolling(window=self.window).apply(calc_embedding_dim, raw=True)
 
 class CorrelationDimensionFactor(BaseFactor):
     """关联维度因子（分形维度）"""
@@ -133,40 +259,50 @@ class CorrelationDimensionFactor(BaseFactor):
         
     def calculate(self, df: pd.DataFrame) -> pd.Series:
         """计算关联维度（Grassberger-Procaccia算法）"""
-        close = df['close']
-        
-        def calc_corr_dim(x):
-            if len(x) < 30:
-                return 2.0
-            
-            n = len(x)
-            x_normalized = (x - np.mean(x)) / (np.std(x) + 1e-8)
-            
-            r_values = np.logspace(np.log10(self.min_r), np.log10(self.max_r), 20)
-            log_r = np.log(r_values)
-            
-            log_c = []
+        close = np.log(df['close'].astype(float))
+
+        def calc_corr_dim(x: np.ndarray) -> float:
+            values = np.asarray(x, dtype=float)
+            if len(values) < 30:
+                return 0.0
+
+            scale = np.std(values)
+            if scale <= 0 or not np.isfinite(scale):
+                return 0.0
+
+            normalized = (values - np.mean(values)) / scale
+            embedded = _embed_series(normalized, dim=2)
+            if len(embedded) < 10:
+                return 0.0
+
+            distances = _pairwise_distances(embedded)
+            upper = distances[np.triu_indices(len(embedded), k=1)]
+            upper = upper[np.isfinite(upper) & (upper > 0)]
+            if len(upper) < 10:
+                return 0.0
+
+            r_low = max(self.min_r, float(np.percentile(upper, 10)))
+            r_high = min(self.max_r, float(np.percentile(upper, 90)))
+            if r_high <= r_low:
+                return 0.0
+
+            r_values = np.logspace(np.log10(r_low), np.log10(r_high), 8)
+            valid_r = []
+            valid_c = []
+
             for r in r_values:
-                count = 0
-                for i in range(n):
-                    for j in range(i + 1, n):
-                        if abs(x_normalized[i] - x_normalized[j]) < r:
-                            count += 1
-                c = count / (n * (n - 1) / 2)
-                if c > 0:
-                    log_c.append(np.log(c))
-            
-            if len(log_c) < 5:
-                return 2.0
-            
-            try:
-                slope, _ = stats.linregress(log_r[:len(log_c)], log_c)[:2]
-                return max(0.1, slope)
-            except:
-                return 2.0
-        
-        corr_dim = close.rolling(window=self.window).apply(calc_corr_dim)
-        return corr_dim
+                c_r = np.mean(upper < r)
+                if 0 < c_r < 1:
+                    valid_r.append(r)
+                    valid_c.append(c_r)
+
+            if len(valid_c) < 3:
+                return 0.0
+
+            slope = np.polyfit(np.log(valid_r), np.log(valid_c), 1)[0]
+            return float(max(0.0, slope))
+
+        return close.rolling(window=self.window).apply(calc_corr_dim, raw=True)
 
 class KolmogorovEntropyFactor(BaseFactor):
     """科尔莫哥洛夫熵因子（动力学系统）"""
@@ -178,44 +314,51 @@ class KolmogorovEntropyFactor(BaseFactor):
         
     def calculate(self, df: pd.DataFrame) -> pd.Series:
         """计算科尔莫哥洛夫熵（衡量系统复杂度）"""
-        close = df['close']
-        
-        def calc_kolmogorov_entropy(x):
-            if len(x) < 50:
-                return 0
-            
-            n = len(x)
-            
-            embedded = np.array([x[i:i+self.m] for i in range(n - self.m)])
-            
-            if len(embedded) < 100:
-                return 0
-            
-            tau_values = [1, 2, 3, 5, 10]
-            entropy_estimates = []
-            
-            for tau in tau_values:
-                if tau >= len(embedded) // 2:
-                    continue
-                    
-                match_count = 0
-                total_count = len(embedded)
-                
-                for i in range(len(embedded) - tau):
-                    for j in range(i + tau, len(embedded)):
-                        if np.max(np.abs(embedded[i] - embedded[j])) < self.r:
-                            match_count += 1
-                
-                p_match = match_count / total_count if total_count > 0 else 0
-                
-                if p_match > 0 and p_match < 1:
-                    ks_entropy = -np.log(p_match) / tau
-                    entropy_estimates.append(max(0, ks_entropy))
-            
-            return np.mean(entropy_estimates) if entropy_estimates else 0
-        
-        entropy = close.rolling(window=self.window).apply(calc_kolmogorov_entropy)
-        return entropy
+        close = np.log(df['close'].astype(float))
+
+        def calc_kolmogorov_entropy(x: np.ndarray) -> float:
+            values = np.asarray(x, dtype=float)
+            if len(values) < self.m + 10:
+                return 0.0
+
+            returns = np.diff(values)
+            if len(returns) < self.m + 5:
+                return 0.0
+
+            tolerance = self.r * np.std(returns)
+            if tolerance <= 0 or not np.isfinite(tolerance):
+                return 0.0
+
+            templates_m = np.array(
+                [returns[i:i + self.m] for i in range(len(returns) - self.m + 1)]
+            )
+            templates_m1 = np.array(
+                [returns[i:i + self.m + 1] for i in range(len(returns) - self.m)]
+            )
+
+            if len(templates_m) < 2 or len(templates_m1) < 2:
+                return 0.0
+
+            diff_m = np.max(
+                np.abs(templates_m[:, None, :] - templates_m[None, :, :]),
+                axis=2,
+            )
+            diff_m1 = np.max(
+                np.abs(templates_m1[:, None, :] - templates_m1[None, :, :]),
+                axis=2,
+            )
+            np.fill_diagonal(diff_m, np.inf)
+            np.fill_diagonal(diff_m1, np.inf)
+
+            b = np.mean(diff_m <= tolerance)
+            a = np.mean(diff_m1 <= tolerance)
+
+            if a <= 0 or b <= 0:
+                return 0.0
+
+            return float(max(0.0, -np.log(a / b)))
+
+        return close.rolling(window=self.window).apply(calc_kolmogorov_entropy, raw=True)
 
 class MultifractalSpectrumFactor(BaseFactor):
     """多尺度谱因子（分形分析）"""
@@ -226,33 +369,42 @@ class MultifractalSpectrumFactor(BaseFactor):
         
     def calculate(self, df: pd.DataFrame) -> pd.Series:
         """计算多尺度谱（衡量分形复杂度）"""
-        close = df['close']
-        
-        def calc_multifractal(x):
-            if len(x) < 100:
-                return 0
-            
-            q_values = self.q_values
+        close = np.log(df['close'].astype(float))
+
+        def calc_multifractal(x: np.ndarray) -> float:
+            values = np.asarray(x, dtype=float)
+            if len(values) < 40:
+                return 0.0
+
+            returns = np.abs(np.diff(values))
+            if len(returns) < 20:
+                return 0.0
+
+            total = returns.sum()
+            if total <= 0 or not np.isfinite(total):
+                return 0.0
+
+            probs = returns / total
+            probs = probs[probs > 0]
+            if len(probs) < 5:
+                return 0.0
+
             spectrum = []
-            
-            for q in q_values:
-                if q == 0:
-                    hist, _ = np.histogram(x, bins=10)
-                    prob = hist / hist.sum()
-                    prob = prob[prob > 0]
-                    d_q = -np.log(np.sum(prob ** q)) / (q - 1) if q != 1 else np.exp(-np.sum(prob * np.log(prob)))
+            for q in self.q_values:
+                if np.isclose(q, 1.0):
+                    d_q = -np.sum(probs * np.log(probs))
+                elif np.isclose(q, 0.0):
+                    d_q = np.log(len(probs))
                 else:
-                    d_q = np.log(np.sum(prob ** q)) / (q - 1) if q != 1 else 0
-                
-                spectrum.append(d_q)
-            
-            if len(spectrum) > 1:
-                spectrum_width = max(spectrum) - min(spectrum)
-                return spectrum_width
-            return 0
-        
-        multifractal = close.rolling(window=self.window).apply(calc_multifractal)
-        return multifractal
+                    d_q = np.log(np.sum(probs ** q)) / (1.0 - q)
+                if np.isfinite(d_q):
+                    spectrum.append(float(d_q))
+
+            if len(spectrum) < 2:
+                return 0.0
+            return float(max(spectrum) - min(spectrum))
+
+        return close.rolling(window=self.window).apply(calc_multifractal, raw=True)
 
 class DetrendedFluctuationFactor(BaseFactor):
     """去趋势波动分析因子"""
@@ -263,60 +415,46 @@ class DetrendedFluctuationFactor(BaseFactor):
         
     def calculate(self, df: pd.DataFrame) -> pd.Series:
         """计算DFA指数（衡量长程相关性）"""
-        close = df['close']
-        
-        def calc_dfa(x):
-            if len(x) < 100:
+        close = np.log(df['close'].astype(float))
+
+        def calc_dfa(x: np.ndarray) -> float:
+            values = np.asarray(x, dtype=float)
+            if len(values) < 20:
                 return 0.5
-            
-            y = np.cumsum(x - np.mean(x))
-            
-            scales = self.scales
-            fluc = []
-            
-            for scale in scales:
-                if scale * 2 > len(y):
+
+            profile = np.cumsum(values - np.mean(values))
+            valid_scales = []
+            fluctuations = []
+
+            for scale in self.scales:
+                if scale < 4 or scale * 2 > len(profile):
                     continue
-                    
-                n_segments = len(y) // scale
+
+                n_segments = len(profile) // scale
+                if n_segments < 2:
+                    continue
+
                 segment_fluc = []
-                
+                x_vals = np.arange(scale, dtype=float)
                 for i in range(n_segments):
-                    start = i * scale
-                    end = start + scale
-                    
-                    if end > len(y):
-                        continue
-                    
-                    x_vals = np.arange(scale)
-                    y_vals = y[start:end]
-                    
-                    try:
-                        slope, intercept = np.polyfit(x_vals, y_vals, 1)
-                        trend = slope * x_vals + intercept
-                        residual = y_vals - trend
-                        rms = np.sqrt(np.mean(residual ** 2))
+                    segment = profile[i * scale:(i + 1) * scale]
+                    coeffs = np.polyfit(x_vals, segment, 1)
+                    trend = np.polyval(coeffs, x_vals)
+                    rms = np.sqrt(np.mean((segment - trend) ** 2))
+                    if np.isfinite(rms) and rms > 0:
                         segment_fluc.append(rms)
-                    except:
-                        continue
-                
+
                 if segment_fluc:
-                    fluc.append(np.mean(segment_fluc))
-            
-            if len(fluc) < 3:
+                    valid_scales.append(scale)
+                    fluctuations.append(float(np.mean(segment_fluc)))
+
+            if len(fluctuations) < 3:
                 return 0.5
-            
-            log_scales = np.log(self.scales[:len(fluc)])
-            log_fluc = np.log(fluc)
-            
-            try:
-                slope, _ = stats.linregress(log_scales, log_fluc)[:2]
-                return max(0.1, min(1.9, slope))
-            except:
-                return 0.5
-        
-        dfa = close.rolling(window=self.window).apply(calc_dfa)
-        return dfa
+
+            slope = np.polyfit(np.log(valid_scales), np.log(fluctuations), 1)[0]
+            return float(np.clip(slope, 0.1, 1.9))
+
+        return close.rolling(window=self.window).apply(calc_dfa, raw=True)
 
 class WaveletEntropyFactor(BaseFactor):
     """小波熵因子"""
@@ -327,44 +465,37 @@ class WaveletEntropyFactor(BaseFactor):
         
     def calculate(self, df: pd.DataFrame) -> pd.Series:
         """计算小波熵（时频分析）"""
-        close = df['close']
-        
-        def calc_wavelet_entropy(x):
-            if len(x) < 32:
-                return 0
-            
-            returns = np.diff(x)
-            
-            scales = [2, 4, 8, 16]
-            entropies = []
-            
-            for scale in scales:
-                if len(returns) < scale * 2:
-                    continue
-                    
-                n_segments = len(returns) // scale
-                segment_entropies = []
-                
-                for i in range(n_segments):
-                    segment = returns[i*scale:(i+1)*scale]
-                    if len(segment) < 5:
-                        continue
-                    
-                    hist, _ = np.histogram(segment, bins=10)
-                    prob = hist / hist.sum()
-                    prob = prob[prob > 0]
-                    
-                    if len(prob) > 0:
-                        entropy = -np.sum(prob * np.log2(prob + 1e-10))
-                        segment_entropies.append(entropy)
-                
-                if segment_entropies:
-                    entropies.append(np.mean(segment_entropies))
-            
-            return np.mean(entropies) if entropies else 0
-        
-        wavelet_entropy = close.rolling(window=self.window).apply(calc_wavelet_entropy)
-        return wavelet_entropy
+        close = np.log(df['close'].astype(float))
+
+        def calc_wavelet_entropy(x: np.ndarray) -> float:
+            values = np.asarray(x, dtype=float)
+            if len(values) < 16:
+                return 0.0
+
+            detail_energies = []
+            signal = np.diff(values)
+            while len(signal) >= 4:
+                even = signal[::2]
+                odd = signal[1::2]
+                size = min(len(even), len(odd))
+                if size < 2:
+                    break
+
+                approx = (even[:size] + odd[:size]) / np.sqrt(2.0)
+                detail = (even[:size] - odd[:size]) / np.sqrt(2.0)
+                energy = float(np.sum(detail ** 2))
+                if energy > 0 and np.isfinite(energy):
+                    detail_energies.append(energy)
+                signal = approx
+
+            if not detail_energies:
+                return 0.0
+
+            probs = np.asarray(detail_energies) / np.sum(detail_energies)
+            probs = probs[probs > 0]
+            return float(-np.sum(probs * np.log(probs)))
+
+        return close.rolling(window=self.window).apply(calc_wavelet_entropy, raw=True)
 
 class PhaseSpaceVolumeFactor(BaseFactor):
     """相空间体积因子"""
@@ -376,37 +507,31 @@ class PhaseSpaceVolumeFactor(BaseFactor):
         
     def calculate(self, df: pd.DataFrame) -> pd.Series:
         """计算相空间体积（系统复杂度度量）"""
-        close = df['close']
-        
-        def calc_phase_volume(x):
-            if len(x) < self.dim * 10:
-                return 0
-            
-            n = len(x)
-            
-            embedded = np.array([x[i:i+self.dim] for i in range(n - self.dim)])
-            
-            if len(embedded) < 100:
-                return 0
-            
-            distances = []
-            for i in range(len(embedded)):
-                for j in range(i + 1, len(embedded)):
-                    dist = np.linalg.norm(embedded[i] - embedded[j])
-                    distances.append(dist)
-            
-            if not distances:
-                return 0
-            
-            count_in_sphere = sum(1 for d in distances if d < self.r)
-            total_pairs = len(distances)
-            
-            volume = count_in_sphere / total_pairs if total_pairs > 0 else 0
-            
-            return volume * 100
-        
-        phase_volume = close.rolling(window=self.window).apply(calc_phase_volume)
-        return phase_volume
+        close = np.log(df['close'].astype(float))
+
+        def calc_phase_volume(x: np.ndarray) -> float:
+            values = np.asarray(x, dtype=float)
+            if len(values) < self.dim * 6:
+                return 0.0
+
+            scale = np.std(values)
+            if scale <= 0 or not np.isfinite(scale):
+                return 0.0
+
+            normalized = (values - np.mean(values)) / scale
+            embedded = _embed_series(normalized, self.dim)
+            if len(embedded) < 8:
+                return 0.0
+
+            distances = _pairwise_distances(embedded)
+            upper = distances[np.triu_indices(len(embedded), k=1)]
+            upper = upper[np.isfinite(upper)]
+            if len(upper) == 0:
+                return 0.0
+
+            return float(np.mean(upper < self.r))
+
+        return close.rolling(window=self.window).apply(calc_phase_volume, raw=True)
 
 class PoincareSectionFactor(BaseFactor):
     """庞加莱截面因子（非线性动力学）"""
@@ -417,37 +542,34 @@ class PoincareSectionFactor(BaseFactor):
         
     def calculate(self, df: pd.DataFrame) -> pd.Series:
         """计算庞加莱截面（系统状态采样）"""
-        close = df['close']
-        
-        def calc_poincare(x):
-            if len(x) < 20:
-                return 0
-            
-            returns = np.diff(x)
-            
-            crossings = []
-            for i in range(1, len(returns)):
-                if (returns[i-1] - self.threshold) * (returns[i] - self.threshold) < 0:
-                    t = (self.threshold - returns[i-1]) / (returns[i] - returns[i-1] + 1e-8)
-                    crossing = returns[i-1] + t * (returns[i] - returns[i-1])
-                    crossings.append(crossing)
-            
-            if len(crossings) < 10:
-                return 0
-            
-            crossings = np.array(crossings)
-            
-            width = np.std(crossings)
-            
-            try:
-                skewness = stats.skew(crossings)
-            except:
-                skewness = 0
-            
-            return abs(skewness) + width / (np.mean(np.abs(crossings)) + 1e-8)
-        
-        poincare = close.rolling(window=self.window).apply(calc_poincare)
-        return poincare
+        close = np.log(df['close'].astype(float))
+
+        def calc_poincare(x: np.ndarray) -> float:
+            values = np.asarray(x, dtype=float)
+            if len(values) < 20:
+                return 0.0
+
+            returns = np.diff(values)
+            if len(returns) < 10:
+                return 0.0
+
+            centered = returns - np.mean(returns)
+            shifted = centered - self.threshold
+            cross_mask = shifted[:-1] * shifted[1:] <= 0
+            cross_idx = np.where(cross_mask)[0]
+            if len(cross_idx) < 4:
+                return 0.0
+
+            intervals = np.diff(cross_idx)
+            if len(intervals) < 3:
+                return 0.0
+
+            sd1 = np.std(np.diff(returns)) / np.sqrt(2.0)
+            sd2 = np.std(returns[:-1] + returns[1:]) / np.sqrt(2.0)
+            ratio = sd1 / (sd2 + 1e-8)
+            return float(ratio + np.std(intervals) / (np.mean(intervals) + 1e-8))
+
+        return close.rolling(window=self.window).apply(calc_poincare, raw=True)
 
 class BifurcationDiagramFactor(BaseFactor):
     """分岔图因子（混沌理论）"""
@@ -459,44 +581,49 @@ class BifurcationDiagramFactor(BaseFactor):
         
     def calculate(self, df: pd.DataFrame) -> pd.Series:
         """计算分岔图特征（混沌系统参数变化）"""
-        close = df['close']
-        
-        def calc_bifurcation(x):
-            if len(x) < 50:
-                return 0
-            
-            returns = np.diff(x)
-            mean_return = np.mean(returns)
-            
-            r_values = np.linspace(mean_return - self.param_range, mean_return + self.param_range, 20)
+        close = np.log(df['close'].astype(float))
+
+        def calc_bifurcation(x: np.ndarray) -> float:
+            values = np.asarray(x, dtype=float)
+            if len(values) < 30:
+                return 0.0
+
+            returns = np.diff(values)
+            vol = np.std(returns)
+            drift = abs(np.mean(returns))
+            if not np.isfinite(vol) or vol <= 0:
+                return 0.0
+
+            center_r = float(np.clip(3.2 + 20.0 * vol + 10.0 * drift, 2.8, 3.95))
+            r_low = max(2.5, center_r - self.param_range)
+            r_high = min(3.99, center_r + self.param_range)
+            r_values = np.linspace(r_low, r_high, 12)
             bifurcation_points = []
-            
+
             for r in r_values:
-                x_val = 0.5
+                x_val = 0.5 + 0.1 * np.tanh(np.mean(returns) / (vol + 1e-8))
                 states = []
-                
-                for _ in range(self.iterations):
-                    x_val = r * x_val * (1 - x_val + 1e-8)
-                    if _ > self.iterations // 2:
+                for step in range(self.iterations):
+                    x_val = r * x_val * (1.0 - x_val)
+                    x_val = float(np.clip(x_val, 1e-8, 1.0 - 1e-8))
+                    if step >= self.iterations // 2:
                         states.append(x_val)
-                
-                if states:
-                    bifurcation_points.extend(states)
-            
+                bifurcation_points.extend(states[-20:])
+
             if not bifurcation_points:
-                return 0
-            
-            hist, _ = np.histogram(bifurcation_points, bins=20)
+                return 0.0
+
+            hist, _ = np.histogram(bifurcation_points, bins=20, range=(0.0, 1.0))
             prob = hist / hist.sum()
             prob = prob[prob > 0]
-            
-            if len(prob) > 0:
-                entropy = -np.sum(prob * np.log2(prob + 1e-10))
-                return entropy / 5
-            return 0
-        
-        bifurcation = close.rolling(window=self.window).apply(calc_bifurcation)
-        return bifurcation
+            if len(prob) == 0:
+                return 0.0
+
+            entropy = -np.sum(prob * np.log(prob))
+            occupancy = len(prob) / 20.0
+            return float(entropy * occupancy)
+
+        return close.rolling(window=self.window).apply(calc_bifurcation, raw=True)
 
 class ChaosIndicatorFactor(BaseFactor):
     """混沌指示器因子"""
@@ -508,39 +635,37 @@ class ChaosIndicatorFactor(BaseFactor):
         
     def calculate(self, df: pd.DataFrame) -> pd.Series:
         """计算混沌指示器（区分随机和混沌）"""
-        close = df['close']
-        
-        def calc_chaos(x):
-            if len(x) < 50:
-                return 0
-            
-            n = len(x)
-            
-            embedded = np.array([x[i:i+self.m] for i in range(n - self.m)])
-            
-            if len(embedded) < 100:
-                return 0
-            
-            lyapunov_estimates = []
-            
-            for i in range(min(50, len(embedded))):
-                distances = np.linalg.norm(embedded - embedded[i], axis=1)
-                nearest_idx = np.argsort(distances)[1]
-                
-                if nearest_idx < len(embedded):
-                    separation = np.linalg.norm(embedded[nearest_idx] - embedded[i])
-                    if separation > 0:
-                        lyapunov_estimates.append(np.log(separation + 1e-8))
-            
-            if not lyapunov_estimates:
-                return 0
-            
-            mean_lyapunov = np.mean(lyapunov_estimates)
-            
-            return max(0, mean_lyapunov)
-        
-        chaos = close.rolling(window=self.window).apply(calc_chaos)
-        return chaos
+        close = np.log(df['close'].astype(float))
+
+        def calc_chaos(x: np.ndarray) -> float:
+            values = np.asarray(x, dtype=float)
+            if len(values) < max(30, self.m * 6):
+                return 0.0
+
+            returns = np.diff(values)
+            scale = np.std(returns)
+            if scale <= 0 or not np.isfinite(scale):
+                return 0.0
+
+            normalized = (returns - np.mean(returns)) / scale
+            embedded = _embed_series(normalized, self.m)
+            if len(embedded) < 10:
+                return 0.0
+
+            distances = _pairwise_distances(embedded)
+            np.fill_diagonal(distances, np.inf)
+            nearest = np.argmin(distances, axis=1)
+            nearest_dist = distances[np.arange(len(embedded)), nearest]
+
+            valid = np.isfinite(nearest_dist) & (nearest_dist > 1e-8)
+            if not np.any(valid):
+                return 0.0
+
+            divergence = float(np.mean(np.log1p(nearest_dist[valid] / self.r)))
+            recurrence = float(np.mean(nearest_dist[valid] < self.r))
+            return float(max(0.0, divergence) * (1.0 + recurrence))
+
+        return close.rolling(window=self.window).apply(calc_chaos, raw=True)
 
 class TimeReversalAsymmetryFactor(BaseFactor):
     """时间反演不对称性因子"""
@@ -551,29 +676,33 @@ class TimeReversalAsymmetryFactor(BaseFactor):
         
     def calculate(self, df: pd.DataFrame) -> pd.Series:
         """计算时间反演不对称性（检测非线性）"""
-        close = df['close']
-        
-        def calc_asymmetry(x):
-            if len(x) < 20:
-                return 0
-            
-            returns = np.diff(x)
-            
-            asymmetry = 0
-            
-            for k in range(1, self.lag + 1):
-                if k >= len(returns):
-                    break
-                    
-                forward = returns[k:]
-                backward = returns[:-k]
-                
-                asymmetry += np.mean(forward ** 2 * backward) - np.mean(forward * backward ** 2)
-            
-            return asymmetry / (self.lag + 1)
-        
-        asymmetry = close.rolling(window=self.window).apply(calc_asymmetry)
-        return asymmetry
+        close = np.log(df['close'].astype(float))
+
+        def calc_asymmetry(x: np.ndarray) -> float:
+            values = np.asarray(x, dtype=float)
+            if len(values) < 20:
+                return 0.0
+
+            returns = np.diff(values)
+            scale = np.std(returns)
+            if scale <= 0 or not np.isfinite(scale):
+                return 0.0
+
+            normalized = (returns - np.mean(returns)) / scale
+            contributions = []
+
+            for lag in range(1, min(self.lag + 1, len(normalized) // 2 + 1)):
+                forward = normalized[lag:]
+                backward = normalized[:-lag]
+                if len(forward) < 5:
+                    continue
+                contributions.append(np.mean(forward ** 2 * backward - forward * backward ** 2))
+
+            if not contributions:
+                return 0.0
+            return float(np.mean(contributions))
+
+        return close.rolling(window=self.window).apply(calc_asymmetry, raw=True)
 
 class NonlinearAutocorrelationFactor(BaseFactor):
     """非线性自相关因子"""
@@ -584,30 +713,46 @@ class NonlinearAutocorrelationFactor(BaseFactor):
         
     def calculate(self, df: pd.DataFrame) -> pd.Series:
         """计算非线性自相关（检测非线性依赖）"""
-        close = df['close']
-        
-        def calc_nonlinear_acf(x):
-            if len(x) < 30:
-                return 0
-            
-            returns = np.diff(x)
-            returns_abs = np.abs(returns)
-            
+        close = np.log(df['close'].astype(float))
+
+        def calc_nonlinear_acf(x: np.ndarray) -> float:
+            values = np.asarray(x, dtype=float)
+            if len(values) < 30:
+                return 0.0
+
+            returns = np.diff(values)
+            if len(returns) < 10:
+                return 0.0
+
+            transforms = [
+                returns,
+                np.abs(returns),
+                returns ** 2,
+            ]
             acf_values = []
-            
+
             for lag in range(1, min(self.max_lag + 1, len(returns) // 2)):
-                n = len(returns) - lag
-                
-                acf_raw = np.corrcoef(returns[lag:], returns[:n])[0, 1] if n > 0 else 0
-                acf_abs = np.corrcoef(returns_abs[lag:], returns_abs[:n])[0, 1] if n > 0 else 0
-                
-                nonlinear = abs(acf_abs) - abs(acf_raw)
-                acf_values.append(nonlinear)
-            
-            return np.mean(acf_values) if acf_values else 0
-        
-        nonlinear_acf = close.rolling(window=self.window).apply(calc_nonlinear_acf)
-        return nonlinear_acf
+                base = returns[:-lag]
+                shifted = returns[lag:]
+                if len(base) < 5:
+                    continue
+
+                raw_corr = np.corrcoef(base, shifted)[0, 1]
+                if not np.isfinite(raw_corr):
+                    raw_corr = 0.0
+
+                transformed_corrs = []
+                for transformed in transforms[1:]:
+                    corr = np.corrcoef(transformed[:-lag], transformed[lag:])[0, 1]
+                    transformed_corrs.append(0.0 if not np.isfinite(corr) else abs(corr))
+
+                acf_values.append(max(transformed_corrs) - abs(raw_corr))
+
+            if not acf_values:
+                return 0.0
+            return float(np.mean(acf_values))
+
+        return close.rolling(window=self.window).apply(calc_nonlinear_acf, raw=True)
 
 class SurrogateDataTestFactor(BaseFactor):
     """代理数据测试因子"""
@@ -618,39 +763,53 @@ class SurrogateDataTestFactor(BaseFactor):
         
     def calculate(self, df: pd.DataFrame) -> pd.Series:
         """计算代理数据测试（检验非线性）"""
-        close = df['close']
-        
-        def calc_surrogate_test(x):
-            if len(x) < 50:
-                return 0
-            
-            returns = np.diff(x)
-            
-            original_metric = self._compute_nonlinearity_metric(returns)
-            
+        close = np.log(df['close'].astype(float))
+
+        def compute_nonlinearity_metric(values: np.ndarray) -> float:
+            if len(values) < 10:
+                return 0.0
+            centered = values - np.mean(values)
+            if np.std(centered) <= 0:
+                return 0.0
+            skew = stats.skew(centered, bias=False)
+            cubic_dependence = np.corrcoef(centered[:-1], centered[1:] ** 2)[0, 1] if len(centered) > 5 else 0.0
+            skew = 0.0 if not np.isfinite(skew) else float(abs(skew))
+            cubic_dependence = 0.0 if not np.isfinite(cubic_dependence) else float(abs(cubic_dependence))
+            return skew + cubic_dependence
+
+        def calc_surrogate_test(x: np.ndarray) -> float:
+            values = np.asarray(x, dtype=float)
+            if len(values) < 30:
+                return 0.0
+
+            returns = np.diff(values)
+            if len(returns) < 12:
+                return 0.0
+
+            original_metric = compute_nonlinearity_metric(returns)
+            fft_returns = np.fft.rfft(returns)
+            amplitudes = np.abs(fft_returns)
+            seed = int(np.round(np.abs(np.sum(returns)) * 1_000_000)) % (2 ** 32 - 1)
+            rng = np.random.default_rng(seed)
             surrogate_metrics = []
-            
+
             for _ in range(self.n_surrogates):
-                fft_returns = np.fft.fft(returns)
-                phases = np.random.uniform(0, 2 * np.pi, len(fft_returns))
-                fft_surrogate = np.abs(fft_returns) * np.exp(1j * phases)
-                surrogate = np.real(np.fft.ifft(fft_surrogate))
-                
-                metric = self._compute_nonlinearity_metric(surrogate)
-                surrogate_metrics.append(metric)
-            
-            if surrogate_metrics:
-                p_value = sum(1 for s in surrogate_metrics if s > original_metric) / len(surrogate_metrics)
-                return 1 - p_value
-            return 0
-        
-        def _compute_nonlinearity_metric(x):
-            if len(x) < 20:
-                return 0
-            return abs(stats.skew(x))
-        
-        surrogate_test = close.rolling(window=self.window).apply(calc_surrogate_test)
-        return surrogate_test
+                phases = rng.uniform(0.0, 2.0 * np.pi, len(amplitudes))
+                phases[0] = 0.0
+                if len(phases) > 1:
+                    phases[-1] = 0.0
+                surrogate_fft = amplitudes * np.exp(1j * phases)
+                surrogate = np.fft.irfft(surrogate_fft, n=len(returns))
+                surrogate_metrics.append(compute_nonlinearity_metric(np.asarray(surrogate)))
+
+            surrogate_metrics = np.asarray(surrogate_metrics, dtype=float)
+            surrogate_metrics = surrogate_metrics[np.isfinite(surrogate_metrics)]
+            if len(surrogate_metrics) == 0:
+                return 0.0
+
+            return float(np.mean(original_metric > surrogate_metrics))
+
+        return close.rolling(window=self.window).apply(calc_surrogate_test, raw=True)
 
 class RecurrencePlotFactor(BaseFactor):
     """复发图因子（非线性时间序列）"""
@@ -662,50 +821,47 @@ class RecurrencePlotFactor(BaseFactor):
         
     def calculate(self, df: pd.DataFrame) -> pd.Series:
         """计算复发图特征"""
-        close = df['close']
-        
-        def calc_recurrence_plot(x):
-            if len(x) < 30:
-                return 0
-            
-            n = len(x)
-            
-            if n <= self.dim:
-                return 0
-                
-            embedded = np.array([x[i:i+self.dim] for i in range(n - self.dim)])
-            
-            if len(embedded) < 20:
-                return 0
-            
-            n_points = len(embedded)
-            recurrence_count = 0
-            
-            for i in range(n_points):
-                for j in range(i + 1, n_points):
-                    if np.linalg.norm(embedded[i] - embedded[j]) < self.threshold:
-                        recurrence_count += 1
-            
-            total_pairs = n_points * (n_points - 1) / 2
-            recurrence_rate = recurrence_count / total_pairs if total_pairs > 0 else 0
-            
-            diagonal_lengths = []
-            for i in range(min(10, n_points)):
-                length = 0
-                for j in range(1, min(10, n_points - i)):
-                    if np.linalg.norm(embedded[i+j] - embedded[i+j-1]) < self.threshold:
-                        length += 1
+        close = np.log(df['close'].astype(float))
+
+        def calc_recurrence_plot(x: np.ndarray) -> float:
+            values = np.asarray(x, dtype=float)
+            if len(values) < max(20, self.dim * 6):
+                return 0.0
+
+            scale = np.std(values)
+            if scale <= 0 or not np.isfinite(scale):
+                return 0.0
+
+            normalized = (values - np.mean(values)) / scale
+            embedded = _embed_series(normalized, self.dim)
+            if len(embedded) < 10:
+                return 0.0
+
+            distances = _pairwise_distances(embedded)
+            recurrence = distances < self.threshold
+            np.fill_diagonal(recurrence, False)
+
+            recurrence_rate = float(np.mean(recurrence))
+            diagonal_runs = []
+            for offset in range(1, min(len(embedded), 8)):
+                diag = np.diag(recurrence, k=offset)
+                if len(diag) == 0:
+                    continue
+                run = 0
+                for flag in diag:
+                    if flag:
+                        run += 1
                     else:
-                        break
-                if length > 0:
-                    diagonal_lengths.append(length)
-            
-            avg_diagonal = np.mean(diagonal_lengths) if diagonal_lengths else 0
-            
-            return recurrence_rate * 100 + avg_diagonal * 0.1
-        
-        recurrence_plot = close.rolling(window=self.window).apply(calc_recurrence_plot)
-        return recurrence_plot
+                        if run >= 2:
+                            diagonal_runs.append(run)
+                        run = 0
+                if run >= 2:
+                    diagonal_runs.append(run)
+
+            determinism = 0.0 if not diagonal_runs else float(np.mean(diagonal_runs) / len(embedded))
+            return float(recurrence_rate + determinism)
+
+        return close.rolling(window=self.window).apply(calc_recurrence_plot, raw=True)
 
 class MultiscaleComplexityFactor(BaseFactor):
     """多尺度复杂度因子"""
@@ -716,42 +872,41 @@ class MultiscaleComplexityFactor(BaseFactor):
         
     def calculate(self, df: pd.DataFrame) -> pd.Series:
         """计算多尺度复杂度（综合多种度量）"""
-        close = df['close']
-        
-        def calc_multiscale(x):
-            if len(x) < 100:
-                return 0
-            
+        close = np.log(df['close'].astype(float))
+
+        def calc_multiscale(x: np.ndarray) -> float:
+            values = np.asarray(x, dtype=float)
+            if len(values) < 30:
+                return 0.0
+
+            returns = np.diff(values)
             complexities = []
-            
+
             for scale in self.scales:
-                if scale >= len(x) // 2:
+                if scale < 1 or scale > len(returns) // 3:
                     continue
-                
-                downsampled = x[::scale]
-                
-                if len(downsampled) < 20:
+
+                usable = len(returns) // scale
+                if usable < 8:
                     continue
-                
-                hist, _ = np.histogram(downsampled, bins=10)
-                prob = hist / hist.sum()
+
+                coarse = returns[:usable * scale].reshape(usable, scale).mean(axis=1)
+                hist, _ = np.histogram(coarse, bins=min(10, max(4, usable // 2)))
+                prob = hist / hist.sum() if hist.sum() > 0 else np.array([])
                 prob = prob[prob > 0]
-                entropy = -np.sum(prob * np.log2(prob + 1e-10)) if len(prob) > 0 else 0
-                
-                cv = np.std(downsampled) / (np.mean(downsampled) + 1e-8)
-                
-                if len(downsampled) > 10:
-                    acf = np.corrcoef(downsampled[:-5], downsampled[5:])[0, 1] if len(downsampled) > 5 else 0
-                else:
-                    acf = 0
-                
-                complexity = entropy * (1 + abs(acf)) * (1 + cv / 10)
-                complexities.append(complexity)
-            
-            return np.mean(complexities) if complexities else 0
-        
-        multiscale_complexity = close.rolling(window=self.window).apply(calc_multiscale)
-        return multiscale_complexity
+                if len(prob) < 2:
+                    continue
+
+                entropy = -np.sum(prob * np.log(prob))
+                variability = np.std(coarse)
+                complexity = entropy * (1.0 + variability)
+                complexities.append(float(complexity))
+
+            if not complexities:
+                return 0.0
+            return float(np.mean(complexities))
+
+        return close.rolling(window=self.window).apply(calc_multiscale, raw=True)
 
 class InformationComplexityFactor(BaseFactor):
     """信息复杂度因子"""
@@ -763,49 +918,39 @@ class InformationComplexityFactor(BaseFactor):
         
     def calculate(self, df: pd.DataFrame) -> pd.Series:
         """计算信息复杂度（结合信息论和复杂度）"""
-        close = df['close']
-        
-        def calc_info_complexity(x):
-            if len(x) < 50:
-                return 0
-            
-            n = len(x)
-            
-            if n <= self.m:
-                return 0
-                
-            embedded = np.array([x[i:i+self.m] for i in range(n - self.m)])
-            
-            if len(embedded) < 50:
-                return 0
-            
-            distances = []
-            for i in range(len(embedded)):
-                for j in range(i + 1, len(embedded)):
-                    distances.append(np.linalg.norm(embedded[i] - embedded[j]))
-            
-            if not distances:
-                return 0
-            
-            hist, _ = np.histogram(distances, bins=20)
+        close = np.log(df['close'].astype(float))
+
+        def calc_info_complexity(x: np.ndarray) -> float:
+            values = np.asarray(x, dtype=float)
+            if len(values) < max(20, self.m * 6):
+                return 0.0
+
+            scale = np.std(values)
+            if scale <= 0 or not np.isfinite(scale):
+                return 0.0
+
+            normalized = (values - np.mean(values)) / scale
+            embedded = _embed_series(normalized, self.m)
+            if len(embedded) < 10:
+                return 0.0
+
+            distances = _pairwise_distances(embedded)
+            upper = distances[np.triu_indices(len(embedded), k=1)]
+            upper = upper[np.isfinite(upper) & (upper > 0)]
+            if len(upper) < 5:
+                return 0.0
+
+            hist, _ = np.histogram(upper, bins=min(20, max(6, len(upper) // 4)))
+            if hist.sum() == 0:
+                return 0.0
+
             prob = hist / hist.sum()
             prob = prob[prob > 0]
-            
-            if len(prob) < 2:
-                return 0
-            
-            entropy = -np.sum(prob * np.log2(prob + 1e-10))
-            
-            mean_dist = np.mean(distances)
-            variance = np.var(distances)
-            
-            complexity = entropy * (1 - abs(2 * mean_dist - np.min(distances) - np.max(distances)) / 
-                                   (np.max(distances) - np.min(distances) + 1e-8))
-            
-            return complexity
-        
-        info_complexity = close.rolling(window=self.window).apply(calc_info_complexity)
-        return info_complexity
+            entropy = -np.sum(prob * np.log(prob))
+            spread_balance = 1.0 - (np.std(upper) / (np.mean(upper) + 1e-8)) / (1.0 + np.std(upper))
+            return float(max(0.0, entropy * max(0.0, spread_balance)))
+
+        return close.rolling(window=self.window).apply(calc_info_complexity, raw=True)
 
 class DynamicPatternFactor(BaseFactor):
     """动态模式因子"""
@@ -816,36 +961,33 @@ class DynamicPatternFactor(BaseFactor):
         
     def calculate(self, df: pd.DataFrame) -> pd.Series:
         """提取动态模式（类似PCA）"""
-        close = df['close']
-        
-        def calc_dynamic_pattern(x):
-            if len(x) < 30:
-                return 0
-            
-            n = len(x)
-            
-            lag = min(n // 3, 10)
-            if lag < 2:
-                return 0
-            
-            n_vectors = n - lag + 1
-            trajectory = np.array([x[i:i+lag] for i in range(n_vectors)])
-            
-            try:
-                U, S, Vt = np.linalg.svd(trajectory, full_matrices=False)
-                
-                explained_variance = S[:self.n_patterns] ** 2
-                total_variance = S ** 2
-                
-                if np.sum(total_variance) > 0:
-                    pattern_strength = np.sum(explained_variance) / np.sum(total_variance)
-                    return pattern_strength
-                return 0
-            except:
-                return 0
-        
-        dynamic_pattern = close.rolling(window=self.window).apply(calc_dynamic_pattern)
-        return dynamic_pattern
+        close = np.log(df['close'].astype(float))
+
+        def calc_dynamic_pattern(x: np.ndarray) -> float:
+            values = np.asarray(x, dtype=float)
+            if len(values) < 20:
+                return 0.0
+
+            returns = np.diff(values)
+            lag = min(max(3, len(returns) // 6), 12)
+            if lag >= len(returns):
+                return 0.0
+
+            trajectory = _embed_series(returns, lag)
+            if len(trajectory) < 5:
+                return 0.0
+
+            trajectory = trajectory - trajectory.mean(axis=0, keepdims=True)
+            singular_values = np.linalg.svd(trajectory, compute_uv=False)
+            energy = singular_values ** 2
+            total_energy = energy.sum()
+            if total_energy <= 0:
+                return 0.0
+
+            top_k = min(self.n_patterns, len(energy))
+            return float(np.sum(energy[:top_k]) / total_energy)
+
+        return close.rolling(window=self.window).apply(calc_dynamic_pattern, raw=True)
 
 class StateSpaceGeometryFactor(BaseFactor):
     """状态空间几何因子"""
@@ -856,50 +998,37 @@ class StateSpaceGeometryFactor(BaseFactor):
         
     def calculate(self, df: pd.DataFrame) -> pd.Series:
         """计算状态空间几何特征"""
-        close = df['close']
-        
-        def calc_geometry(x):
-            if len(x) < 30:
-                return 0
-            
-            n = len(x)
-            
-            if n <= self.dim:
-                return 0
-                
-            embedded = np.array([x[i:i+self.dim] for i in range(n - self.dim)])
-            
-            if len(embedded) < 20:
-                return 0
-            
-            ranges = [np.max(embedded[:, i]) - np.min(embedded[:, i]) for i in range(self.dim)]
-            volume = np.prod(ranges)
-            
-            if volume > 0:
-                surface_area = 2 * np.pi * (3 * volume / (4 * np.pi)) ** (2/3) if self.dim == 3 else 2 * np.pi * (volume / np.pi)
-                sphereicity = (np.pi ** (1/3) * (6 * volume) ** (2/3)) / surface_area if volume > 0 else 1
-            else:
-                sphereicity = 1
-            
-            try:
-                box_size = np.min(ranges) / 10 if ranges else 0.1
-                n_boxes = 0
-                for i in range(self.dim):
-                    min_val = np.min(embedded[:, i])
-                    max_val = np.max(embedded[:, i])
-                    n_boxes += int((max_val - min_val) / box_size) + 1
-                
-                if n_boxes > 0 and volume > 0:
-                    fractal_dim = np.log(n_boxes) / np.log(1 / box_size)
-                else:
-                    fractal_dim = self.dim
-            except:
-                fractal_dim = self.dim
-            
-            return sphereicity * fractal_dim
-        
-        state_space_geom = close.rolling(window=self.window).apply(calc_geometry)
-        return state_space_geom
+        close = np.log(df['close'].astype(float))
+
+        def calc_geometry(x: np.ndarray) -> float:
+            values = np.asarray(x, dtype=float)
+            if len(values) < max(20, self.dim * 5):
+                return 0.0
+
+            scale = np.std(values)
+            if scale <= 0 or not np.isfinite(scale):
+                return 0.0
+
+            normalized = (values - np.mean(values)) / scale
+            embedded = _embed_series(normalized, self.dim)
+            if len(embedded) < 8:
+                return 0.0
+
+            ranges = np.ptp(embedded, axis=0)
+            if np.any(ranges <= 0):
+                return 0.0
+
+            cov = np.cov(embedded, rowvar=False)
+            eigvals = np.linalg.eigvalsh(cov)
+            eigvals = eigvals[eigvals > 1e-12]
+            if len(eigvals) == 0:
+                return 0.0
+
+            participation_ratio = (eigvals.sum() ** 2) / np.sum(eigvals ** 2)
+            anisotropy = np.max(ranges) / (np.min(ranges) + 1e-8)
+            return float(participation_ratio / anisotropy)
+
+        return close.rolling(window=self.window).apply(calc_geometry, raw=True)
 
 class ChaosGameRepresentationFactor(BaseFactor):
     """混沌游戏表示因子"""
@@ -910,52 +1039,41 @@ class ChaosGameRepresentationFactor(BaseFactor):
         
     def calculate(self, df: pd.DataFrame) -> pd.Series:
         """计算混沌游戏表示特征"""
-        close = df['close']
-        
-        def calc_chaos_game(x):
-            if len(x) < 50:
-                return 0
-            
-            x_norm = (x - np.min(x)) / (np.max(x) - np.min(x) + 1e-8)
-            
-            n_points = 1000
+        close = np.log(df['close'].astype(float))
+
+        def calc_chaos_game(x: np.ndarray) -> float:
+            values = np.asarray(x, dtype=float)
+            if len(values) < 20:
+                return 0.0
+
+            vmin = np.min(values)
+            vmax = np.max(values)
+            if not np.isfinite(vmin) or not np.isfinite(vmax) or vmax <= vmin:
+                return 0.0
+
+            x_norm = (values - vmin) / (vmax - vmin)
+            vertices = np.array([(0.0, 0.0), (1.0, 0.0), (0.5, np.sqrt(3.0) / 2.0)])
+            point = np.array([0.5, 0.5])
             points = []
-            x_val, y_val = 0.5, 0.5
-            
-            for i in range(n_points):
-                vertex_idx = np.random.randint(0, 3)
-                
-                vertices = [(0, 0), (1, 0), (0.5, np.sqrt(3)/2)]
-                vx, vy = vertices[vertex_idx]
-                
-                x_val = self.r * x_val + (1 - self.r) * vx
-                y_val = self.r * y_val + (1 - self.r) * vy
-                
-                if i > 100:
-                    points.append((x_val, y_val))
-            
-            if not points:
-                return 0
-            
-            points = np.array(points)
-            
-            from scipy.spatial.distance import pdist
-            
-            if len(points) > 10:
-                distances = pdist(points)
-                cluster_degree = np.std(distances) / (np.mean(distances) + 1e-8)
-            else:
-                cluster_degree = 0
-            
-            hist_2d, _, _ = np.histogram2d(points[:, 0], points[:, 1], bins=10)
-            prob = hist_2d.flatten()
+
+            for value in x_norm:
+                idx = min(int(value * len(vertices)), len(vertices) - 1)
+                point = self.r * point + (1.0 - self.r) * vertices[idx]
+                points.append(point.copy())
+
+            points = np.asarray(points)
+            hist, _, _ = np.histogram2d(points[:, 0], points[:, 1], bins=8, range=[[0, 1], [0, 1]])
+            prob = hist.ravel()
             prob = prob[prob > 0]
-            uniformity = -np.sum(prob * np.log2(prob + 1e-10)) / np.log2(len(prob)) if len(prob) > 0 else 0
-            
-            return cluster_degree * uniformity
-        
-        chaos_game = close.rolling(window=self.window).apply(calc_chaos_game)
-        return chaos_game
+            if len(prob) == 0:
+                return 0.0
+
+            prob = prob / prob.sum()
+            entropy = -np.sum(prob * np.log(prob))
+            coverage = len(prob) / hist.size
+            return float(entropy * coverage)
+
+        return close.rolling(window=self.window).apply(calc_chaos_game, raw=True)
 
 class AttractorDimensionFactor(BaseFactor):
     """吸引子维度因子"""
@@ -967,45 +1085,47 @@ class AttractorDimensionFactor(BaseFactor):
         
     def calculate(self, df: pd.DataFrame) -> pd.Series:
         """计算吸引子维度（嵌入维度）"""
-        close = df['close']
-        
-        def calc_attractor_dim(x):
-            if len(x) < 50:
-                return 2.0
-            
-            n = len(x)
-            
-            if n <= self.m:
-                return 2.0
-                
-            embedded = np.array([x[i:i+self.m] for i in range(n - self.m)])
-            
-            if len(embedded) < 100:
-                return 2.0
-            
-            r_values = np.logspace(np.log10(self.r / 10), np.log10(self.r * 10), 10)
-            log_r = np.log(r_values)
-            log_n = []
-            
-            for r in r_values:
-                count = 0
-                for i in range(len(embedded)):
-                    for j in range(i + 1, len(embedded)):
-                        if np.linalg.norm(embedded[i] - embedded[j]) < r:
-                            count += 1
-                log_n.append(np.log(count + 1))
-            
-            if len(log_n) < 5:
-                return 2.0
-            
-            try:
-                slope, _ = stats.linregress(log_r, log_n)[:2]
-                return max(0.1, slope)
-            except:
-                return 2.0
-        
-        attractor_dim = close.rolling(window=self.window).apply(calc_attractor_dim)
-        return attractor_dim
+        close = np.log(df['close'].astype(float))
+
+        def calc_attractor_dim(x: np.ndarray) -> float:
+            values = np.asarray(x, dtype=float)
+            if len(values) < max(20, self.m * 6):
+                return float(self.m)
+
+            scale = np.std(values)
+            if scale <= 0 or not np.isfinite(scale):
+                return float(self.m)
+
+            normalized = (values - np.mean(values)) / scale
+            embedded = _embed_series(normalized, self.m)
+            if len(embedded) < 8:
+                return float(self.m)
+
+            distances = _pairwise_distances(embedded)
+            upper = distances[np.triu_indices(len(embedded), k=1)]
+            upper = upper[np.isfinite(upper) & (upper > 0)]
+            if len(upper) < 10:
+                return float(self.m)
+
+            r_low = max(self.r / 2.0, float(np.percentile(upper, 15)))
+            r_high = max(r_low * 1.5, float(np.percentile(upper, 85)))
+            r_values = np.logspace(np.log10(r_low), np.log10(r_high), 6)
+            counts = []
+            valid_r = []
+
+            for radius in r_values:
+                count = np.mean(upper < radius)
+                if 0 < count < 1:
+                    valid_r.append(radius)
+                    counts.append(count)
+
+            if len(counts) < 3:
+                return float(self.m)
+
+            slope = np.polyfit(np.log(valid_r), np.log(counts), 1)[0]
+            return float(np.clip(slope, 0.1, float(self.m)))
+
+        return close.rolling(window=self.window).apply(calc_attractor_dim, raw=True)
 
 class PhaseTransitionFactor(BaseFactor):
     """相变因子"""
@@ -1016,30 +1136,38 @@ class PhaseTransitionFactor(BaseFactor):
         
     def calculate(self, df: pd.DataFrame) -> pd.Series:
         """检测相变（系统状态突变）"""
-        close = df['close']
-        
-        def calc_phase_transition(x):
-            if len(x) < 30:
-                return 0
-            
-            returns = np.diff(x)
-            
-            n = len(returns)
-            half = n // 2
-            
+        close = np.log(df['close'].astype(float))
+
+        def calc_phase_transition(x: np.ndarray) -> float:
+            values = np.asarray(x, dtype=float)
+            if len(values) < 20:
+                return 0.0
+
+            returns = np.diff(values)
+            if len(returns) < 10:
+                return 0.0
+
+            half = len(returns) // 2
             first_half = returns[:half]
             second_half = returns[half:]
-            
-            mean_diff = abs(np.mean(first_half) - np.mean(second_half)) / (np.std(returns) + 1e-8)
-            var_diff = abs(np.var(first_half) - np.var(second_half)) / (np.var(returns) + 1e-8)
-            skew_diff = abs(stats.skew(first_half) - stats.skew(second_half)) / (stats.skew(returns) + 1e-8)
-            
-            phase_transition = mean_diff + var_diff + abs(skew_diff)
-            
-            return min(phase_transition, 10) / 10
-        
-        phase_transition = close.rolling(window=self.window).apply(calc_phase_transition)
-        return phase_transition
+            scale = np.std(returns)
+            if scale <= 0 or not np.isfinite(scale):
+                return 0.0
+
+            mean_shift = abs(np.mean(first_half) - np.mean(second_half)) / scale
+            vol_shift = abs(np.std(first_half) - np.std(second_half)) / scale
+            corr_shift = 0.0
+            if len(first_half) > 3 and len(second_half) > 3:
+                corr1 = np.corrcoef(first_half[:-1], first_half[1:])[0, 1]
+                corr2 = np.corrcoef(second_half[:-1], second_half[1:])[0, 1]
+                corr1 = 0.0 if not np.isfinite(corr1) else corr1
+                corr2 = 0.0 if not np.isfinite(corr2) else corr2
+                corr_shift = abs(corr1 - corr2)
+
+            score = mean_shift + vol_shift + corr_shift
+            return float(score / (1.0 + score))
+
+        return close.rolling(window=self.window).apply(calc_phase_transition, raw=True)
 
 class CriticalSlowingDownFactor(BaseFactor):
     """临界慢化因子"""
@@ -1050,38 +1178,29 @@ class CriticalSlowingDownFactor(BaseFactor):
         
     def calculate(self, df: pd.DataFrame) -> pd.Series:
         """检测临界慢化（系统恢复变慢）"""
-        close = df['close']
-        
-        def calc_csd(x):
-            if len(x) < 50:
-                return 0
-            
-            returns = np.diff(x)
-            
-            n = len(returns)
-            
-            acf = []
-            for k in range(1, min(self.lag * 5, n // 2)):
-                if k >= n:
-                    break
-                corr = np.corrcoef(returns[k:], returns[:n-k])[0, 1] if n-k > 0 else 0
-                acf.append(abs(corr))
-            
-            if not acf:
-                return 0
-            
-            acf = np.array(acf)
-            
-            if len(acf) > 1:
-                try:
-                    decay_rate = -np.log(abs(acf[-1]) + 1e-8) / len(acf) if acf[-1] != 0 else 0
-                    return decay_rate * 10
-                except:
-                    return 0
-            return 0
-        
-        csd = close.rolling(window=self.window).apply(calc_csd)
-        return csd
+        close = np.log(df['close'].astype(float))
+
+        def calc_csd(x: np.ndarray) -> float:
+            values = np.asarray(x, dtype=float)
+            if len(values) < 20:
+                return 0.0
+
+            returns = np.diff(values)
+            if len(returns) < self.lag + 3:
+                return 0.0
+
+            lag = min(max(1, self.lag), len(returns) // 3)
+            acf1 = np.corrcoef(returns[:-lag], returns[lag:])[0, 1]
+            acf1 = 0.0 if not np.isfinite(acf1) else abs(acf1)
+
+            rolling_var = pd.Series(returns).rolling(window=max(3, lag + 2)).var().dropna()
+            if len(rolling_var) < 2:
+                return float(acf1)
+
+            var_trend = rolling_var.iloc[-1] / (rolling_var.iloc[0] + 1e-8)
+            return float(acf1 * np.log1p(max(0.0, var_trend)))
+
+        return close.rolling(window=self.window).apply(calc_csd, raw=True)
 
 class MemoryFunctionFactor(BaseFactor):
     """记忆函数因子"""
@@ -1092,38 +1211,31 @@ class MemoryFunctionFactor(BaseFactor):
         
     def calculate(self, df: pd.DataFrame) -> pd.Series:
         """计算记忆函数（长程相关性）"""
-        close = df['close']
-        
-        def calc_memory(x):
-            if len(x) < 100:
-                return 0
-            
-            returns = np.diff(x)
-            
-            n = len(returns)
+        close = np.log(df['close'].astype(float))
+
+        def calc_memory(x: np.ndarray) -> float:
+            values = np.asarray(x, dtype=float)
+            if len(values) < 30:
+                return 0.0
+
+            returns = np.diff(values)
+            max_lag = min(self.max_lag, len(returns) // 2)
+            if max_lag < 2:
+                return 0.0
+
             acf = []
-            
-            for k in range(1, min(self.max_lag + 1, n // 2)):
-                if k >= n:
-                    break
-                corr = np.corrcoef(returns[k:], returns[:n-k])[0, 1] if n-k > 0 else 0
-                acf.append(corr)
-            
-            if not acf:
-                return 0
-            
-            acf = np.array(acf)
-            
-            if len(acf) > 1:
-                try:
-                    decay_rate = -np.log(abs(acf[-1]) + 1e-8) / len(acf) if acf[-1] != 0 else 0
-                    return decay_rate * 10
-                except:
-                    return 0
-            return 0
-        
-        memory = close.rolling(window=self.window).apply(calc_memory)
-        return memory
+            for lag in range(1, max_lag + 1):
+                corr = np.corrcoef(returns[:-lag], returns[lag:])[0, 1]
+                acf.append(0.0 if not np.isfinite(corr) else abs(corr))
+
+            acf = np.asarray(acf)
+            if np.all(acf <= 0):
+                return 0.0
+
+            weights = 1.0 / np.arange(1, len(acf) + 1)
+            return float(np.sum(acf * weights) / np.sum(weights))
+
+        return close.rolling(window=self.window).apply(calc_memory, raw=True)
 
 class NonlinearDampingFactor(BaseFactor):
     """非线性阻尼因子"""
@@ -1133,30 +1245,30 @@ class NonlinearDampingFactor(BaseFactor):
         
     def calculate(self, df: pd.DataFrame) -> pd.Series:
         """计算非线性阻尼特征"""
-        close = df['close']
-        
-        def calc_damping(x):
-            if len(x) < 50:
-                return 0
-            
-            returns = np.diff(x)
-            
-            n = len(returns)
-            
-            if n > 20:
-                first_half = returns[:n//2]
-                second_half = returns[n//2:]
-                
-                first_amplitude = np.std(first_half)
-                second_amplitude = np.std(second_half)
-                
-                if first_amplitude > 0:
-                    damping = np.log(first_amplitude / (second_amplitude + 1e-8)) / (n // 2)
-                    return max(0, damping) * 10
-            return 0
-        
-        damping = close.rolling(window=self.window).apply(calc_damping)
-        return damping
+        close = np.log(df['close'].astype(float))
+
+        def calc_damping(x: np.ndarray) -> float:
+            values = np.asarray(x, dtype=float)
+            if len(values) < 20:
+                return 0.0
+
+            returns = np.diff(values)
+            half = len(returns) // 2
+            if half < 5:
+                return 0.0
+
+            first_half = returns[:half]
+            second_half = returns[half:]
+            first_amp = np.std(first_half)
+            second_amp = np.std(second_half)
+            if first_amp <= 0 or not np.isfinite(first_amp):
+                return 0.0
+
+            linear_damping = np.log((first_amp + 1e-8) / (second_amp + 1e-8))
+            nonlinear_energy = np.mean(np.abs(second_half) ** 3) / (np.mean(np.abs(first_half) ** 3) + 1e-8)
+            return float(max(0.0, linear_damping) / (1.0 + nonlinear_energy))
+
+        return close.rolling(window=self.window).apply(calc_damping, raw=True)
 
 class BifurcationParameterFactor(BaseFactor):
     """分岔参数因子"""
@@ -1167,54 +1279,41 @@ class BifurcationParameterFactor(BaseFactor):
         
     def calculate(self, df: pd.DataFrame) -> pd.Series:
         """估计分岔参数（系统临界点）"""
-        close = df['close']
-        
-        def calc_bifurcation_param(x):
-            if len(x) < 50:
+        close = np.log(df['close'].astype(float))
+
+        def calc_bifurcation_param(x: np.ndarray) -> float:
+            values = np.asarray(x, dtype=float)
+            if len(values) < 25:
                 return 0.5
-            
-            returns = np.diff(x)
-            mean_return = np.mean(returns)
-            
-            r_values = np.linspace(mean_return - self.param_range, mean_return + self.param_range, 30)
-            
-            stat_values = []
-            
+
+            returns = np.diff(values)
+            vol = np.std(returns)
+            drift = abs(np.mean(returns))
+            if vol <= 0 or not np.isfinite(vol):
+                return 0.5
+
+            center_r = float(np.clip(3.1 + 15.0 * vol + 10.0 * drift, 2.8, 3.95))
+            r_values = np.linspace(max(2.5, center_r - self.param_range), min(3.99, center_r + self.param_range), 16)
+            variances = []
+
             for r in r_values:
                 x_val = 0.5
                 states = []
-                
-                for _ in range(100):
-                    x_val = r * x_val * (1 - x_val + 1e-8)
-                    if _ > 50:
+                for step in range(80):
+                    x_val = r * x_val * (1.0 - x_val)
+                    x_val = float(np.clip(x_val, 1e-8, 1.0 - 1e-8))
+                    if step >= 40:
                         states.append(x_val)
-                
-                if states:
-                    stat_values.append({
-                        'r': r,
-                        'mean': np.mean(states),
-                        'var': np.var(states),
-                        'max': np.max(states),
-                        'min': np.min(states)
-                    })
-            
-            if len(stat_values) < 10:
+                variances.append(np.var(states))
+
+            variances = np.asarray(variances, dtype=float)
+            if len(variances) < 4 or np.allclose(variances, variances[0]):
                 return 0.5
-            
-            variances = [s['var'] for s in stat_values]
-            
-            if len(variances) > 5:
-                var_changes = np.diff(variances)
-                
-                max_change_idx = np.argmax(np.abs(var_changes))
-                
-                normalized_param = max_change_idx / len(variances)
-                return normalized_param
-            
-            return 0.5
-        
-        bifurcation_param = close.rolling(window=self.window).apply(calc_bifurcation_param)
-        return bifurcation_param
+
+            change_idx = int(np.argmax(np.abs(np.diff(variances))))
+            return float(change_idx / max(1, len(variances) - 1))
+
+        return close.rolling(window=self.window).apply(calc_bifurcation_param, raw=True)
 
 class StrangeAttractorFactor(BaseFactor):
     """奇异吸引子因子"""
@@ -1225,55 +1324,48 @@ class StrangeAttractorFactor(BaseFactor):
         
     def calculate(self, df: pd.DataFrame) -> pd.Series:
         """检测奇异吸引子特征"""
-        close = df['close']
-        
-        def calc_strange_attractor(x):
-            if len(x) < 50:
-                return 0
-            
-            n = len(x)
-            
-            if n <= self.dim:
-                return 0
-                
-            embedded = np.array([x[i:i+self.dim] for i in range(n - self.dim)])
-            
-            if len(embedded) < 100:
-                return 0
-            
-            ranges = [np.max(embedded[:, i]) - np.min(embedded[:, i]) for i in range(self.dim)]
-            volume = np.prod([max(r, 0.01) for r in ranges])
-            
-            point_density = len(embedded) / (volume + 1e-8)
-            
-            scales = [0.1, 0.2, 0.5, 1.0, 2.0]
-            n_points = []
-            
-            for scale in scales:
-                count = 0
-                for i in range(len(embedded)):
-                    for j in range(i + 1, len(embedded)):
-                        if np.linalg.norm(embedded[i] - embedded[j]) < scale:
-                            count += 1
-                n_points.append(count)
-            
-            if len(n_points) > 2:
-                try:
-                    log_scales = np.log(scales)
-                    log_points = np.log([max(p, 1) for p in n_points])
-                    slope, _ = stats.linregress(log_scales, log_points)[:2]
-                    fractal_dim = -slope
-                except:
-                    fractal_dim = self.dim
-            else:
-                fractal_dim = self.dim
-            
-            strange_attractor = point_density ** (1/self.dim) * (1 + abs(fractal_dim - self.dim))
-            
-            return min(strange_attractor, 10) / 10
-        
-        strange_attractor = close.rolling(window=self.window).apply(calc_strange_attractor)
-        return strange_attractor
+        close = np.log(df['close'].astype(float))
+
+        def calc_strange_attractor(x: np.ndarray) -> float:
+            values = np.asarray(x, dtype=float)
+            if len(values) < max(20, self.dim * 6):
+                return 0.0
+
+            scale = np.std(values)
+            if scale <= 0 or not np.isfinite(scale):
+                return 0.0
+
+            normalized = (values - np.mean(values)) / scale
+            embedded = _embed_series(normalized, self.dim)
+            if len(embedded) < 8:
+                return 0.0
+
+            ranges = np.ptp(embedded, axis=0)
+            volume = float(np.prod(np.maximum(ranges, 1e-3)))
+            density = len(embedded) / volume
+
+            distances = _pairwise_distances(embedded)
+            upper = distances[np.triu_indices(len(embedded), k=1)]
+            upper = upper[np.isfinite(upper) & (upper > 0)]
+            if len(upper) < 10:
+                return 0.0
+
+            q10 = float(np.percentile(upper, 10))
+            q90 = float(np.percentile(upper, 90))
+            if q90 <= q10:
+                return 0.0
+
+            scales = np.logspace(np.log10(q10), np.log10(q90), 5)
+            counts = [np.mean(upper < radius) for radius in scales]
+            valid = [(radius, count) for radius, count in zip(scales, counts) if 0 < count < 1]
+            if len(valid) < 3:
+                return float(np.log1p(density) / (1.0 + self.dim))
+
+            slope = np.polyfit(np.log([v[0] for v in valid]), np.log([v[1] for v in valid]), 1)[0]
+            attractor_score = np.log1p(density) * (1.0 + abs(slope - self.dim / 2.0))
+            return float(attractor_score / (1.0 + attractor_score))
+
+        return close.rolling(window=self.window).apply(calc_strange_attractor, raw=True)
 
 class TopologicalEntropyFactor(BaseFactor):
     """拓扑熵因子"""
@@ -1284,53 +1376,38 @@ class TopologicalEntropyFactor(BaseFactor):
         
     def calculate(self, df: pd.DataFrame) -> pd.Series:
         """计算拓扑熵（系统复杂度）"""
-        close = df['close']
-        
-        def calc_topological_entropy(x):
-            if len(x) < 50:
-                return 0
-            
-            n = len(x)
-            
-            dim = min(3, n // 10)
-            if dim < 2:
-                return 0
-                
-            embedded = np.array([x[i:i+dim] for i in range(n - dim)])
-            
-            if len(embedded) < 50:
-                return 0
-            
-            epsilon_values = [self.epsilon / 2, self.epsilon, self.epsilon * 2, self.epsilon * 4]
-            n_values = []
-            
-            for eps in epsilon_values:
-                covered = np.zeros(len(embedded), dtype=bool)
-                count = 0
-                
-                for i in range(len(embedded)):
-                    if not covered[i]:
-                        for j in range(len(embedded)):
-                            if not covered[j] and np.linalg.norm(embedded[i] - embedded[j]) < eps:
-                                covered[j] = True
-                        count += 1
-                
-                n_values.append(count)
-            
-            if len(n_values) < 3:
-                return 0
-            
-            log_n = np.log([max(v, 1) for v in n_values])
-            log_eps = np.log(epsilon_values)
-            
-            try:
-                slope, _ = stats.linregress(log_eps, log_n)[:2]
-                return max(0, -slope)
-            except:
-                return 0
-        
-        topological_entropy = close.rolling(window=self.window).apply(calc_topological_entropy)
-        return topological_entropy
+        close = np.log(df['close'].astype(float))
+
+        def calc_topological_entropy(x: np.ndarray) -> float:
+            values = np.asarray(x, dtype=float)
+            if len(values) < 20:
+                return 0.0
+
+            returns = np.diff(values)
+            if len(returns) < 10:
+                return 0.0
+
+            scale = np.std(returns)
+            if scale <= 0 or not np.isfinite(scale):
+                return 0.0
+
+            normalized = (returns - np.mean(returns)) / scale
+            eps = self.epsilon
+            symbols = np.digitize(normalized, bins=[-eps, eps])
+            words = {}
+            word_len = 3
+            for i in range(len(symbols) - word_len + 1):
+                word = tuple(symbols[i:i + word_len])
+                words[word] = words.get(word, 0) + 1
+
+            counts = np.asarray(list(words.values()), dtype=float)
+            if len(counts) == 0:
+                return 0.0
+
+            prob = counts / counts.sum()
+            return float(-np.sum(prob * np.log(prob)) / word_len)
+
+        return close.rolling(window=self.window).apply(calc_topological_entropy, raw=True)
 
 class WindingNumberFactor(BaseFactor):
     """缠绕数因子（环面映射）"""
@@ -1340,30 +1417,26 @@ class WindingNumberFactor(BaseFactor):
         
     def calculate(self, df: pd.DataFrame) -> pd.Series:
         """计算缠绕数（周期轨道）"""
-        close = df['close']
-        
-        def calc_winding(x):
-            if len(x) < 50:
-                return 0
-            
-            returns = np.diff(x)
-            
-            n = len(returns)
-            
-            theta = 2 * np.pi * returns / (np.max(returns) - np.min(returns) + 1e-8)
-            r = np.linspace(0, 1, n)
-            
-            dtheta = np.diff(theta)
-            dtheta = np.where(dtheta > np.pi, dtheta - 2*np.pi, dtheta)
-            dtheta = np.where(dtheta < -np.pi, dtheta + 2*np.pi, dtheta)
-            
-            total_rotation = np.sum(dtheta)
-            winding_number = total_rotation / (2 * np.pi)
-            
-            return abs(winding_number)
-        
-        winding = close.rolling(window=self.window).apply(calc_winding)
-        return winding
+        close = np.log(df['close'].astype(float))
+
+        def calc_winding(x: np.ndarray) -> float:
+            values = np.asarray(x, dtype=float)
+            if len(values) < 15:
+                return 0.0
+
+            returns = np.diff(values)
+            centered = returns - np.mean(returns)
+            scale = np.std(centered)
+            if scale <= 0 or not np.isfinite(scale):
+                return 0.0
+
+            normalized = centered / scale
+            analytic = normalized[1:] + 1j * normalized[:-1]
+            angles = np.unwrap(np.angle(analytic))
+            total_rotation = angles[-1] - angles[0] if len(angles) > 1 else 0.0
+            return float(abs(total_rotation) / (2.0 * np.pi))
+
+        return close.rolling(window=self.window).apply(calc_winding, raw=True)
 
 class ManifoldDimensionFactor(BaseFactor):
     """流形维度因子"""
@@ -1374,58 +1447,43 @@ class ManifoldDimensionFactor(BaseFactor):
         
     def calculate(self, df: pd.DataFrame) -> pd.Series:
         """估计流形维度（局部线性嵌入）"""
-        close = df['close']
-        
-        def calc_manifold_dim(x):
-            if len(x) < 30:
+        close = np.log(df['close'].astype(float))
+
+        def calc_manifold_dim(x: np.ndarray) -> float:
+            values = np.asarray(x, dtype=float)
+            if len(values) < 20:
                 return 2.0
-            
-            n = len(x)
-            
-            dim = min(5, n // 5)
-            if dim < 2:
+
+            scale = np.std(values)
+            if scale <= 0 or not np.isfinite(scale):
                 return 2.0
-                
-            embedded = np.array([x[i:i+dim] for i in range(n - dim)])
-            
-            if len(embedded) < 20:
+
+            normalized = (values - np.mean(values)) / scale
+            dim = min(5, max(2, len(normalized) // 8))
+            embedded = _embed_series(normalized, dim)
+            if len(embedded) < self.k + 2:
                 return 2.0
-            
-            errors = []
-            
-            for i in range(min(50, len(embedded))):
+
+            sample_count = min(20, len(embedded))
+            local_dims = []
+            for i in range(sample_count):
                 distances = np.linalg.norm(embedded - embedded[i], axis=1)
-                nearest_idx = np.argsort(distances)[1:self.k+1]
-                
-                if len(nearest_idx) < 2:
+                distances[i] = np.inf
+                nn_idx = np.argsort(distances)[:self.k]
+                neighborhood = embedded[nn_idx] - embedded[nn_idx].mean(axis=0, keepdims=True)
+                cov = np.cov(neighborhood, rowvar=False)
+                eigvals = np.linalg.eigvalsh(cov)
+                eigvals = eigvals[eigvals > 1e-10]
+                if len(eigvals) == 0:
                     continue
-                
-                try:
-                    X = embedded[nearest_idx]
-                    y = embedded[i]
-                    
-                    X_centered = X - np.mean(X, axis=0)
-                    y_centered = y - np.mean(X, axis=0)
-                    
-                    U, S, Vt = np.linalg.svd(X_centered, full_matrices=False)
-                    
-                    projection = U @ (U.T @ y_centered)
-                    error = np.linalg.norm(y_centered - projection)
-                    errors.append(error)
-                except:
-                    continue
-            
-            if not errors:
+                participation_ratio = (eigvals.sum() ** 2) / np.sum(eigvals ** 2)
+                local_dims.append(participation_ratio)
+
+            if not local_dims:
                 return 2.0
-            
-            mean_error = np.mean(errors)
-            
-            dimension = 1 / (1 + mean_error)
-            
-            return dimension * self.k
-        
-        manifold_dim = close.rolling(window=self.window).apply(calc_manifold_dim)
-        return manifold_dim
+            return float(np.mean(local_dims))
+
+        return close.rolling(window=self.window).apply(calc_manifold_dim, raw=True)
 
 class FractalCorrelationFactor(BaseFactor):
     """分形相关性因子"""
@@ -1436,44 +1494,41 @@ class FractalCorrelationFactor(BaseFactor):
         
     def calculate(self, df: pd.DataFrame) -> pd.Series:
         """计算分形相关积分"""
-        close = df['close']
-        
-        def calc_fractal_corr(x):
-            if len(x) < 50:
-                return 0
-            
-            n = len(x)
-            
-            dim = min(3, n // 10)
-            if dim < 2:
-                return 0
-                
-            embedded = np.array([x[i:i+dim] for i in range(n - dim)])
-            
-            if len(embedded) < 50:
-                return 0
-            
-            count = 0
-            total_pairs = 0
-            
-            for i in range(len(embedded)):
-                for j in range(i + 1, len(embedded)):
-                    if np.linalg.norm(embedded[i] - embedded[j]) < self.r:
-                        count += 1
-                    total_pairs += 1
-            
-            if total_pairs == 0:
-                return 0
-            
-            correlation_integral = count / total_pairs
-            
-            if correlation_integral > 0:
-                dimension = np.log(correlation_integral + 1e-8) / np.log(self.r)
-                return max(0.1, -dimension)
-            return 0
-        
-        fractal_corr = close.rolling(window=self.window).apply(calc_fractal_corr)
-        return fractal_corr
+        close = np.log(df['close'].astype(float))
+
+        def calc_fractal_corr(x: np.ndarray) -> float:
+            values = np.asarray(x, dtype=float)
+            if len(values) < 20:
+                return 0.0
+
+            scale = np.std(values)
+            if scale <= 0 or not np.isfinite(scale):
+                return 0.0
+
+            normalized = (values - np.mean(values)) / scale
+            dim = min(3, max(2, len(normalized) // 10))
+            embedded = _embed_series(normalized, dim)
+            if len(embedded) < 8:
+                return 0.0
+
+            distances = _pairwise_distances(embedded)
+            upper = distances[np.triu_indices(len(embedded), k=1)]
+            upper = upper[np.isfinite(upper) & (upper > 0)]
+            if len(upper) < 10:
+                return 0.0
+
+            q20 = max(self.r, float(np.percentile(upper, 20)))
+            q80 = max(q20 * 1.5, float(np.percentile(upper, 80)))
+            radii = np.logspace(np.log10(q20), np.log10(q80), 5)
+            corr_vals = [np.mean(upper < radius) for radius in radii]
+            valid = [(radius, corr) for radius, corr in zip(radii, corr_vals) if 0 < corr < 1]
+            if len(valid) < 3:
+                return 0.0
+
+            slope = np.polyfit(np.log([v[0] for v in valid]), np.log([v[1] for v in valid]), 1)[0]
+            return float(max(0.0, slope))
+
+        return close.rolling(window=self.window).apply(calc_fractal_corr, raw=True)
 
 class NonlinearPredictabilityFactor(BaseFactor):
     """非线性可预测性因子"""
@@ -1484,48 +1539,35 @@ class NonlinearPredictabilityFactor(BaseFactor):
         
     def calculate(self, df: pd.DataFrame) -> pd.Series:
         """计算非线性可预测性"""
-        close = df['close']
-        
-        def calc_predictability(x):
-            if len(x) < 50:
-                return 0
-            
-            returns = np.diff(x)
-            n = len(returns)
-            
-            errors = []
-            
-            for h in range(1, min(self.lag + 3, n // 5)):
-                y_true = returns[h:]
-                y_pred = returns[:-h]
-                
-                if len(y_true) < 10:
+        close = np.log(df['close'].astype(float))
+
+        def calc_predictability(x: np.ndarray) -> float:
+            values = np.asarray(x, dtype=float)
+            if len(values) < 20:
+                return 0.0
+
+            returns = np.diff(values)
+            if len(returns) < 12:
+                return 0.0
+
+            scores = []
+            for lag in range(1, min(self.lag + 4, len(returns) // 3 + 1)):
+                current = returns[:-lag]
+                future = returns[lag:]
+                if len(current) < 8:
                     continue
-                
-                mae = np.mean(np.abs(y_true - y_pred))
-                rmse = np.sqrt(np.mean((y_true - y_pred) ** 2))
-                
-                errors.append({
-                    'lag': h,
-                    'mae': mae,
-                    'rmse': rmse
-                })
-            
-            if not errors:
-                return 0
-            
-            rmse_values = [e['rmse'] for e in errors]
-            mae_values = [e['mae'] for e in errors]
-            
-            rmse_normalized = 1 - (np.min(rmse_values) / (np.mean(rmse_values) + 1e-8))
-            mae_normalized = 1 - (np.min(mae_values) / (np.mean(mae_values) + 1e-8))
-            
-            predictability = (rmse_normalized + mae_normalized) / 2
-            
-            return predictability
-        
-        predictability = close.rolling(window=self.window).apply(calc_predictability)
-        return predictability
+
+                corr = np.corrcoef(current, future)[0, 1]
+                corr = 0.0 if not np.isfinite(corr) else abs(corr)
+
+                sign_match = np.mean(np.sign(current) == np.sign(future))
+                scores.append(0.5 * corr + 0.5 * sign_match)
+
+            if not scores:
+                return 0.0
+            return float(np.mean(scores))
+
+        return close.rolling(window=self.window).apply(calc_predictability, raw=True)
 
 class ChaosGameIterationFactor(BaseFactor):
     """混沌游戏迭代因子"""
@@ -1537,60 +1579,44 @@ class ChaosGameIterationFactor(BaseFactor):
         
     def calculate(self, df: pd.DataFrame) -> pd.Series:
         """计算混沌游戏迭代特征"""
-        close = df['close']
-        
-        def calc_chaos_iter(x):
-            if len(x) < 50:
-                return 0
-            
-            x_norm = (x - np.min(x)) / (np.max(x) - np.min(x) + 1e-8)
-            
+        close = np.log(df['close'].astype(float))
+
+        def calc_chaos_iter(x: np.ndarray) -> float:
+            values = np.asarray(x, dtype=float)
+            if len(values) < 15:
+                return 0.0
+
+            vmin = np.min(values)
+            vmax = np.max(values)
+            if not np.isfinite(vmin) or not np.isfinite(vmax) or vmax <= vmin:
+                return 0.0
+
+            x_norm = (values - vmin) / (vmax - vmin)
+            vertices = np.array([(0.0, 0.0), (1.0, 0.0), (0.5, np.sqrt(3.0) / 2.0)])
+            point = np.array([0.5, 0.5])
             points = []
-            x_val, y_val = 0.5, 0.5
-            
+
             for i in range(self.iterations):
-                vertex_idx = np.random.randint(0, 3)
-                
-                vertices = [(0, 0), (1, 0), (0.5, np.sqrt(3)/2)]
-                vx, vy = vertices[vertex_idx]
-                
-                x_val = self.r * x_val + (1 - self.r) * vx
-                y_val = self.r * y_val + (1 - self.r) * vy
-                
-                points.append((x_val, y_val))
-            
-            if len(points) < 10:
-                return 0
-            
-            points = np.array(points)
-            
-            center = np.mean(points, axis=0)
+                idx = min(int(x_norm[i % len(x_norm)] * len(vertices)), len(vertices) - 1)
+                point = self.r * point + (1.0 - self.r) * vertices[idx]
+                points.append(point.copy())
+
+            points = np.asarray(points)
+            center = points.mean(axis=0)
             distances = np.linalg.norm(points - center, axis=1)
-            
-            if len(distances) > 10:
-                early_dist = np.mean(distances[:10])
-                late_dist = np.mean(distances[-10:])
-                
-                if early_dist > 0:
-                    convergence = early_dist / (late_dist + 1e-8)
-                else:
-                    convergence = 1
-            else:
-                convergence = 1
-            
-            hist, _ = np.histogram2d(points[:, 0], points[:, 1], bins=5)
-            prob = hist.flatten()
+            convergence = distances[:10].mean() / (distances[-10:].mean() + 1e-8)
+
+            hist, _, _ = np.histogram2d(points[:, 0], points[:, 1], bins=6, range=[[0, 1], [0, 1]])
+            prob = hist.ravel()
             prob = prob[prob > 0]
-            
-            if len(prob) > 0:
-                uniformity = -np.sum(prob * np.log2(prob + 1e-10)) / np.log2(len(prob))
-            else:
-                uniformity = 0
-            
-            return convergence * uniformity
-        
-        chaos_iter = close.rolling(window=self.window).apply(calc_chaos_iter)
-        return chaos_iter
+            if len(prob) == 0:
+                return 0.0
+
+            prob = prob / prob.sum()
+            entropy = -np.sum(prob * np.log(prob))
+            return float(entropy / (1.0 + convergence))
+
+        return close.rolling(window=self.window).apply(calc_chaos_iter, raw=True)
 
 class MultiscaleEntropyFactor(BaseFactor):
     """多尺度熵因子"""
@@ -1603,50 +1629,53 @@ class MultiscaleEntropyFactor(BaseFactor):
         
     def calculate(self, df: pd.DataFrame) -> pd.Series:
         """计算多尺度熵"""
-        close = df['close']
-        
-        def calc_multiscale_entropy(x):
-            if len(x) < 100:
-                return 0
-            
+        close = np.log(df['close'].astype(float))
+
+        def sample_entropy(series: np.ndarray) -> float:
+            if len(series) <= self.m + 2:
+                return 0.0
+            tolerance = self.r * np.std(series)
+            if tolerance <= 0 or not np.isfinite(tolerance):
+                return 0.0
+
+            templates_m = np.array([series[i:i + self.m] for i in range(len(series) - self.m + 1)])
+            templates_m1 = np.array([series[i:i + self.m + 1] for i in range(len(series) - self.m)])
+            if len(templates_m) < 2 or len(templates_m1) < 2:
+                return 0.0
+
+            diff_m = np.max(np.abs(templates_m[:, None, :] - templates_m[None, :, :]), axis=2)
+            diff_m1 = np.max(np.abs(templates_m1[:, None, :] - templates_m1[None, :, :]), axis=2)
+            np.fill_diagonal(diff_m, np.inf)
+            np.fill_diagonal(diff_m1, np.inf)
+            b = np.mean(diff_m <= tolerance)
+            a = np.mean(diff_m1 <= tolerance)
+            if a <= 0 or b <= 0:
+                return 0.0
+            return float(-np.log(a / b))
+
+        def calc_multiscale_entropy(x: np.ndarray) -> float:
+            values = np.asarray(x, dtype=float)
+            if len(values) < 20:
+                return 0.0
+
+            returns = np.diff(values)
             entropies = []
-            
             for scale in self.scales:
-                downsampled = x[::scale]
-                
-                if len(downsampled) < 20:
+                if scale < 1 or scale > len(returns) // 3:
                     continue
-                
-                n = len(downsampled)
-                
-                if n <= self.m:
+                usable = len(returns) // scale
+                if usable < 8:
                     continue
-                    
-                embedded = np.array([downsampled[i:i+self.m] for i in range(n - self.m)])
-                
-                if len(embedded) < 10:
-                    continue
-                
-                count_m = 0
-                count_m1 = 0
-                
-                for i in range(len(embedded)):
-                    for j in range(i + 1, len(embedded)):
-                        if np.max(np.abs(embedded[i] - embedded[j])) < self.r:
-                            count_m += 1
-                            
-                            if i + self.m < n and j + self.m < n:
-                                if np.abs(downsampled[i+self.m] - downsampled[j+self.m]) < self.r:
-                                    count_m1 += 1
-                
-                if count_m > 0:
-                    entropy = -np.log(count_m1 / count_m + 1e-8)
+                coarse = returns[:usable * scale].reshape(usable, scale).mean(axis=1)
+                entropy = sample_entropy(coarse)
+                if np.isfinite(entropy):
                     entropies.append(entropy)
-            
-            return np.mean(entropies) if entropies else 0
-        
-        multiscale_entropy = close.rolling(window=self.window).apply(calc_multiscale_entropy)
-        return multiscale_entropy
+
+            if not entropies:
+                return 0.0
+            return float(np.mean(entropies))
+
+        return close.rolling(window=self.window).apply(calc_multiscale_entropy, raw=True)
 
 class RecurrenceQuantificationFactor(BaseFactor):
     """复发量化分析因子"""
@@ -1658,52 +1687,42 @@ class RecurrenceQuantificationFactor(BaseFactor):
         
     def calculate(self, df: pd.DataFrame) -> pd.Series:
         """计算复发量化特征"""
-        close = df['close']
-        
-        def calc_rqa(x):
-            if len(x) < 30:
-                return 0
-            
-            n = len(x)
-            
-            recurrence = np.zeros((n, n))
-            
-            for i in range(n):
-                for j in range(i + 1, n):
-                    if abs(x[i] - x[j]) < self.threshold:
-                        recurrence[i, j] = 1
-                        recurrence[j, i] = 1
-            
-            total_pairs = n * (n - 1) / 2
-            recurrence_points = np.sum(recurrence) / 2
-            recurrence_rate = recurrence_points / total_pairs if total_pairs > 0 else 0
-            
+        close = np.log(df['close'].astype(float))
+
+        def calc_rqa(x: np.ndarray) -> float:
+            values = np.asarray(x, dtype=float)
+            if len(values) < 15:
+                return 0.0
+
+            scale = np.std(values)
+            if scale <= 0 or not np.isfinite(scale):
+                return 0.0
+
+            normalized = (values - np.mean(values)) / scale
+            distances = np.abs(normalized[:, None] - normalized[None, :])
+            recurrence = distances < self.threshold
+            np.fill_diagonal(recurrence, False)
+
+            recurrence_rate = float(np.mean(recurrence))
             diagonal_lengths = []
-            for i in range(n):
-                length = 0
-                for j in range(1, min(10, n - i)):
-                    if recurrence[i, i+j]:
-                        length += 1
+            for offset in range(1, min(len(values), 10)):
+                diag = np.diag(recurrence, k=offset)
+                run = 0
+                for flag in diag:
+                    if flag:
+                        run += 1
                     else:
-                        break
-                if length >= self.min_line:
-                    diagonal_lengths.append(length)
-            
-            if diagonal_lengths:
-                determinism = np.sum(diagonal_lengths) / recurrence_points if recurrence_points > 0 else 0
-            else:
-                determinism = 0
-            
-            avg_diagonal = np.mean(diagonal_lengths) if diagonal_lengths else 0
-            
-            max_diagonal = max(diagonal_lengths) if diagonal_lengths else 0
-            
-            rqa_index = recurrence_rate * (1 + determinism) * (1 + avg_diagonal / 10)
-            
-            return min(rqa_index, 1)
-        
-        rqa = close.rolling(window=self.window).apply(calc_rqa)
-        return rqa
+                        if run >= self.min_line:
+                            diagonal_lengths.append(run)
+                        run = 0
+                if run >= self.min_line:
+                    diagonal_lengths.append(run)
+
+            determinism = 0.0 if not diagonal_lengths else float(np.sum(diagonal_lengths) / (recurrence.sum() + 1e-8))
+            avg_line = 0.0 if not diagonal_lengths else float(np.mean(diagonal_lengths))
+            return float(recurrence_rate * (1.0 + determinism) * (1.0 + avg_line / len(values)))
+
+        return close.rolling(window=self.window).apply(calc_rqa, raw=True)
 
 class DynamicTimeWarpingFactor(BaseFactor):
     """动态时间规整因子"""
@@ -1714,38 +1733,34 @@ class DynamicTimeWarpingFactor(BaseFactor):
         
     def calculate(self, df: pd.DataFrame) -> pd.Series:
         """计算DTW距离（模式匹配）"""
-        close = df['close']
-        
-        def calc_dtw(x):
-            if len(x) < 30:
-                return 0
-            
-            n = len(x)
-            
-            if n < self.template_length * 2:
-                return 0
-            
-            template = x[-self.template_length:]
-            
-            m = len(template)
-            
-            dtw = np.zeros((m + 1, n - m + 2))
-            dtw[0, 1:] = np.inf
-            dtw[1:, 0] = np.inf
-            
-            for i in range(1, m + 1):
-                for j in range(1, n - m + 2):
-                    cost = abs(template[i-1] - x[j-1])
-                    dtw[i, j] = cost + min(dtw[i-1, j], dtw[i, j-1], dtw[i-1, j-1])
-            
-            dtw_distance = dtw[m, n - m + 1] / m
-            
-            predictability = 1 / (1 + dtw_distance)
-            
-            return predictability
-        
-        dtw = close.rolling(window=self.window).apply(calc_dtw)
-        return dtw
+        close = np.log(df['close'].astype(float))
+
+        def dtw_distance(a: np.ndarray, b: np.ndarray) -> float:
+            dp = np.full((len(a) + 1, len(b) + 1), np.inf)
+            dp[0, 0] = 0.0
+            for i in range(1, len(a) + 1):
+                for j in range(1, len(b) + 1):
+                    cost = abs(a[i - 1] - b[j - 1])
+                    dp[i, j] = cost + min(dp[i - 1, j], dp[i, j - 1], dp[i - 1, j - 1])
+            return float(dp[-1, -1] / (len(a) + len(b)))
+
+        def calc_dtw(x: np.ndarray) -> float:
+            values = np.asarray(x, dtype=float)
+            if len(values) < self.template_length * 3:
+                return 0.0
+
+            returns = np.diff(values)
+            template = returns[-self.template_length:]
+            candidate = returns[-2 * self.template_length:-self.template_length]
+            baseline = returns[:self.template_length]
+            if len(candidate) != self.template_length or len(baseline) != self.template_length:
+                return 0.0
+
+            d_recent = dtw_distance(template, candidate)
+            d_baseline = dtw_distance(template, baseline)
+            return float(1.0 / (1.0 + d_recent / (d_baseline + 1e-8)))
+
+        return close.rolling(window=self.window).apply(calc_dtw, raw=True)
 
 class ManifoldLearningFactor(BaseFactor):
     """流形学习因子（t-SNE, UMAP等）"""
@@ -1756,51 +1771,37 @@ class ManifoldLearningFactor(BaseFactor):
         
     def calculate(self, df: pd.DataFrame) -> pd.Series:
         """计算流形学习特征"""
-        close = df['close']
-        
-        def calc_manifold(x):
-            if len(x) < 50:
-                return 0
-            
-            n = len(x)
-            
-            dim = min(5, n // 5)
-            if dim < 2:
-                return 0
-                
-            embedded = np.array([x[i:i+dim] for i in range(n - dim)])
-            
-            if len(embedded) < 30:
-                return 0
-            
-            eigenvalues_list = []
-            
-            for i in range(min(50, len(embedded))):
-                distances = np.linalg.norm(embedded - embedded[i], axis=1)
-                nearest_idx = np.argsort(distances)[1:6]
-                
-                if len(nearest_idx) < 2:
-                    continue
-                
-                try:
-                    X = embedded[nearest_idx]
-                    X_centered = X - np.mean(X, axis=0)
-                    
-                    cov_matrix = np.cov(X_centered.T)
-                    eigenvalues = np.linalg.eigvalsh(cov_matrix)
-                    eigenvalues = np.sort(eigenvalues)[::-1]
-                    
-                    explained_variance = eigenvalues / np.sum(eigenvalues)
-                    manifold_dim = np.sum(explained_variance ** 2)
-                    
-                    eigenvalues_list.append(1 / manifold_dim)
-                except:
-                    continue
-            
-            return np.mean(eigenvalues_list) if eigenvalues_list else 0
-        
-        manifold_learning = close.rolling(window=self.window).apply(calc_manifold)
-        return manifold_learning
+        close = np.log(df['close'].astype(float))
+
+        def calc_manifold(x: np.ndarray) -> float:
+            values = np.asarray(x, dtype=float)
+            if len(values) < 20:
+                return 0.0
+
+            scale = np.std(values)
+            if scale <= 0 or not np.isfinite(scale):
+                return 0.0
+
+            normalized = (values - np.mean(values)) / scale
+            dim = min(5, max(2, len(normalized) // 8))
+            embedded = _embed_series(normalized, dim)
+            if len(embedded) < 8:
+                return 0.0
+
+            centered = embedded - embedded.mean(axis=0, keepdims=True)
+            cov = np.cov(centered, rowvar=False)
+            eigvals = np.linalg.eigvalsh(cov)
+            eigvals = np.sort(eigvals)[::-1]
+            eigvals = eigvals[eigvals > 1e-10]
+            if len(eigvals) == 0:
+                return 0.0
+
+            explained = eigvals / eigvals.sum()
+            intrinsic_dim = 1.0 / np.sum(explained ** 2)
+            compression = explained[:self.n_components].sum() if len(explained) >= self.n_components else explained.sum()
+            return float(intrinsic_dim * compression / max(1, self.n_components))
+
+        return close.rolling(window=self.window).apply(calc_manifold, raw=True)
 
 class RecurrenceAnalysisFactor(BaseFactor):
     """复发分析因子"""
@@ -1811,43 +1812,56 @@ class RecurrenceAnalysisFactor(BaseFactor):
         
     def calculate(self, df: pd.DataFrame) -> pd.Series:
         """计算复发分析特征"""
-        close = df['close']
-        
-        def calc_recurrence(x):
-            if len(x) < 30:
-                return 0
-            
-            n = len(x)
-            
-            recurrence = np.zeros((n, n))
-            
-            for i in range(n):
-                for j in range(i + 1, n):
-                    if abs(x[i] - x[j]) < self.threshold:
-                        recurrence[i, j] = 1
-                        recurrence[j, i] = 1
-            
+        close = np.log(df['close'].astype(float))
+
+        def calc_recurrence(x: np.ndarray) -> float:
+            values = np.asarray(x, dtype=float)
+            if len(values) < 15:
+                return 0.0
+
+            scale = np.std(values)
+            if scale <= 0 or not np.isfinite(scale):
+                return 0.0
+
+            normalized = (values - np.mean(values)) / scale
+            recurrence = np.abs(normalized[:, None] - normalized[None, :]) < self.threshold
+            np.fill_diagonal(recurrence, False)
+
             diagonal_lengths = []
-            for i in range(n):
-                length = 0
-                for j in range(1, min(10, n - i)):
-                    if recurrence[i, i+j]:
-                        length += 1
+            vertical_lengths = []
+            for offset in range(1, min(len(values), 10)):
+                diag = np.diag(recurrence, k=offset)
+                run = 0
+                for flag in diag:
+                    if flag:
+                        run += 1
                     else:
-                        break
-                if length > 0:
-                    diagonal_lengths.append(length)
-            
+                        if run > 0:
+                            diagonal_lengths.append(run)
+                        run = 0
+                if run > 0:
+                    diagonal_lengths.append(run)
+
+            for col in recurrence.T[:min(len(values), 10)]:
+                run = 0
+                for flag in col:
+                    if flag:
+                        run += 1
+                    else:
+                        if run > 0:
+                            vertical_lengths.append(run)
+                        run = 0
+                if run > 0:
+                    vertical_lengths.append(run)
+
             if not diagonal_lengths:
-                return 0
-            
-            avg_length = np.mean(diagonal_lengths)
-            max_length = max(diagonal_lengths)
-            
-            return avg_length * max_length / 100
-        
-        recurrence_analysis = close.rolling(window=self.window).apply(calc_recurrence)
-        return recurrence_analysis
+                return 0.0
+
+            diag_mean = np.mean(diagonal_lengths)
+            vert_mean = 0.0 if not vertical_lengths else np.mean(vertical_lengths)
+            return float((diag_mean + vert_mean) / len(values))
+
+        return close.rolling(window=self.window).apply(calc_recurrence, raw=True)
 
 class NonlinearDynamicsFactor(BaseFactor):
     """非线性动力学因子"""
@@ -1859,42 +1873,34 @@ class NonlinearDynamicsFactor(BaseFactor):
         
     def calculate(self, df: pd.DataFrame) -> pd.Series:
         """计算非线性动力学特征"""
-        close = df['close']
-        
-        def calc_nonlinear_dynamics(x):
-            if len(x) < 50:
-                return 0
-            
-            n = len(x)
-            
-            if n <= self.m:
-                return 0
-                
-            embedded = np.array([x[i:i+self.m] for i in range(n - self.m)])
-            
-            if len(embedded) < 50:
-                return 0
-            
-            lyapunov_estimates = []
-            
-            for i in range(min(50, len(embedded))):
-                distances = np.linalg.norm(embedded - embedded[i], axis=1)
-                nearest_idx = np.argsort(distances)[1]
-                
-                if nearest_idx < len(embedded):
-                    separation = np.linalg.norm(embedded[nearest_idx] - embedded[i])
-                    if separation > 0:
-                        lyapunov_estimates.append(np.log(separation + 1e-8))
-            
-            if not lyapunov_estimates:
-                return 0
-            
-            mean_lyapunov = np.mean(lyapunov_estimates)
-            
-            return max(0, mean_lyapunov)
-        
-        nonlinear_dynamics = close.rolling(window=self.window).apply(calc_nonlinear_dynamics)
-        return nonlinear_dynamics
+        close = np.log(df['close'].astype(float))
+
+        def calc_nonlinear_dynamics(x: np.ndarray) -> float:
+            values = np.asarray(x, dtype=float)
+            if len(values) < max(20, self.m * 6):
+                return 0.0
+
+            scale = np.std(values)
+            if scale <= 0 or not np.isfinite(scale):
+                return 0.0
+
+            normalized = (values - np.mean(values)) / scale
+            embedded = _embed_series(normalized, self.m)
+            if len(embedded) < 8:
+                return 0.0
+
+            distances = _pairwise_distances(embedded)
+            np.fill_diagonal(distances, np.inf)
+            nearest = np.min(distances, axis=1)
+            nearest = nearest[np.isfinite(nearest) & (nearest > 1e-8)]
+            if len(nearest) == 0:
+                return 0.0
+
+            divergence = np.mean(np.log1p(nearest / self.r))
+            recurrence = np.mean(nearest < self.r)
+            return float(max(0.0, divergence) * (1.0 + recurrence))
+
+        return close.rolling(window=self.window).apply(calc_nonlinear_dynamics, raw=True)
 
 class FractalAnalysisFactor(BaseFactor):
     """分形分析因子"""
@@ -1905,44 +1911,35 @@ class FractalAnalysisFactor(BaseFactor):
         
     def calculate(self, df: pd.DataFrame) -> pd.Series:
         """计算分形分析特征"""
-        close = df['close']
-        
-        def calc_fractal(x):
-            if len(x) < 100:
-                return 0
-            
-            log_price = np.log(x)
-            
-            variances = []
+        close = np.log(df['close'].astype(float))
+
+        def calc_fractal(x: np.ndarray) -> float:
+            values = np.asarray(x, dtype=float)
+            if len(values) < 20:
+                return 0.0
+
+            returns = np.diff(values)
+            valid_scales = []
+            fluctuations = []
             for scale in self.scales:
-                if scale >= len(log_price) // 2:
+                if scale < 2 or scale > len(returns) // 3:
                     continue
-                
-                n_segments = len(log_price) // scale
-                segment_vars = []
-                
-                for i in range(n_segments):
-                    segment = log_price[i*scale:(i+1)*scale]
-                    if len(segment) > 1:
-                        segment_vars.append(np.var(segment))
-                
-                if segment_vars:
-                    variances.append(np.mean(segment_vars))
-            
-            if len(variances) < 3:
-                return 0
-            
-            try:
-                log_scales = np.log(self.scales[:len(variances)])
-                log_vars = np.log(variances)
-                slope, _ = stats.linregress(log_scales, log_vars)[:2]
-                fractal_dim = 0.5 * (1 - slope)
-                return max(0.1, min(2.0, fractal_dim))
-            except:
-                return 0
-        
-        fractal_analysis = close.rolling(window=self.window).apply(calc_fractal)
-        return fractal_analysis
+                usable = len(returns) // scale
+                if usable < 4:
+                    continue
+                coarse = returns[:usable * scale].reshape(usable, scale).sum(axis=1)
+                fluct = np.std(coarse)
+                if np.isfinite(fluct) and fluct > 0:
+                    valid_scales.append(scale)
+                    fluctuations.append(fluct)
+
+            if len(fluctuations) < 3:
+                return 0.0
+
+            slope = np.polyfit(np.log(valid_scales), np.log(fluctuations), 1)[0]
+            return float(np.clip(slope + 1.0, 0.1, 2.0))
+
+        return close.rolling(window=self.window).apply(calc_fractal, raw=True)
 
 class ChaosTheoryFactor(BaseFactor):
     """混沌理论因子"""
@@ -1954,41 +1951,39 @@ class ChaosTheoryFactor(BaseFactor):
         
     def calculate(self, df: pd.DataFrame) -> pd.Series:
         """计算混沌理论特征"""
-        close = df['close']
+        close = np.log(df['close'].astype(float))
         
-        def calc_chaos(x):
-            if len(x) < 50:
-                return 0
+        def calc_chaos(x: np.ndarray) -> float:
+            values = np.asarray(x, dtype=float)
+            if len(values) < max(20, self.m * 6):
+                return 0.0
             
-            n = len(x)
-            
-            if n <= self.m:
-                return 0
-                
-            embedded = np.array([x[i:i+self.m] for i in range(n - self.m)])
-            
-            if len(embedded) < 50:
-                return 0
+            scale = np.std(values)
+            if scale <= 0 or not np.isfinite(scale):
+                return 0.0
+
+            normalized = (values - np.mean(values)) / scale
+            embedded = _embed_series(normalized, self.m)
+
+            if len(embedded) < 8:
+                return 0.0
             
             # 计算关联维度
-            distances = []
-            for i in range(len(embedded)):
-                for j in range(i + 1, len(embedded)):
-                    distances.append(np.linalg.norm(embedded[i] - embedded[j]))
-            
-            if not distances:
-                return 0
-            
-            count = sum(1 for d in distances if d < self.r)
-            correlation_integral = count / len(distances)
-            
-            if correlation_integral > 0:
-                dimension = np.log(correlation_integral + 1e-8) / np.log(self.r)
-                return max(0.1, -dimension)
-            return 0
+            distances = _pairwise_distances(embedded)
+            upper = distances[np.triu_indices(len(embedded), k=1)]
+            upper = upper[np.isfinite(upper) & (upper > 0)]
+
+            if len(upper) < 10:
+                return 0.0
+
+            corr_integral = np.mean(upper < self.r)
+            if corr_integral <= 0 or corr_integral >= 1:
+                return 0.0
+
+            dimension = -np.log(corr_integral) / np.log(max(1.0001, 1.0 / self.r))
+            return float(max(0.0, dimension))
         
-        chaos_theory = close.rolling(window=self.window).apply(calc_chaos)
-        return chaos_theory
+        return close.rolling(window=self.window).apply(calc_chaos, raw=True)
 
 class NonlinearTimeSeriesFactor(BaseFactor):
     """非线性时间序列因子"""
@@ -1999,25 +1994,33 @@ class NonlinearTimeSeriesFactor(BaseFactor):
         
     def calculate(self, df: pd.DataFrame) -> pd.Series:
         """计算非线性时间序列特征"""
-        close = df['close']
+        close = np.log(df['close'].astype(float))
         
-        def calc_nonlinear_ts(x):
-            if len(x) < 50:
-                return 0
+        def calc_nonlinear_ts(x: np.ndarray) -> float:
+            values = np.asarray(x, dtype=float)
+            if len(values) < 20:
+                return 0.0
             
-            returns = np.diff(x)
+            returns = np.diff(values)
             
             # 计算高阶统计量
-            skewness = stats.skew(returns)
-            kurtosis = stats.kurtosis(returns)
+            if len(returns) < 8:
+                return 0.0
+
+            skewness = stats.skew(returns, bias=False)
+            kurtosis = stats.kurtosis(returns, fisher=False, bias=False)
+            skewness = 0.0 if not np.isfinite(skewness) else abs(float(skewness))
+            kurtosis = 3.0 if not np.isfinite(kurtosis) else float(kurtosis)
             
             # 非线性度量
-            nonlinear_metric = abs(skewness) + abs(kurtosis - 3) / 6
+            cubic_dep = np.corrcoef(returns[:-1], returns[1:] ** 2)[0, 1] if len(returns) > 5 else 0.0
+            cubic_dep = 0.0 if not np.isfinite(cubic_dep) else abs(float(cubic_dep))
+
+            nonlinear_metric = skewness + abs(kurtosis - 3.0) / 6.0 + cubic_dep
             
-            return min(nonlinear_metric, 5) / 5
+            return float(nonlinear_metric / (1.0 + nonlinear_metric))
         
-        nonlinear_ts = close.rolling(window=self.window).apply(calc_nonlinear_ts)
-        return nonlinear_ts
+        return close.rolling(window=self.window).apply(calc_nonlinear_ts, raw=True)
 
 class StateSpaceReconstructionFactor(BaseFactor):
     """状态空间重构因子"""
@@ -2029,13 +2032,34 @@ class StateSpaceReconstructionFactor(BaseFactor):
         
     def calculate(self, df: pd.DataFrame) -> pd.Series:
         """计算状态空间重构特征"""
-        close = df['close']
+        close = np.log(df['close'].astype(float))
         
-        def calc_state_space(x):
-            if len(x) < 30:
-                return 0
-            
-            n = len(x)
-            
-            if n <= self.dim:
-                return 0
+        def calc_state_space(x: np.ndarray) -> float:
+            values = np.asarray(x, dtype=float)
+            min_required = (self.dim - 1) * self.tau + 5
+            if len(values) < max(10, min_required):
+                return 0.0
+
+            scale = np.std(values)
+            if scale <= 0 or not np.isfinite(scale):
+                return 0.0
+
+            normalized = (values - np.mean(values)) / scale
+            embedded = _embed_series(normalized, self.dim, delay=max(1, self.tau))
+            if len(embedded) < 5:
+                return 0.0
+
+            centered = embedded - embedded.mean(axis=0, keepdims=True)
+            cov = np.cov(centered, rowvar=False)
+            eigvals = np.linalg.eigvalsh(cov)
+            eigvals = np.sort(eigvals)[::-1]
+            eigvals = eigvals[eigvals > 1e-10]
+            if len(eigvals) == 0:
+                return 0.0
+
+            explained = eigvals / eigvals.sum()
+            effective_dim = 1.0 / np.sum(explained ** 2)
+            reconstruction_stability = explained[0]
+            return float(effective_dim * reconstruction_stability / max(1, self.dim))
+
+        return close.rolling(window=self.window).apply(calc_state_space, raw=True)

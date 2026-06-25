@@ -165,6 +165,20 @@
 pip install -r requirements.txt
 ```
 
+### 使用 uv
+
+```powershell
+uv venv
+.venv\Scripts\activate
+uv sync
+```
+
+运行示例：
+
+```powershell
+uv run python FractalQuant/scripts/generate_etf_minute_factors.py --input-root F:\stock-data\etf-data\etf_1min --output-root F:\stock-data\etf-data\etf_1min_factors --workers 30
+```
+
 ### 环境配置
 
 复制 `.env.example` 到 `.env` 并填写您的API密钥：

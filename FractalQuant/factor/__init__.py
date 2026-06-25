@@ -1,107 +1,141 @@
-"""
-因子模块
-"""
-from .base import BaseFactor
-from .price import ReturnsFactor, PriceMomentumFactor, VolumePriceTrendFactor
-from .volatility import HistoricalVolatilityFactor, ParkinsonVolatilityFactor, GARCHVolatilityFactor
-from .trend import MACDFactor, RSIFactor, EMAFactor, BollingerBandsFactor
-from .orderbook import OrderBookImbalanceFactor, OrderBookPressureFactor
+"""Stable factor exports for local factor scripts."""
 
-# 高级统计因子
-from .advanced import (
-    FutureReturnsFactor, CorrelationFactor, HurstExponentFactor,
-    LyapunovExponentFactor, RecurrenceRateFactor, EmbeddingDimensionFactor,
-    CorrelationDimensionFactor, KolmogorovEntropyFactor, MultifractalSpectrumFactor,
-    DetrendedFluctuationFactor, WaveletEntropyFactor, PhaseSpaceVolumeFactor,
-    PoincareSectionFactor, BifurcationDiagramFactor, ChaosIndicatorFactor,
-    TimeReversalAsymmetryFactor, NonlinearAutocorrelationFactor
+from .base import (
+    BaseFactor,
+    MomentumFactor,
+    OrderBookFactor,
+    PriceFactor,
+    TrendFactor,
+    VolatilityFactor,
+    VolumeFactor,
 )
-
-# 机器学习因子
-from .ml import (
-    MLForecastFactor, MLAnomalyDetectionFactor, ClusteringRegimeFactor,
-    DimensionReductionFactor, EnsemblePredictorFactor, NeuralNetPredictorFactor,
-    SupportVectorForecastFactor, FeatureImportanceFactor, AutoencoderAnomalyFactor,
-    GaussianProcessFactor, RegressionQuantileFactor
+from .price import (
+    LogReturnsFactor,
+    OBVFactor,
+    PriceMomentumFactor,
+    PriceRelativeFactor,
+    PriceZScoreFactor,
+    ReturnsFactor,
+    VolumeMomentumFactor,
+    VolumePriceConfirmFactor,
+    VolumePriceTrendFactor,
 )
-
-# 微观结构因子
+from .volatility import (
+    ATRFactor,
+    AnnualizedVolatilityFactor,
+    BollingerBandWidthFactor,
+    GarmanKlassVolatilityFactor,
+    HistoricalVolatilityFactor,
+    ParkinsonVolatilityFactor,
+    RealizedVolatilityFactor,
+    VolatilityKurtosisFactor,
+    VolatilityRegimeFactor,
+    VolatilitySkewFactor,
+)
+from .trend import (
+    ADXFactor,
+    AOFactor,
+    CCIFactor,
+    CMOFactor,
+    EMAFactor,
+    LSMAFactor,
+    MACDFactor,
+    MovingAverageFactor,
+    ROCFactor,
+    RSIFactor,
+    StochasticFactor,
+    TRIXFactor,
+    WilliamsRFactor,
+)
 from .microstructure import (
-    OrderFlowImbalanceFactor, LiquidityRatioFactor, VolumeWeightedPriceFactor,
-    OrderBookPressureFactor, TradeSizeDistributionFactor, VolatilityAdjustedVolumeFactor,
-    PriceVelocityFactor, MomentumAccelerationFactor, VolumeSpikeFactor,
-    LiquidityShockFactor, OrderBookAsymmetryFactor, TradeDirectionPersistenceFactor,
-    MarketImpactFactor, LiquidityDepthFactor, OrderFlowSignificanceFactor,
-    VolumeClusteringFactor, PriceVolumeDecouplingFactor, MarketEfficiencyFactor,
-    LiquidityMigrationFactor
+    LiquidityDepthFactor,
+    LiquidityMigrationFactor,
+    LiquidityRatioFactor,
+    LiquidityShockFactor,
+    MarketEfficiencyFactor,
+    MarketImpactFactor,
+    MomentumAccelerationFactor,
+    OrderBookAsymmetryFactor,
+    OrderBookPressureFactor,
+    OrderFlowImbalanceFactor,
+    OrderFlowSignificanceFactor,
+    PriceVelocityFactor,
+    PriceVolumeDecouplingFactor,
+    TradeDirectionPersistenceFactor,
+    TradeSizeDistributionFactor,
+    VolatilityAdjustedVolumeFactor,
+    VolumeClusteringFactor,
+    VolumeSpikeFactor,
+    VolumeWeightedPriceFactor,
 )
-
-# 跨市场因子
-from .crossmarket import (
-    CrossMarketCorrelationFactor, ArbitrageOpportunityFactor, MarketLinkageFactor,
-    RelativeStrengthFactor, CointegrationFactor, CrossMarketVolatilityFactor,
-    MarketRegimeSwitchFactor, CrossMarketEntropyFactor, CrossMarketCoherenceFactor,
-    CrossMarketGrangerFactor, CrossMarketJointDistributionFactor, CrossMarketCopulaFactor,
-    CrossMarketPhaseSynchronizationFactor, CrossMarketInformationFlowFactor,
-    CrossMarketMultiscaleCorrelationFactor, CrossMarketDynamicCorrelationFactor
+from .stock_orderbook import (
+    build_stock_orderbook_factor_frame,
+    calculate_order_flow_factors,
+    calculate_snapshot_factors,
+    calculate_trade_flow_factors,
 )
-
-# 组合器
-from .combiner import FactorCombiner, FactorScore, MultiFactorSignal
-
-# 选择器
-from .selector import FactorSelector, WeightOptimizer, FactorEnsemble, FactorBacktest
 
 __all__ = [
-    # 基础
-    'BaseFactor',
-    
-    # 价格因子
-    'ReturnsFactor', 'PriceMomentumFactor', 'VolumePriceTrendFactor',
-    
-    # 波动率因子
-    'HistoricalVolatilityFactor', 'ParkinsonVolatilityFactor', 'GARCHVolatilityFactor',
-    
-    # 趋势因子
-    'MACDFactor', 'RSIFactor', 'EMAFactor', 'BollingerBandsFactor',
-    
-    # 订单簿因子
-    'OrderBookImbalanceFactor', 'OrderBookPressureFactor',
-    
-    # 高级统计因子
-    'FutureReturnsFactor', 'CorrelationFactor', 'HurstExponentFactor',
-    'LyapunovExponentFactor', 'RecurrenceRateFactor', 'EmbeddingDimensionFactor',
-    'CorrelationDimensionFactor', 'KolmogorovEntropyFactor', 'MultifractalSpectrumFactor',
-    'DetrendedFluctuationFactor', 'WaveletEntropyFactor', 'PhaseSpaceVolumeFactor',
-    'PoincareSectionFactor', 'BifurcationDiagramFactor', 'ChaosIndicatorFactor',
-    'TimeReversalAsymmetryFactor', 'NonlinearAutocorrelationFactor',
-    
-    # 机器学习因子
-    'MLForecastFactor', 'MLAnomalyDetectionFactor', 'ClusteringRegimeFactor',
-    'DimensionReductionFactor', 'EnsemblePredictorFactor', 'NeuralNetPredictorFactor',
-    'SupportVectorForecastFactor', 'FeatureImportanceFactor', 'AutoencoderAnomalyFactor',
-    'GaussianProcessFactor', 'RegressionQuantileFactor',
-    
-    # 微观结构因子
-    'OrderFlowImbalanceFactor', 'LiquidityRatioFactor', 'VolumeWeightedPriceFactor',
-    'OrderBookPressureFactor', 'TradeSizeDistributionFactor', 'VolatilityAdjustedVolumeFactor',
-    'PriceVelocityFactor', 'MomentumAccelerationFactor', 'VolumeSpikeFactor',
-    'LiquidityShockFactor', 'OrderBookAsymmetryFactor', 'TradeDirectionPersistenceFactor',
-    'MarketImpactFactor', 'LiquidityDepthFactor', 'OrderFlowSignificanceFactor',
-    'VolumeClusteringFactor', 'PriceVolumeDecouplingFactor', 'MarketEfficiencyFactor',
-    'LiquidityMigrationFactor',
-    
-    # 跨市场因子
-    'CrossMarketCorrelationFactor', 'ArbitrageOpportunityFactor', 'MarketLinkageFactor',
-    'RelativeStrengthFactor', 'CointegrationFactor', 'CrossMarketVolatilityFactor',
-    'MarketRegimeSwitchFactor', 'CrossMarketEntropyFactor', 'CrossMarketCoherenceFactor',
-    'CrossMarketGrangerFactor', 'CrossMarketJointDistributionFactor', 'CrossMarketCopulaFactor',
-    'CrossMarketPhaseSynchronizationFactor', 'CrossMarketInformationFlowFactor',
-    'CrossMarketMultiscaleCorrelationFactor', 'CrossMarketDynamicCorrelationFactor',
-    
-    # 组合器
-    'FactorCombiner', 'FactorScore', 'MultiFactorSignal',
-    
-    # 选择器
-    'FactorSelector', 'WeightOptimizer', 'FactorEnsemble', 'FactorBacktest',
+    "ADXFactor",
+    "AOFactor",
+    "ATRFactor",
+    "AnnualizedVolatilityFactor",
+    "BaseFactor",
+    "BollingerBandWidthFactor",
+    "CCIFactor",
+    "CMOFactor",
+    "EMAFactor",
+    "GarmanKlassVolatilityFactor",
+    "HistoricalVolatilityFactor",
+    "LSMAFactor",
+    "LiquidityDepthFactor",
+    "LiquidityMigrationFactor",
+    "LiquidityRatioFactor",
+    "LiquidityShockFactor",
+    "LogReturnsFactor",
+    "MACDFactor",
+    "MarketEfficiencyFactor",
+    "MarketImpactFactor",
+    "MomentumFactor",
+    "MomentumAccelerationFactor",
+    "MovingAverageFactor",
+    "OBVFactor",
+    "OrderBookFactor",
+    "OrderBookAsymmetryFactor",
+    "OrderBookPressureFactor",
+    "OrderFlowImbalanceFactor",
+    "OrderFlowSignificanceFactor",
+    "ParkinsonVolatilityFactor",
+    "PriceFactor",
+    "PriceMomentumFactor",
+    "PriceRelativeFactor",
+    "PriceVelocityFactor",
+    "PriceVolumeDecouplingFactor",
+    "PriceZScoreFactor",
+    "ROCFactor",
+    "RSIFactor",
+    "RealizedVolatilityFactor",
+    "ReturnsFactor",
+    "build_stock_orderbook_factor_frame",
+    "calculate_order_flow_factors",
+    "calculate_snapshot_factors",
+    "calculate_trade_flow_factors",
+    "StochasticFactor",
+    "TradeDirectionPersistenceFactor",
+    "TradeSizeDistributionFactor",
+    "TRIXFactor",
+    "TrendFactor",
+    "VolatilityFactor",
+    "VolatilityKurtosisFactor",
+    "VolatilityRegimeFactor",
+    "VolatilitySkewFactor",
+    "VolatilityAdjustedVolumeFactor",
+    "VolumeFactor",
+    "VolumeClusteringFactor",
+    "VolumeMomentumFactor",
+    "VolumePriceConfirmFactor",
+    "VolumePriceTrendFactor",
+    "VolumeSpikeFactor",
+    "VolumeWeightedPriceFactor",
+    "WilliamsRFactor",
 ]

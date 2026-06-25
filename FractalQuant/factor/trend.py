@@ -169,8 +169,11 @@ class CCIFactor(MomentumFactor):
         """计算CCI"""
         tp = (df['high'] + df['low'] + df['close']) / 3
         ma = tp.rolling(window=self.window).mean()
-        md = tp.rolling(window=self.window).apply(lambda x: np.mean(np.abs(x - x.iloc[-1])))
-        
+        # 标准CCI的平均绝对偏差应围绕窗口移动均值计算，而非窗口最后一个值。
+        md = tp.rolling(window=self.window).apply(
+            lambda x: np.mean(np.abs(x - np.mean(x))), raw=True
+        )
+
         cci = (tp - ma) / (0.015 * md + 1e-8)
         return cci
 
@@ -197,7 +200,7 @@ class TRIXFactor(MomentumFactor):
         ema2 = ema1.ewm(span=self.window, adjust=False).mean()
         ema3 = ema2.ewm(span=self.window, adjust=False).mean()
         
-        trix = ema3.pct_change(periods=1) * 100
+        trix = ema3.pct_change(periods=1, fill_method=None) * 100
         return trix
 
 class LSMAFactor(TrendFactor):
