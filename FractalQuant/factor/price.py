@@ -14,7 +14,7 @@ class ReturnsFactor(PriceFactor):
         
     def calculate(self, df: pd.DataFrame) -> pd.Series:
         """计算收益率"""
-        returns = df['close'].pct_change(periods=self.window)
+        returns = df['close'].pct_change(periods=self.window, fill_method=None)
         return returns
 
 class LogReturnsFactor(PriceFactor):
@@ -83,16 +83,29 @@ class OBVFactor(VolumeFactor):
         super().__init__('obv', 1)
         
     def calculate(self, df: pd.DataFrame) -> pd.Series:
-        """计算OBV"""
-        obv = [0]
+        """计算OBV
+
+        说明：close 可能因数据清洗（close<=0 置为 NaN）出现缺失。比较运算遇到
+        NaN 会同时落入 else 分支，导致 OBV 被错误地拉平。这里显式检测 NaN，
+        在缺失 bar 上保持前值不变，避免静默错误。
+        """
+        close = df['close']
+        volume = df['volume']
+        obv_values = [0.0]
         for i in range(1, len(df)):
-            if df['close'].iloc[i] > df['close'].iloc[i-1]:
-                obv.append(obv[-1] + df['volume'].iloc[i])
-            elif df['close'].iloc[i] < df['close'].iloc[i-1]:
-                obv.append(obv[-1] - df['volume'].iloc[i])
+            curr = close.iloc[i]
+            prev = close.iloc[i - 1]
+            vol = volume.iloc[i]
+            if pd.isna(curr) or pd.isna(prev) or pd.isna(vol):
+                # 数据缺失，保持前值，不累加
+                obv_values.append(obv_values[-1])
+            elif curr > prev:
+                obv_values.append(obv_values[-1] + vol)
+            elif curr < prev:
+                obv_values.append(obv_values[-1] - vol)
             else:
-                obv.append(obv[-1])
-        return pd.Series(obv, index=df.index)
+                obv_values.append(obv_values[-1])
+        return pd.Series(obv_values, index=df.index)
 
 class VolumeMomentumFactor(VolumeFactor):
     """成交量动量因子"""
@@ -114,8 +127,10 @@ class VolumePriceConfirmFactor(VolumeFactor):
         
     def calculate(self, df: pd.DataFrame) -> pd.Series:
         """计算量价确认"""
-        price_change = df['close'].pct_change()
-        volume_change = df['volume'].pct_change()
-        
-        confirm = (price_change > 0) & (volume_change > 0) | (price_change < 0) & (volume_change < 0)
+        price_change = df['close'].pct_change(fill_method=None)
+        volume_change = df['volume'].pct_change(fill_method=None)
+
+        confirm = ((price_change > 0) & (volume_change > 0)) | (
+            (price_change < 0) & (volume_change < 0)
+        )
         return confirm.astype(float)
