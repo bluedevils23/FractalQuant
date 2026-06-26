@@ -34,6 +34,32 @@ def normalize_trade_date_arg(value: str | None) -> str | None:
     return digits
 
 
+def read_symbol_list_file(path: Path) -> list[str]:
+    if not path.exists():
+        raise FileNotFoundError(f"Symbols file does not exist: {path}")
+
+    symbols: list[str] = []
+    with path.open("r", encoding="utf-8-sig") as handle:
+        for raw_line in handle:
+            line = raw_line.split("#", 1)[0].strip()
+            if not line:
+                continue
+            symbols.append(normalize_symbol_id(line))
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for symbol in symbols:
+        if symbol in seen:
+            continue
+        seen.add(symbol)
+        deduped.append(symbol)
+
+    if not deduped:
+        raise ValueError(f"No symbols found in file: {path}")
+
+    return deduped
+
+
 def normalize_minute_frame(raw_df: pd.DataFrame, ts_code_hint: str) -> pd.DataFrame:
     df = raw_df.copy()
 

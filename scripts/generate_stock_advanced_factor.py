@@ -22,6 +22,7 @@ from factor.advanced_runtime import (  # noqa: E402
     log_result,
     normalize_symbol_id,
     normalize_trade_date_arg,
+    read_symbol_list_file,
     process_symbol_file,
 )
 
@@ -61,6 +62,12 @@ def parse_args() -> argparse.Namespace:
         nargs="*",
         default=None,
         help="Optional symbols such as 000001.SZ 600000.SH.",
+    )
+    parser.add_argument(
+        "--symbols-file",
+        type=Path,
+        default=None,
+        help="Optional text file with one or more symbols per line.",
     )
     parser.add_argument(
         "--limit",
@@ -146,6 +153,27 @@ def discover_minute_files(minute_root: Path, symbols: list[str] | None) -> list[
     return files
 
 
+def load_requested_symbols(
+    symbols: list[str] | None, symbols_file: Path | None
+) -> list[str] | None:
+    requested: list[str] = []
+    if symbols_file is not None:
+        requested.extend(read_symbol_list_file(symbols_file))
+    if symbols:
+        requested.extend(normalize_symbol_id(symbol) for symbol in symbols)
+    if not requested:
+        return None
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for symbol in requested:
+        if symbol in seen:
+            continue
+        seen.add(symbol)
+        deduped.append(symbol)
+    return deduped
+
+
 def main() -> int:
     args = parse_args()
     configure_logging()
@@ -154,7 +182,8 @@ def main() -> int:
     if date_from and date_to and date_from > date_to:
         raise ValueError("--date-from cannot be later than --date-to")
 
-    files = discover_minute_files(args.minute_root, args.symbols)
+    requested_symbols = load_requested_symbols(args.symbols, args.symbols_file)
+    files = discover_minute_files(args.minute_root, requested_symbols)
     if args.limit is not None:
         files = files[: args.limit]
 
