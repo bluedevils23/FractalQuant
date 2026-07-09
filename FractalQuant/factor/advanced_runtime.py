@@ -134,7 +134,7 @@ def prepare_factor_input(df: pd.DataFrame) -> pd.DataFrame:
 
 
 @lru_cache(maxsize=2)
-def build_advanced_factors(exclude_future_returns: bool = False) -> tuple[BaseFactor, ...]:
+def build_advanced_factors(exclude_future_returns: bool = True) -> tuple[BaseFactor, ...]:
     factors: list[BaseFactor] = []
     for name, obj in advanced_module.__dict__.items():
         if not inspect.isclass(obj):
@@ -186,7 +186,7 @@ def calculate_factor_frame(
     df: pd.DataFrame,
     *,
     day_workers: int = 1,
-    exclude_future_returns: bool = False,
+    exclude_future_returns: bool = True,
 ) -> pd.DataFrame:
     factor_input = prepare_factor_input(df)
 
@@ -291,7 +291,7 @@ def process_symbol_file(
     skip_tick_check: bool,
     overwrite: bool,
     *,
-    exclude_future_returns: bool = False,
+    exclude_future_returns: bool = True,
 ) -> dict[str, object]:
     ts_code = normalize_symbol_id(input_path.name)
     output_path = output_root / f"{ts_code}.parquet"

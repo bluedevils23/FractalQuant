@@ -1,5 +1,5 @@
 """
-瓒嬪娍鍜屽姩閲忓洜瀛?
+趋势和动量因子
 """
 import pandas as pd
 import numpy as np
@@ -81,18 +81,18 @@ def _rolling_high_low(
     return cache[key]
 
 class MovingAverageFactor(TrendFactor):
-    """绉诲姩骞冲潎绾垮洜瀛?"""
+    """移动平均线因子"""
     
     def __init__(self, window: int = 20):
         super().__init__('moving_average', window)
         
     def calculate(self, df: pd.DataFrame) -> pd.Series:
-        """璁＄畻绉诲姩骞冲潎绾?"""
+        """计算移动平均线"""
         ma = df['close'].rolling(window=self.window).mean()
         return ma
 
 class MACDFactor(TrendFactor):
-    """MACD鍥犲瓙"""
+    """MACD因子"""
     
     def __init__(self, fast_window: int = 12, slow_window: int = 26, signal_window: int = 9):
         super().__init__('macd', slow_window)
@@ -101,7 +101,7 @@ class MACDFactor(TrendFactor):
         self.signal_window = signal_window
         
     def calculate(self, df: pd.DataFrame) -> pd.Series:
-        """璁＄畻MACD"""
+        """计算MACD"""
         ema_fast = df['close'].ewm(span=self.fast_window, adjust=False).mean()
         ema_slow = df['close'].ewm(span=self.slow_window, adjust=False).mean()
         macd_line = ema_fast - ema_slow
@@ -110,24 +110,24 @@ class MACDFactor(TrendFactor):
         return macd_histogram
 
 class EMAFactor(TrendFactor):
-    """鎸囨暟绉诲姩骞冲潎绾垮洜瀛?"""
+    """指数移动平均线因子"""
     
     def __init__(self, window: int = 20):
         super().__init__('ema', window)
         
     def calculate(self, df: pd.DataFrame) -> pd.Series:
-        """璁＄畻鎸囨暟绉诲姩骞冲潎绾?"""
+        """计算指数移动平均线"""
         ema = df['close'].ewm(span=self.window, adjust=False).mean()
         return ema
 
 class ADXFactor(TrendFactor):
-    """ADX瓒嬪娍寮哄害鍥犲瓙"""
+    """ADX趋势强度因子"""
     
     def __init__(self, window: int = 14):
         super().__init__('adx', window)
         
     def calculate(self, df: pd.DataFrame) -> pd.Series:
-        """璁＄畻ADX"""
+        """计算ADX"""
         high = df['high']
         low = df['low']
         close = df['close']
@@ -149,13 +149,13 @@ class ADXFactor(TrendFactor):
         return adx
 
 class RSIFactor(MomentumFactor):
-    """RSI鐩稿寮哄急鎸囨暟鍥犲瓙"""
+    """RSI相对强弱指数因子"""
     
     def __init__(self, window: int = 14):
         super().__init__('rsi', window)
         
     def calculate(self, df: pd.DataFrame) -> pd.Series:
-        """璁＄畻RSI"""
+        """计算RSI"""
         gain, loss = _rolling_gain_loss_mean(df, self.window)
         
         rs = gain / (loss + 1e-8)
@@ -163,7 +163,7 @@ class RSIFactor(MomentumFactor):
         return rsi
 
 class StochasticFactor(MomentumFactor):
-    """闅忔満鎸囨爣鍥犲瓙"""
+    """随机指标因子"""
     
     def __init__(self, window: int = 14, smooth_k: int = 3, smooth_d: int = 3):
         super().__init__('stochastic', window)
@@ -171,7 +171,7 @@ class StochasticFactor(MomentumFactor):
         self.smooth_d = smooth_d
         
     def calculate(self, df: pd.DataFrame) -> pd.Series:
-        """璁＄畻闅忔満鎸囨爣"""
+        """计算随机指标"""
         high, low = _rolling_high_low(df, self.window)
         
         k = 100 * (df['close'] - low) / (high - low + 1e-8)
@@ -180,33 +180,33 @@ class StochasticFactor(MomentumFactor):
         return d
 
 class CMOFactor(MomentumFactor):
-    """Chande Momentum Oscillator鍥犲瓙"""
+    """Chande Momentum Oscillator因子"""
     
     def __init__(self, window: int = 14):
         super().__init__('cmo', window)
         
     def calculate(self, df: pd.DataFrame) -> pd.Series:
-        """璁＄畻CMO"""
+        """计算CMO"""
         total_gain, total_loss = _rolling_gain_loss_sum(df, self.window)
         
         cmo = 100 * (total_gain - total_loss) / (total_gain + total_loss + 1e-8)
         return cmo
 
 class WilliamsRFactor(MomentumFactor):
-    """Williams %R鍥犲瓙"""
+    """Williams %R因子"""
     
     def __init__(self, window: int = 14):
         super().__init__('williams_r', window)
         
     def calculate(self, df: pd.DataFrame) -> pd.Series:
-        """璁＄畻Williams %R"""
+        """计算Williams %R"""
         high, low = _rolling_high_low(df, self.window)
         
         wr = (high - df['close']) / (high - low + 1e-8) * -100
         return wr
 
 class AOFactor(MomentumFactor):
-    """Awesome Oscillator鍥犲瓙"""
+    """Awesome Oscillator因子"""
     
     def __init__(self, short_window: int = 5, long_window: int = 34):
         super().__init__('awesome_oscillator', long_window)
@@ -214,7 +214,7 @@ class AOFactor(MomentumFactor):
         self.long_window = long_window
         
     def calculate(self, df: pd.DataFrame) -> pd.Series:
-        """璁＄畻Awesome Oscillator"""
+        """计算Awesome Oscillator"""
         median_price = (df['high'] + df['low']) / 2
         
         short_ao = median_price.rolling(window=self.short_window).mean()
@@ -224,16 +224,16 @@ class AOFactor(MomentumFactor):
         return ao
 
 class CCIFactor(MomentumFactor):
-    """鍟嗗搧閫氶亾鎸囨暟鍥犲瓙"""
+    """商品通道指数因子"""
     
     def __init__(self, window: int = 20):
         super().__init__('cci', window)
         
     def calculate(self, df: pd.DataFrame) -> pd.Series:
-        """璁＄畻CCI"""
+        """计算CCI"""
         tp = (df['high'] + df['low'] + df['close']) / 3
         ma = tp.rolling(window=self.window).mean()
-        # 鏍囧噯CCI鐨勫钩鍧囩粷瀵瑰亸宸簲鍥寸粫绐楀彛绉诲姩鍧囧€艰绠楋紝鑰岄潪绐楀彛鏈€鍚庝竴涓€笺€?
+        # 标准CCI的平均绝对偏差应围绕窗口移动均值计算，而非窗口最后一个值。
         values = tp.to_numpy(dtype=float, copy=False)
         md_values = np.full(len(values), np.nan, dtype=float)
         if len(values) >= self.window:
@@ -250,24 +250,24 @@ class CCIFactor(MomentumFactor):
         return cci
 
 class ROCFactor(MomentumFactor):
-    """鍔ㄩ噺姣旂巼鍥犲瓙"""
+    """动量比率因子"""
     
     def __init__(self, window: int = 12):
         super().__init__('roc', window)
         
     def calculate(self, df: pd.DataFrame) -> pd.Series:
-        """璁＄畻ROC"""
+        """计算ROC"""
         roc = (df['close'] - df['close'].shift(self.window)) / (df['close'].shift(self.window) + 1e-8) * 100
         return roc
 
 class TRIXFactor(MomentumFactor):
-    """TRIX鍥犲瓙"""
+    """TRIX因子"""
     
     def __init__(self, window: int = 15):
         super().__init__('trix', window)
         
     def calculate(self, df: pd.DataFrame) -> pd.Series:
-        """璁＄畻TRIX"""
+        """计算TRIX"""
         ema1 = df['close'].ewm(span=self.window, adjust=False).mean()
         ema2 = ema1.ewm(span=self.window, adjust=False).mean()
         ema3 = ema2.ewm(span=self.window, adjust=False).mean()
@@ -276,13 +276,13 @@ class TRIXFactor(MomentumFactor):
         return trix
 
 class LSMAFactor(TrendFactor):
-    """绾挎€у洖褰掓枩鐜囧洜瀛?"""
+    """线性回归斜率因子"""
     
     def __init__(self, window: int = 20):
         super().__init__('lsma', window)
         
     def calculate(self, df: pd.DataFrame) -> pd.Series:
-        """璁＄畻绾挎€у洖褰掓枩鐜?"""
+        """计算线性回归斜率"""
         close = df['close']
         values = close.to_numpy(dtype=float, copy=False)
         result = np.full(len(values), np.nan, dtype=float)

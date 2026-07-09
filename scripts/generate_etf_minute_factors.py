@@ -143,6 +143,9 @@ def build_factors() -> list[object]:
     ]
 
 
+FACTORS = build_factors()
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Generate ETF minute factors from local parquet files."
@@ -258,33 +261,37 @@ def prepare_factor_input(df: pd.DataFrame) -> pd.DataFrame:
 
 def calculate_factor_frame(df: pd.DataFrame) -> pd.DataFrame:
     factor_input = prepare_factor_input(df)
+    factors = FACTORS
 
     # 按交易日分组分别计算滚动窗口因子，避免隔夜跨日污染：
     # 每个交易日开头会有窗口预热期（前若干根 bar 为 NaN），这是预期行为。
     trade_days = factor_input.index.normalize()
-    unique_days = trade_days.unique()
+    trade_day_values = trade_days.to_numpy(dtype="datetime64[ns]", copy=False)
 
-    if len(unique_days) <= 1:
-        factor_df = _calculate_factors_for_group(factor_input)
+    if len(trade_day_values) <= 1:
+        factor_df = _calculate_factors_for_group(factor_input, factors)
     else:
+        split_points = np.flatnonzero(trade_day_values[1:] != trade_day_values[:-1]) + 1
+        starts = np.concatenate(([0], split_points))
+        stops = np.concatenate((split_points, [len(factor_input)]))
         per_day_frames = [
-            _calculate_factors_for_group(factor_input.loc[trade_days == day])
-            for day in unique_days
+            _calculate_factors_for_group(factor_input.iloc[start:stop], factors)
+            for start, stop in zip(starts, stops)
         ]
         factor_df = pd.concat(per_day_frames, axis=0)
-        factor_df = factor_df.reindex(factor_input.index)
 
     return pd.concat([df, factor_df], axis=1)
 
 
-def _calculate_factors_for_group(factor_input: pd.DataFrame) -> pd.DataFrame:
+def _calculate_factors_for_group(
+    factor_input: pd.DataFrame, factors: list[object]
+) -> pd.DataFrame:
     factor_series: dict[str, pd.Series] = {}
 
-    for factor in build_factors():
+    for factor in factors:
         with np.errstate(divide="ignore", invalid="ignore"):
-            values = factor.calculate(factor_input)
+            series = factor.calculate(factor_input)
 
-        series = values
         if not series.index.equals(factor_input.index):
             series = series.reindex(factor_input.index)
 

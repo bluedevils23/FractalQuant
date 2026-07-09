@@ -27,13 +27,17 @@ def _pairwise_distances(points: np.ndarray) -> np.ndarray:
 
 
 class FutureReturnsFactor(BaseFactor):
-    """Forward return label used by factor analysis workflows."""
+    """Forward return label used by factor analysis workflows.
+
+    This is intentionally look-ahead and should not be used as a predictor
+    feature.
+    """
 
     def __init__(self, window: int = 5):
         super().__init__('future_returns', window)
 
     def calculate(self, df: pd.DataFrame) -> pd.Series:
-        close = np.log(df['close'].astype(float))
+        close = df['close'].astype(float)
         return close.shift(-self.window) / close - 1
 
 
@@ -81,7 +85,7 @@ class HurstExponentFactor(BaseFactor):
                     continue
 
                 lags.append(lag)
-                tau.append(np.sqrt(std))
+                tau.append(std)
 
             if len(tau) < 3:
                 return 0.5
@@ -459,9 +463,11 @@ class DetrendedFluctuationFactor(BaseFactor):
 class WaveletEntropyFactor(BaseFactor):
     """小波熵因子"""
     
-    def __init__(self, window: int = 50, wavelet: str = 'db4'):
+    def __init__(self, window: int = 50, wavelet: str = 'haar'):
         super().__init__('wavelet_entropy', window)
-        self.wavelet = wavelet
+        self.wavelet = str(wavelet).lower()
+        if self.wavelet not in {'haar', 'db1'}:
+            raise ValueError("WaveletEntropyFactor currently supports only Haar/db1.")
         
     def calculate(self, df: pd.DataFrame) -> pd.Series:
         """计算小波熵（时频分析）"""
@@ -472,6 +478,7 @@ class WaveletEntropyFactor(BaseFactor):
             if len(values) < 16:
                 return 0.0
 
+            # The lightweight in-repo implementation uses a Haar/db1 dyadic split.
             detail_energies = []
             signal = np.diff(values)
             while len(signal) >= 4:
@@ -523,13 +530,22 @@ class PhaseSpaceVolumeFactor(BaseFactor):
             if len(embedded) < 8:
                 return 0.0
 
-            distances = _pairwise_distances(embedded)
-            upper = distances[np.triu_indices(len(embedded), k=1)]
-            upper = upper[np.isfinite(upper)]
-            if len(upper) == 0:
+            ranges = np.ptp(embedded, axis=0)
+            if np.any(~np.isfinite(ranges)) or np.any(ranges <= 0):
                 return 0.0
 
-            return float(np.mean(upper < self.r))
+            bounding_volume = float(np.prod(ranges))
+
+            cov = np.cov(embedded, rowvar=False)
+            eigvals = np.linalg.eigvalsh(cov)
+            eigvals = eigvals[np.isfinite(eigvals) & (eigvals > 1e-12)]
+            if len(eigvals) == 0:
+                return float(np.log1p(bounding_volume))
+
+            ellipsoid_volume = float(np.sqrt(np.prod(eigvals)))
+            occupied_volume = min(bounding_volume, ellipsoid_volume * len(eigvals))
+            radius_scale = max(float(self.r), 1e-8) ** self.dim
+            return float(np.log1p(max(0.0, occupied_volume / radius_scale)))
 
         return close.rolling(window=self.window).apply(calc_phase_volume, raw=True)
 
@@ -1311,7 +1327,7 @@ class BifurcationParameterFactor(BaseFactor):
                 return 0.5
 
             change_idx = int(np.argmax(np.abs(np.diff(variances))))
-            return float(change_idx / max(1, len(variances) - 1))
+            return float(r_values[change_idx])
 
         return close.rolling(window=self.window).apply(calc_bifurcation_param, raw=True)
 

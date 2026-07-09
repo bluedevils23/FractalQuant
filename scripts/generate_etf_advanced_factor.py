@@ -111,6 +111,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Skip tick coverage validation to save time.",
     )
+    parser.add_argument(
+        "--include-future-returns",
+        action="store_true",
+        help="Include the look-ahead future_returns label column in outputs.",
+    )
     return parser.parse_args()
 
 
@@ -220,7 +225,7 @@ def main() -> int:
                     day_workers,
                     args.skip_tick_check,
                     args.overwrite,
-                    exclude_future_returns=False,
+                    exclude_future_returns=not args.include_future_returns,
                 )
                 log_result(LOGGER, result)
             except Exception as exc:  # noqa: BLE001
@@ -240,7 +245,7 @@ def main() -> int:
                     day_workers,
                     args.skip_tick_check,
                     args.overwrite,
-                    exclude_future_returns=False,
+                    exclude_future_returns=not args.include_future_returns,
                 ): input_path
                 for input_path in files
             }
