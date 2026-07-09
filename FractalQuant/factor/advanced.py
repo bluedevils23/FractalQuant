@@ -285,18 +285,20 @@ class CorrelationDimensionFactor(BaseFactor):
             if len(upper) < 10:
                 return 0.0
 
-            r_low = max(self.min_r, float(np.percentile(upper, 10)))
-            r_high = min(self.max_r, float(np.percentile(upper, 90)))
+            r_low = max(self.min_r, float(np.percentile(upper, 20)))
+            r_high = min(self.max_r, float(np.percentile(upper, 80)))
             if r_high <= r_low:
                 return 0.0
 
-            r_values = np.logspace(np.log10(r_low), np.log10(r_high), 8)
+            r_values = np.logspace(np.log10(r_low), np.log10(r_high), 6)
             valid_r = []
             valid_c = []
 
             for r in r_values:
                 c_r = np.mean(upper < r)
-                if 0 < c_r < 1:
+                # Avoid near-zero and near-one correlation integrals, which make
+                # the log-log slope numerically unstable on short intraday windows.
+                if 0.02 <= c_r <= 0.98:
                     valid_r.append(r)
                     valid_c.append(c_r)
 
@@ -304,7 +306,7 @@ class CorrelationDimensionFactor(BaseFactor):
                 return 0.0
 
             slope = np.polyfit(np.log(valid_r), np.log(valid_c), 1)[0]
-            return float(max(0.0, slope))
+            return float(np.clip(slope, 0.0, 2.0))
 
         return close.rolling(window=self.window).apply(calc_corr_dim, raw=True)
 
@@ -1923,7 +1925,7 @@ class FractalAnalysisFactor(BaseFactor):
     
     def __init__(self, window: int = 50, scales: List[int] = None):
         super().__init__('fractal_analysis', window)
-        self.scales = scales or [5, 10, 20, 40, 80]
+        self.scales = scales
         
     def calculate(self, df: pd.DataFrame) -> pd.Series:
         """计算分形分析特征"""
@@ -1935,13 +1937,31 @@ class FractalAnalysisFactor(BaseFactor):
                 return 0.0
 
             returns = np.diff(values)
+            if len(returns) < 12:
+                return 0.0
+
+            if self.scales is not None:
+                candidate_scales = sorted(
+                    {int(scale) for scale in self.scales if int(scale) >= 2}
+                )
+            else:
+                max_scale = max(4, len(returns) // 2)
+                geom = np.geomspace(2, max_scale, num=min(8, max_scale))
+                candidate_scales = sorted(
+                    {
+                        int(round(scale))
+                        for scale in geom
+                        if int(round(scale)) >= 2
+                    }
+                )
+
             valid_scales = []
             fluctuations = []
-            for scale in self.scales:
-                if scale < 2 or scale > len(returns) // 3:
+            for scale in candidate_scales:
+                if scale < 2 or scale > len(returns) // 2:
                     continue
                 usable = len(returns) // scale
-                if usable < 4:
+                if usable < 3:
                     continue
                 coarse = returns[:usable * scale].reshape(usable, scale).sum(axis=1)
                 fluct = np.std(coarse)
@@ -1953,7 +1973,7 @@ class FractalAnalysisFactor(BaseFactor):
                 return 0.0
 
             slope = np.polyfit(np.log(valid_scales), np.log(fluctuations), 1)[0]
-            return float(np.clip(slope + 1.0, 0.1, 2.0))
+            return float(np.clip(slope, 0.0, 2.0))
 
         return close.rolling(window=self.window).apply(calc_fractal, raw=True)
 
