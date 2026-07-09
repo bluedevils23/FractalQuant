@@ -3,6 +3,7 @@
 """
 import pandas as pd
 import numpy as np
+import weakref
 from typing import List, Dict, Optional
 from scipy import stats
 from .base import VolatilityFactor
@@ -13,6 +14,86 @@ TRADING_DAYS_PER_YEAR = 252
 BARS_PER_DAY = 240
 PERIODS_PER_YEAR = TRADING_DAYS_PER_YEAR * BARS_PER_DAY
 
+_VOLATILITY_CACHE: dict[int, tuple[weakref.ReferenceType[pd.DataFrame], dict]] = {}
+
+
+def _volatility_cache(df: pd.DataFrame) -> dict:
+    key = id(df)
+    entry = _VOLATILITY_CACHE.get(key)
+    if entry is None or entry[0]() is not df:
+        ref = weakref.ref(
+            df,
+            lambda _ref, cache_key=key: _VOLATILITY_CACHE.pop(cache_key, None),
+        )
+        entry = (ref, {})
+        _VOLATILITY_CACHE[key] = entry
+    return entry[1]
+
+
+def _log_returns(df: pd.DataFrame) -> pd.Series:
+    cache = _volatility_cache(df)
+    key = "log_returns"
+    if key not in cache:
+        cache[key] = np.log(df["close"] / df["close"].shift(1))
+    return cache[key]
+
+
+def _pct_returns(df: pd.DataFrame) -> pd.Series:
+    cache = _volatility_cache(df)
+    key = "pct_returns"
+    if key not in cache:
+        cache[key] = df["close"].pct_change(fill_method=None)
+    return cache[key]
+
+
+def _log_high_low(df: pd.DataFrame) -> pd.Series:
+    cache = _volatility_cache(df)
+    key = "log_high_low"
+    if key not in cache:
+        cache[key] = np.log(df["high"] / df["low"])
+    return cache[key]
+
+
+def _log_close_open(df: pd.DataFrame) -> pd.Series:
+    cache = _volatility_cache(df)
+    key = "log_close_open"
+    if key not in cache:
+        cache[key] = np.log(df["close"] / df["open"])
+    return cache[key]
+
+
+def _rolling_log_return_std(df: pd.DataFrame, window: int) -> pd.Series:
+    cache = _volatility_cache(df)
+    key = ("rolling_log_return_std", window)
+    if key not in cache:
+        cache[key] = _log_returns(df).rolling(window=window).std()
+    return cache[key]
+
+
+def _rolling_pct_return_std(df: pd.DataFrame, window: int) -> pd.Series:
+    cache = _volatility_cache(df)
+    key = ("rolling_pct_return_std", window)
+    if key not in cache:
+        cache[key] = _pct_returns(df).rolling(window=window).std()
+    return cache[key]
+
+
+def _true_range(df: pd.DataFrame) -> pd.Series:
+    cache = _volatility_cache(df)
+    key = "true_range"
+    if key not in cache:
+        high = df["high"]
+        low = df["low"]
+        prev_close = df["close"].shift()
+        high_low = (high - low).to_numpy(dtype=float, copy=False)
+        high_close = np.abs((high - prev_close).to_numpy(dtype=float, copy=False))
+        low_close = np.abs((low - prev_close).to_numpy(dtype=float, copy=False))
+        cache[key] = pd.Series(
+            np.maximum.reduce([high_low, high_close, low_close]),
+            index=df.index,
+        )
+    return cache[key]
+
 class HistoricalVolatilityFactor(VolatilityFactor):
     """历史波动率因子"""
 
@@ -22,8 +103,7 @@ class HistoricalVolatilityFactor(VolatilityFactor):
 
     def calculate(self, df: pd.DataFrame) -> pd.Series:
         """计算历史波动率（按分钟频率年化）"""
-        log_returns = np.log(df['close'] / df['close'].shift(1))
-        volatility = log_returns.rolling(window=self.window).std() * np.sqrt(self.periods_per_year)
+        volatility = _rolling_log_return_std(df, self.window) * np.sqrt(self.periods_per_year)
         return volatility
 
 class AnnualizedVolatilityFactor(VolatilityFactor):
@@ -35,8 +115,7 @@ class AnnualizedVolatilityFactor(VolatilityFactor):
 
     def calculate(self, df: pd.DataFrame) -> pd.Series:
         """计算年化波动率（按分钟频率年化）"""
-        log_returns = np.log(df['close'] / df['close'].shift(1))
-        volatility = log_returns.rolling(window=self.window).std() * np.sqrt(self.periods_per_year)
+        volatility = _rolling_log_return_std(df, self.window) * np.sqrt(self.periods_per_year)
         return volatility
 
 class RealizedVolatilityFactor(VolatilityFactor):
@@ -47,7 +126,7 @@ class RealizedVolatilityFactor(VolatilityFactor):
         
     def calculate(self, df: pd.DataFrame) -> pd.Series:
         """计算实现波动率"""
-        log_returns = np.log(df['close'] / df['close'].shift(1))
+        log_returns = _log_returns(df)
         rv = np.sqrt((log_returns ** 2).rolling(window=self.window).sum())
         return rv
 
@@ -59,7 +138,7 @@ class ParkinsonVolatilityFactor(VolatilityFactor):
         
     def calculate(self, df: pd.DataFrame) -> pd.Series:
         """计算Parkinson波动率"""
-        high_low = np.log(df['high'] / df['low'])
+        high_low = _log_high_low(df)
         volatility = np.sqrt((high_low ** 2).rolling(window=self.window).mean() / (4 * np.log(2)))
         return volatility
 
@@ -71,8 +150,8 @@ class GarmanKlassVolatilityFactor(VolatilityFactor):
         
     def calculate(self, df: pd.DataFrame) -> pd.Series:
         """计算Garman-Klass波动率"""
-        log_high_low = np.log(df['high'] / df['low'])
-        log_close_open = np.log(df['close'] / df['open'])
+        log_high_low = _log_high_low(df)
+        log_close_open = _log_close_open(df)
 
         variance = (
             0.5 * (log_high_low ** 2).rolling(window=self.window).mean() -
@@ -107,12 +186,7 @@ class ATRFactor(VolatilityFactor):
         
     def calculate(self, df: pd.DataFrame) -> pd.Series:
         """计算ATR"""
-        high_low = df['high'] - df['low']
-        high_close = np.abs(df['high'] - df['close'].shift())
-        low_close = np.abs(df['low'] - df['close'].shift())
-        
-        ranges = pd.concat([high_low, high_close, low_close], axis=1)
-        true_range = np.max(ranges, axis=1)
+        true_range = _true_range(df)
         atr = true_range.rolling(window=self.window).mean()
         return atr
 
@@ -126,8 +200,8 @@ class VolatilityRegimeFactor(VolatilityFactor):
         
     def calculate(self, df: pd.DataFrame) -> pd.Series:
         """计算波动率 regimes"""
-        short_vol = df['close'].pct_change(fill_method=None).rolling(window=self.short_window).std()
-        long_vol = df['close'].pct_change(fill_method=None).rolling(window=self.long_window).std()
+        short_vol = _rolling_pct_return_std(df, self.short_window)
+        long_vol = _rolling_pct_return_std(df, self.long_window)
         
         regime = short_vol / long_vol
         return regime
@@ -140,7 +214,7 @@ class VolatilitySkewFactor(VolatilityFactor):
         
     def calculate(self, df: pd.DataFrame) -> pd.Series:
         """计算波动率偏度"""
-        log_returns = np.log(df['close'] / df['close'].shift(1))
+        log_returns = _log_returns(df)
         skew = log_returns.rolling(window=self.window).skew()
         return skew
 
@@ -152,6 +226,6 @@ class VolatilityKurtosisFactor(VolatilityFactor):
         
     def calculate(self, df: pd.DataFrame) -> pd.Series:
         """计算波动率峰度"""
-        log_returns = np.log(df['close'] / df['close'].shift(1))
+        log_returns = _log_returns(df)
         kurtosis = log_returns.rolling(window=self.window).kurt()
         return kurtosis

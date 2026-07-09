@@ -284,8 +284,16 @@ def _calculate_factors_for_group(factor_input: pd.DataFrame) -> pd.DataFrame:
         with np.errstate(divide="ignore", invalid="ignore"):
             values = factor.calculate(factor_input)
 
-        series = pd.Series(values, index=factor_input.index, copy=False)
-        series = series.replace([np.inf, -np.inf], np.nan)
+        series = values
+        if not series.index.equals(factor_input.index):
+            series = series.reindex(factor_input.index)
+
+        array = series.to_numpy(dtype=float, copy=False)
+        if not np.isfinite(array).all():
+            cleaned = array.copy()
+            cleaned[~np.isfinite(cleaned)] = np.nan
+            series = pd.Series(cleaned, index=factor_input.index, copy=False)
+
         factor_series[factor.name] = series
 
     return pd.DataFrame(factor_series, index=factor_input.index)

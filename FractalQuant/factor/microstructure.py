@@ -3,9 +3,13 @@
 """
 import pandas as pd
 import numpy as np
+import weakref
 from typing import List, Dict, Optional
 from scipy import stats
 from .base import BaseFactor
+
+
+_MICROSTRUCTURE_CACHE: dict[int, tuple[weakref.ReferenceType[pd.DataFrame], dict]] = {}
 
 
 def _aligned_window_values(
@@ -23,6 +27,131 @@ def _full_window_mask(series: pd.Series, window: int) -> pd.Series:
 def _rolling_std0(series: pd.Series, window: int) -> pd.Series:
     return series.rolling(window, min_periods=window).std(ddof=0)
 
+
+def _rolling_sum_array(values: np.ndarray, window: int) -> np.ndarray:
+    result = np.full(len(values), np.nan, dtype=float)
+    if window <= 0 or len(values) < window:
+        return result
+
+    clean = np.nan_to_num(values, nan=0.0)
+    cumsum = np.empty(len(values) + 1, dtype=float)
+    cumsum[0] = 0.0
+    cumsum[1:] = np.cumsum(clean, dtype=float)
+    result[window - 1 :] = cumsum[window:] - cumsum[:-window]
+    return result
+
+
+def _microstructure_cache(df: pd.DataFrame) -> dict:
+    key = id(df)
+    entry = _MICROSTRUCTURE_CACHE.get(key)
+    if entry is None or entry[0]() is not df:
+        ref = weakref.ref(
+            df,
+            lambda _ref, cache_key=key: _MICROSTRUCTURE_CACHE.pop(cache_key, None),
+        )
+        entry = (ref, {})
+        _MICROSTRUCTURE_CACHE[key] = entry
+    return entry[1]
+
+
+def _valid_close_window(df: pd.DataFrame, window: int) -> pd.Series:
+    cache = _microstructure_cache(df)
+    key = ("valid_close_window", window)
+    if key not in cache:
+        cache[key] = _full_window_mask(df["close"], window)
+    return cache[key]
+
+
+def _close_diff(df: pd.DataFrame) -> pd.Series:
+    cache = _microstructure_cache(df)
+    key = "close_diff"
+    if key not in cache:
+        cache[key] = df["close"].diff()
+    return cache[key]
+
+
+def _rolling_direction_counts(
+    df: pd.DataFrame, window_returns: int
+) -> tuple[pd.Series, pd.Series]:
+    cache = _microstructure_cache(df)
+    key = ("direction_counts", window_returns)
+    if key not in cache:
+        returns = _close_diff(df).to_numpy(dtype=float, copy=False)
+        buy_values = np.where(np.isfinite(returns) & (returns > 0), 1.0, 0.0)
+        sell_values = np.where(np.isfinite(returns) & (returns < 0), 1.0, 0.0)
+        buy_count = pd.Series(
+            _rolling_sum_array(buy_values, window_returns), index=df.index
+        )
+        sell_count = pd.Series(
+            _rolling_sum_array(sell_values, window_returns), index=df.index
+        )
+        cache[key] = (buy_count, sell_count)
+    return cache[key]
+
+
+def _rolling_flow_sums(
+    df: pd.DataFrame, window_returns: int
+) -> tuple[pd.Series, pd.Series]:
+    cache = _microstructure_cache(df)
+    key = ("flow_sums", window_returns)
+    if key not in cache:
+        returns = _close_diff(df).to_numpy(dtype=float, copy=False)
+        volume = df["volume"].to_numpy(dtype=float, copy=False)
+        valid = np.isfinite(returns) & np.isfinite(volume)
+        buy_values = np.where(valid, np.clip(returns, 0.0, None) * volume, 0.0)
+        sell_values = np.where(valid, np.clip(-returns, 0.0, None) * volume, 0.0)
+        buy_flow = pd.Series(
+            _rolling_sum_array(buy_values, window_returns), index=df.index
+        )
+        sell_flow = pd.Series(
+            _rolling_sum_array(sell_values, window_returns), index=df.index
+        )
+        cache[key] = (buy_flow, sell_flow)
+    return cache[key]
+
+
+def _rolling_return_stats(
+    df: pd.DataFrame, window_returns: int
+) -> tuple[pd.Series, pd.Series]:
+    cache = _microstructure_cache(df)
+    key = ("return_stats", window_returns)
+    if key not in cache:
+        returns = _close_diff(df).to_numpy(dtype=float, copy=False)
+        finite = np.isfinite(returns)
+        clean_returns = np.where(finite, returns, 0.0)
+        counts = _rolling_sum_array(finite.astype(float), window_returns)
+        sums = _rolling_sum_array(clean_returns, window_returns)
+        sq_sums = _rolling_sum_array(clean_returns * clean_returns, window_returns)
+        mean_values = sums / window_returns
+        variance = sq_sums / window_returns - mean_values * mean_values
+        variance = np.clip(variance, 0.0, None)
+        std_values = np.sqrt(variance)
+        mean_values[counts != window_returns] = np.nan
+        std_values[counts != window_returns] = np.nan
+        mean_returns = pd.Series(mean_values, index=df.index)
+        std_returns = pd.Series(std_values, index=df.index)
+        cache[key] = (mean_returns, std_returns)
+    return cache[key]
+
+
+def _rolling_return_magnitude_sums(
+    df: pd.DataFrame, window_returns: int
+) -> tuple[pd.Series, pd.Series]:
+    cache = _microstructure_cache(df)
+    key = ("return_magnitude_sums", window_returns)
+    if key not in cache:
+        returns = _close_diff(df).to_numpy(dtype=float, copy=False)
+        buy_values = np.where(np.isfinite(returns), np.clip(returns, 0.0, None), 0.0)
+        sell_values = np.where(np.isfinite(returns), np.clip(-returns, 0.0, None), 0.0)
+        buy_sum = pd.Series(
+            _rolling_sum_array(buy_values, window_returns), index=df.index
+        )
+        sell_sum = pd.Series(
+            _rolling_sum_array(sell_values, window_returns), index=df.index
+        )
+        cache[key] = (buy_sum, sell_sum)
+    return cache[key]
+
 class OrderFlowImbalanceFactor(BaseFactor):
     """订单流失衡因子"""
     
@@ -31,18 +160,9 @@ class OrderFlowImbalanceFactor(BaseFactor):
         
     def calculate(self, df: pd.DataFrame) -> pd.Series:
         """计算订单流失衡（买方/卖方压力）"""
-        close = df['close']
-        volume = df['volume']
-
         window_returns = self.window - 1
-        valid = _full_window_mask(close, self.window)
-        returns = close.diff()
-        buy_pressure = (returns.clip(lower=0) * volume).rolling(
-            window_returns, min_periods=window_returns
-        ).sum()
-        sell_pressure = ((-returns.clip(upper=0)) * volume).rolling(
-            window_returns, min_periods=window_returns
-        ).sum()
+        valid = _valid_close_window(df, self.window)
+        buy_pressure, sell_pressure = _rolling_flow_sums(df, window_returns)
         total_pressure = buy_pressure + sell_pressure
 
         imbalance = (buy_pressure - sell_pressure) / (total_pressure + 1e-8)
@@ -57,13 +177,11 @@ class LiquidityRatioFactor(BaseFactor):
         
     def calculate(self, df: pd.DataFrame) -> pd.Series:
         """计算流动性比率（买卖价差和成交量）"""
-        close = df['close']
         volume = df['volume']
 
         window_returns = self.window - 1
-        valid = _full_window_mask(close, self.window)
-        returns = close.diff()
-        volatility = _rolling_std0(returns, window_returns)
+        valid = _valid_close_window(df, self.window)
+        _, volatility = _rolling_return_stats(df, window_returns)
         avg_volume = volume.rolling(window_returns, min_periods=window_returns).mean()
         liquidity = avg_volume / (volatility * 100 + 1e-8)
         liquidity = liquidity.where(volatility > 0, 0.0)
@@ -80,7 +198,7 @@ class VolumeWeightedPriceFactor(BaseFactor):
         close = df['close']
         volume = df['volume']
 
-        valid = _full_window_mask(close, self.window)
+        valid = _valid_close_window(df, self.window)
         rolling_pv = (close * volume).rolling(self.window, min_periods=self.window).sum()
         rolling_volume = volume.rolling(self.window, min_periods=self.window).sum()
         vwap = rolling_pv / (rolling_volume + 1e-8)
@@ -96,17 +214,9 @@ class OrderBookPressureFactor(BaseFactor):
         
     def calculate(self, df: pd.DataFrame) -> pd.Series:
         """计算订单簿压力（基于买卖盘口）"""
-        close = df['close']
-
         window_returns = self.window - 1
-        valid = _full_window_mask(close, self.window)
-        returns = close.diff()
-        buy_count = returns.gt(0).rolling(
-            window_returns, min_periods=window_returns
-        ).sum()
-        sell_count = returns.lt(0).rolling(
-            window_returns, min_periods=window_returns
-        ).sum()
+        valid = _valid_close_window(df, self.window)
+        buy_count, sell_count = _rolling_direction_counts(df, window_returns)
         total = buy_count + sell_count
 
         pressure = (buy_count - sell_count) / (total + 1e-8)
@@ -124,7 +234,7 @@ class TradeSizeDistributionFactor(BaseFactor):
         close = df['close']
         volume = df['volume']
 
-        valid = _full_window_mask(close, self.window)
+        valid = _valid_close_window(df, self.window)
         trade_sizes = (close * volume).abs()
         skewness = trade_sizes.rolling(self.window, min_periods=self.window).skew()
         kurtosis = trade_sizes.rolling(self.window, min_periods=self.window).kurt()
@@ -142,35 +252,48 @@ class VolatilityAdjustedVolumeFactor(BaseFactor):
         close = df['close']
         volume = df['volume']
         
-        valid = _full_window_mask(close, self.window)
+        valid = _valid_close_window(df, self.window)
         close_values = close.to_numpy(dtype=float, copy=False)
         volume_values = volume.to_numpy(dtype=float, copy=False)
         result = np.full(len(close_values), np.nan, dtype=float)
         chunk_size = 5
 
-        for end in range(self.window - 1, len(close_values)):
-            start = end - self.window + 1
-            prices = close_values[start : end + 1]
-            vols = volume_values[start : end + 1]
-            if np.isnan(prices).any() or np.isnan(vols).any():
-                continue
-
-            returns = np.diff(prices)
-            current_vol = np.std(returns)
-            chunk_count = len(returns) // chunk_size
-            if chunk_count == 0:
-                result[end] = 0.0
-                continue
-
-            trimmed_returns = returns[-chunk_count * chunk_size :]
-            avg_vol = np.mean(
-                np.std(trimmed_returns.reshape(chunk_count, chunk_size), axis=1)
+        if len(close_values) >= self.window:
+            price_windows = np.lib.stride_tricks.sliding_window_view(
+                close_values, self.window
             )
-            if avg_vol > 0:
-                adj_volume = vols[-1] * (current_vol / avg_vol)
-                result[end] = adj_volume / (np.mean(vols) + 1e-8)
-            else:
-                result[end] = 0.0
+            volume_windows = np.lib.stride_tricks.sliding_window_view(
+                volume_values, self.window
+            )
+            valid_windows = np.isfinite(price_windows).all(axis=1) & np.isfinite(
+                volume_windows
+            ).all(axis=1)
+            chunk_count = (self.window - 1) // chunk_size
+            window_result = np.full(len(price_windows), np.nan, dtype=float)
+
+            if chunk_count == 0:
+                window_result[valid_windows] = 0.0
+            elif valid_windows.any():
+                valid_price_windows = price_windows[valid_windows]
+                valid_volume_windows = volume_windows[valid_windows]
+                returns = np.diff(valid_price_windows, axis=1)
+                current_vol = returns.std(axis=1)
+                trimmed_returns = returns[:, -chunk_count * chunk_size :]
+                chunk_vol = np.std(
+                    trimmed_returns.reshape(len(trimmed_returns), chunk_count, chunk_size),
+                    axis=2,
+                )
+                avg_vol = chunk_vol.mean(axis=1)
+                adjusted = np.zeros(len(valid_price_windows), dtype=float)
+                positive_avg = avg_vol > 0
+                adjusted[positive_avg] = (
+                    valid_volume_windows[positive_avg, -1]
+                    * (current_vol[positive_avg] / avg_vol[positive_avg])
+                    / (valid_volume_windows[positive_avg].mean(axis=1) + 1e-8)
+                )
+                window_result[valid_windows] = adjusted
+
+            result[self.window - 1 :] = window_result
 
         return pd.Series(result, index=close.index).where(valid)
 
@@ -182,13 +305,9 @@ class PriceVelocityFactor(BaseFactor):
         
     def calculate(self, df: pd.DataFrame) -> pd.Series:
         """计算价格变化速度"""
-        close = df['close']
-        
         window_returns = self.window - 1
-        valid = _full_window_mask(close, self.window)
-        returns = close.diff()
-        velocity = returns.rolling(window_returns, min_periods=window_returns).mean()
-        volatility = _rolling_std0(returns, window_returns)
+        valid = _valid_close_window(df, self.window)
+        velocity, volatility = _rolling_return_stats(df, window_returns)
         result = velocity / (volatility + 1e-8)
         result = result.where(volatility > 0, 0.0)
         return result.where(valid)
@@ -203,7 +322,7 @@ class MomentumAccelerationFactor(BaseFactor):
         """计算动量加速度（价格变化的加速度）"""
         close = df['close']
         
-        valid = _full_window_mask(close, self.window)
+        valid = _valid_close_window(df, self.window)
         momentum = close.diff().diff()
         acceleration = momentum.rolling(
             self.window - 2, min_periods=self.window - 2
@@ -225,7 +344,7 @@ class VolumeSpikeFactor(BaseFactor):
         close = df['close']
         volume = df['volume']
         
-        valid = _full_window_mask(close, self.window)
+        valid = _valid_close_window(df, self.window)
         avg_volume = volume.shift(1).rolling(
             self.window - 1, min_periods=self.window - 1
         ).mean()
@@ -245,7 +364,7 @@ class LiquidityShockFactor(BaseFactor):
         close = df['close']
         volume = df['volume']
         
-        valid = _full_window_mask(close, self.window)
+        valid = _valid_close_window(df, self.window)
         price_impact = close.diff().abs() * volume
         prev_mean = price_impact.shift(1).rolling(
             self.window - 2, min_periods=self.window - 2
@@ -263,22 +382,10 @@ class OrderBookAsymmetryFactor(BaseFactor):
         
     def calculate(self, df: pd.DataFrame) -> pd.Series:
         """计算订单簿不对称性"""
-        close = df['close']
-        
         window_returns = self.window - 1
-        valid = _full_window_mask(close, self.window)
-        returns = close.diff()
-        buy_sum = returns.clip(lower=0).rolling(
-            window_returns, min_periods=window_returns
-        ).sum()
-        buy_count = returns.gt(0).rolling(
-            window_returns, min_periods=window_returns
-        ).sum()
-        sell_mag = (-returns.clip(upper=0))
-        sell_sum = sell_mag.rolling(window_returns, min_periods=window_returns).sum()
-        sell_count = returns.lt(0).rolling(
-            window_returns, min_periods=window_returns
-        ).sum()
+        valid = _valid_close_window(df, self.window)
+        buy_sum, sell_sum = _rolling_return_magnitude_sums(df, window_returns)
+        buy_count, sell_count = _rolling_direction_counts(df, window_returns)
 
         buy_mean = buy_sum / (buy_count + 1e-8)
         sell_mean = sell_sum / (sell_count + 1e-8)
@@ -296,7 +403,7 @@ class TradeDirectionPersistenceFactor(BaseFactor):
         """计算交易方向持续性（连续同向交易的概率）"""
         close = df['close']
         
-        valid = _full_window_mask(close, self.window)
+        valid = _valid_close_window(df, self.window)
         directions = np.sign(close.diff())
         same_direction = directions.eq(directions.shift(1)).astype(float)
         persistence = same_direction.rolling(
@@ -317,7 +424,7 @@ class MarketImpactFactor(BaseFactor):
         close = df['close']
         volume = df['volume']
         
-        valid = _full_window_mask(close, self.window)
+        valid = _valid_close_window(df, self.window)
         order_flow = volume * np.sign(close.diff())
         flow_sum = order_flow.rolling(5, min_periods=5).sum()
         price_std = _rolling_std0(close, 10)
@@ -337,7 +444,7 @@ class LiquidityDepthFactor(BaseFactor):
         volume = df['volume']
         
         window_returns = self.window - 1
-        valid = _full_window_mask(close, self.window)
+        valid = _valid_close_window(df, self.window)
         price_changes = close.diff().abs()
         trade_vols = volume
 
@@ -364,18 +471,11 @@ class OrderFlowSignificanceFactor(BaseFactor):
         
     def calculate(self, df: pd.DataFrame) -> pd.Series:
         """计算订单流的统计显著性"""
-        close = df['close']
         volume = df['volume']
         
         window_returns = self.window - 1
-        valid = _full_window_mask(close, self.window)
-        returns = close.diff()
-        buy_flow = (returns.clip(lower=0) * volume).rolling(
-            window_returns, min_periods=window_returns
-        ).sum()
-        sell_flow = ((-returns.clip(upper=0)) * volume).rolling(
-            window_returns, min_periods=window_returns
-        ).sum()
+        valid = _valid_close_window(df, self.window)
+        buy_flow, sell_flow = _rolling_flow_sums(df, window_returns)
         total_flow = buy_flow + sell_flow
         buy_ratio = buy_flow / (total_flow + 1e-8)
         expected_ratio = 0.5
@@ -396,27 +496,34 @@ class VolumeClusteringFactor(BaseFactor):
         close = df['close']
         volume = df['volume']
         
-        valid = _full_window_mask(close, self.window)
+        valid = _valid_close_window(df, self.window)
         volume_values = volume.to_numpy(dtype=float, copy=False)
         result = np.full(len(volume_values), np.nan, dtype=float)
 
-        for end in range(self.window - 1, len(volume_values)):
-            start = end - self.window + 1
-            vols = volume_values[start : end + 1]
-            if np.isnan(vols).any() or len(vols) < 30:
-                continue
+        if len(volume_values) >= self.window and self.window >= 30:
+            volume_windows = np.lib.stride_tricks.sliding_window_view(
+                volume_values, self.window
+            )
+            valid_windows = np.isfinite(volume_windows).all(axis=1)
+            window_result = np.full(len(volume_windows), np.nan, dtype=float)
 
-            avg_vol = np.mean(vols)
-            high_vol = vols > avg_vol
-            high_to_high = 0
-            high_count = 0
-            for i in range(1, len(high_vol)):
-                if high_vol[i - 1]:
-                    high_count += 1
-                    if high_vol[i]:
-                        high_to_high += 1
+            if valid_windows.any():
+                valid_volume_windows = volume_windows[valid_windows]
+                high_vol = valid_volume_windows > valid_volume_windows.mean(
+                    axis=1, keepdims=True
+                )
+                high_count = high_vol[:, :-1].sum(axis=1)
+                high_to_high = np.logical_and(
+                    high_vol[:, :-1], high_vol[:, 1:]
+                ).sum(axis=1)
+                clustered = np.zeros(len(valid_volume_windows), dtype=float)
+                positive_count = high_count > 0
+                clustered[positive_count] = (
+                    (high_to_high[positive_count] / high_count[positive_count]) * 2 - 1
+                )
+                window_result[valid_windows] = clustered
 
-            result[end] = (high_to_high / high_count) * 2 - 1 if high_count > 0 else 0.0
+            result[self.window - 1 :] = window_result
 
         return pd.Series(result, index=close.index).where(valid)
 
@@ -431,7 +538,7 @@ class PriceVolumeDecouplingFactor(BaseFactor):
         close = df['close']
         volume = df['volume']
         
-        valid = _full_window_mask(close, self.window)
+        valid = _valid_close_window(df, self.window)
         returns = close.diff()
         vol_returns = np.log(volume + 1).diff()
         corr = returns.rolling(self.window - 1, min_periods=self.window - 1).corr(
@@ -450,7 +557,7 @@ class MarketEfficiencyFactor(BaseFactor):
         """计算市场效率（可预测性）"""
         close = df['close']
         
-        valid = _full_window_mask(close, self.window)
+        valid = _valid_close_window(df, self.window)
         abs_returns = close.diff().abs()
         m = self.window - 1
         x = np.arange(m, dtype=float)
@@ -480,7 +587,7 @@ class LiquidityMigrationFactor(BaseFactor):
         close = df['close']
         volume = df['volume']
         
-        valid = _full_window_mask(close, self.window)
+        valid = _valid_close_window(df, self.window)
         half_window = self.window // 2
         first_half = volume.shift(half_window).rolling(
             half_window, min_periods=half_window
