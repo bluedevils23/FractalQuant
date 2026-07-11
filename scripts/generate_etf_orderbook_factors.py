@@ -10,6 +10,8 @@ import sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
+import pandas as pd
+
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent
@@ -20,8 +22,9 @@ if str(PACKAGE_ROOT) not in sys.path:
 
 from factor.stock_orderbook import build_stock_orderbook_factor_frame  # noqa: E402
 from generate_stock_orderbook_factors import (  # noqa: E402
-    OUTPUT_COLUMNS,
     build_output_frame,
+    load_minute_frame,
+    merge_symbol_output,
     normalize_order_frame,
     normalize_quote_frame,
     normalize_trade_frame,
@@ -31,7 +34,10 @@ from generate_stock_orderbook_factors import (  # noqa: E402
 LOGGER = logging.getLogger("generate_etf_orderbook_factors")
 
 DEFAULT_TICK_ROOT = Path(r"E:\逐笔数据")
-DEFAULT_OUTPUT_ROOT = Path(r"D:\workspace\stockdata\etf-data\etf_orderbook_factors")
+DEFAULT_MINUTE_ROOT = Path(r"D:\workspace\stockdata\etf-data\etf_1min")
+DEFAULT_OUTPUT_ROOT = Path(
+    r"D:\workspace\stockdata\etf-data\etf_1min_orderbook_factors"
+)
 SYMBOL_PATTERN = re.compile(r"^(\d{6})(?:\.([A-Z]{2}))?$")
 DATE_PATTERN = re.compile(r"^\d{8}$")
 
@@ -51,6 +57,12 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=DEFAULT_TICK_ROOT,
         help="Root directory containing tick folders such as <year>/<yyyymm>/<yyyymmdd>.",
+    )
+    parser.add_argument(
+        "--minute-root",
+        type=Path,
+        default=DEFAULT_MINUTE_ROOT,
+        help="Directory containing one 1-minute parquet file per ETF.",
     )
     parser.add_argument(
         "--output-root",
@@ -268,7 +280,7 @@ def build_tasks(
             if symbol_dir is None:
                 missing_for_date.append(symbol)
                 continue
-            tasks.append((symbol_dir, symbol))
+            tasks.append((symbol_dir, symbol_dir.name.upper()))
 
         if missing_for_date:
             missing_count += len(missing_for_date)
@@ -282,27 +294,40 @@ def build_tasks(
     return tasks, missing_count
 
 
-def process_symbol_dir(
-    symbol_dir: Path,
+def process_symbol_tasks(
+    symbol_dirs: list[Path],
     output_symbol: str,
+    minute_root: Path,
     output_root: Path,
     overwrite: bool,
 ) -> tuple[str, Path, int | None, int | None]:
-    trade_date = symbol_dir.parent.name
-    output_dir = output_root / trade_date
-    output_path = output_dir / f"{output_symbol}.parquet"
+    output_path = output_root / f"{output_symbol}.parquet"
+    existing_dates: set[str] = set()
     if output_path.exists() and not overwrite:
+        existing_dates = set(
+            pd.read_parquet(output_path, columns=["trade_date"])["trade_date"].astype(str)
+        )
+
+    daily_frames: list[pd.DataFrame] = []
+    for symbol_dir in symbol_dirs:
+        trade_date = symbol_dir.parent.name
+        normalized_date = pd.Timestamp(trade_date).strftime("%Y-%m-%d")
+        if normalized_date in existing_dates:
+            continue
+        quotes = normalize_quote_frame(symbol_dir)
+        quotes["ts_code"] = output_symbol
+        orders = normalize_order_frame(symbol_dir)
+        trades = normalize_trade_frame(symbol_dir)
+        factors = build_stock_orderbook_factor_frame(quotes, orders, trades)
+        minute_df = load_minute_frame(minute_root, output_symbol, trade_date)
+        daily_frames.append(build_output_frame(minute_df, factors))
+
+    if not daily_frames:
         return ("skipped", output_path, None, None)
 
-    quotes = normalize_quote_frame(symbol_dir)
-    quotes["ts_code"] = output_symbol
-    orders = normalize_order_frame(symbol_dir)
-    trades = normalize_trade_frame(symbol_dir)
-    factors = build_stock_orderbook_factor_frame(quotes, orders, trades)
-    result = build_output_frame(quotes, factors)
-    result = result[OUTPUT_COLUMNS]
-
-    output_dir.mkdir(parents=True, exist_ok=True)
+    result = pd.concat(daily_frames, ignore_index=True)
+    result = merge_symbol_output(output_path, result, overwrite)
+    output_root.mkdir(parents=True, exist_ok=True)
     result.to_parquet(output_path)
     return ("written", output_path, len(result), len(result.columns))
 
@@ -350,8 +375,13 @@ def main() -> int:
         LOGGER.warning("No ETF tick directories matched the requested symbols.")
         return 0
 
+    tasks_by_symbol: dict[str, list[Path]] = {}
+    for symbol_dir, output_symbol in tasks:
+        tasks_by_symbol.setdefault(output_symbol, []).append(symbol_dir)
+
     LOGGER.info(
-        "Processing %s ETF orderbook tasks across %s trade dates",
+        "Processing %s ETFs and %s daily orderbook inputs across %s trade dates",
+        len(tasks_by_symbol),
         len(tasks),
         len(date_dirs),
     )
@@ -364,11 +394,12 @@ def main() -> int:
     worker_count = max(1, args.workers)
 
     if worker_count == 1:
-        for symbol_dir, output_symbol in tasks:
+        for output_symbol, symbol_dirs in tasks_by_symbol.items():
             try:
-                status, output_path, row_count, column_count = process_symbol_dir(
-                    symbol_dir,
+                status, output_path, row_count, column_count = process_symbol_tasks(
+                    symbol_dirs,
                     output_symbol,
+                    args.minute_root,
                     args.output_root,
                     args.overwrite,
                 )
@@ -376,23 +407,24 @@ def main() -> int:
                 skipped_count += int(status == "skipped")
                 log_task_result(status, output_path, row_count, column_count)
             except Exception as exc:  # noqa: BLE001
-                failures.append((symbol_dir, str(exc)))
-                LOGGER.exception("Failed to process %s", symbol_dir)
+                failures.append((symbol_dirs[0], str(exc)))
+                LOGGER.exception("Failed to process %s", output_symbol)
     else:
         LOGGER.info("Using %s parallel workers", worker_count)
         with ProcessPoolExecutor(max_workers=worker_count) as executor:
             future_map = {
                 executor.submit(
-                    process_symbol_dir,
-                    symbol_dir,
+                    process_symbol_tasks,
+                    symbol_dirs,
                     output_symbol,
+                    args.minute_root,
                     args.output_root,
                     args.overwrite,
-                ): symbol_dir
-                for symbol_dir, output_symbol in tasks
+                ): (output_symbol, symbol_dirs[0])
+                for output_symbol, symbol_dirs in tasks_by_symbol.items()
             }
             for future in as_completed(future_map):
-                symbol_dir = future_map[future]
+                output_symbol, symbol_dir = future_map[future]
                 try:
                     status, output_path, row_count, column_count = future.result()
                     written_count += int(status == "written")

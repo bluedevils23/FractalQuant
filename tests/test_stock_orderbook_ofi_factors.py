@@ -75,3 +75,49 @@ def test_ofi_resets_at_the_start_of_each_trade_day() -> None:
     assert np.isnan(factors["normalized_ofi_l1"].iloc[2])
     assert np.isnan(factors["normalized_ofi_l1_60s"].iloc[2])
     assert np.isclose(factors["normalized_ofi_l1"].iloc[3], 2.0 / 41.0)
+
+
+def test_event_mlofi_resets_across_lunch_break() -> None:
+    morning = pd.date_range("2026-01-05 11:29:00", periods=60, freq="s")
+    afternoon = pd.date_range("2026-01-05 13:00:00", periods=60, freq="s")
+    index = morning.append(afternoon)
+    bid_sizes = [[10.0 + i % 2] + [10.0] * 4 for i in range(len(index))]
+    ask_sizes = [[10.0] * 5 for _ in range(len(index))]
+
+    factors = calculate_snapshot_factors(
+        _quotes(index, [100.0] * len(index), bid_sizes, [101.0] * len(index), ask_sizes)
+    )
+
+    assert factors["mlofi_event_50_l5"].iloc[:50].isna().all()
+    assert np.isfinite(factors["mlofi_event_50_l5"].iloc[50])
+    assert factors["mlofi_event_50_l5"].iloc[60:110].isna().all()
+    assert np.isfinite(factors["mlofi_event_50_l5"].iloc[110])
+
+
+def test_deep_mlofi_divergence_detects_hidden_level_change() -> None:
+    index = pd.date_range("2026-01-05 09:30:00", periods=2, freq="s")
+    bid_sizes = [[10.0] * 5, [10.0, 30.0, 10.0, 10.0, 10.0]]
+    ask_sizes = [[10.0] * 5 for _ in range(2)]
+
+    factors = calculate_snapshot_factors(
+        _quotes(index, [100.0] * 2, bid_sizes, [101.0] * 2, ask_sizes)
+    )
+
+    assert factors["normalized_ofi_l1"].iloc[1] == 0.0
+    assert factors["mlofi_deep_divergence_l5"].iloc[1] > 0.0
+
+
+def test_mlofi_impact_beta_excludes_current_snapshot() -> None:
+    index = pd.date_range("2026-01-05 09:30:00", periods=40, freq="s")
+    bid_sizes = [[10.0 + i % 2] + [10.0] * 4 for i in range(40)]
+    ask_sizes = [[10.0] * 5 for _ in range(40)]
+    base = _quotes(index, [100.0] * 40, bid_sizes, [101.0] * 40, ask_sizes)
+    changed = base.copy()
+    changed.loc[index[-1], [f"bid_price{i}" for i in range(1, 6)]] += 10.0
+    changed.loc[index[-1], [f"ask_price{i}" for i in range(1, 6)]] += 10.0
+
+    base_beta = calculate_snapshot_factors(base)["mlofi_impact_beta"].iloc[-1]
+    changed_beta = calculate_snapshot_factors(changed)["mlofi_impact_beta"].iloc[-1]
+
+    assert np.isfinite(base_beta)
+    assert base_beta == changed_beta

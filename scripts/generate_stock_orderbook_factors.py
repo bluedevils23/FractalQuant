@@ -2,13 +2,9 @@ from __future__ import annotations
 
 """Generate A-share stock orderbook factors from raw per-symbol tick CSV folders.
 
-This entrypoint is intentionally separate from ``generate_etf_minute_factors.py``.
 It reads one trade-date directory of stock quote/order/trade CSV files, computes
-snapshot-level orderbook factors via ``factor.stock_orderbook``, and writes the
-results to ``a-share-data/orderbook_factors/<trade_date>/*.parquet``.
-
-It does not read ETF minute parquet inputs and does not share the ETF minute
-factor set.
+snapshot-level orderbook factors via ``factor.stock_orderbook``, aligns them to
+the stock 1-minute bars, and writes one advanced-compatible parquet per symbol.
 """
 
 import argparse
@@ -36,8 +32,10 @@ LOGGER = logging.getLogger("generate_stock_orderbook_factors")
 
 # Raw A-share tick CSV root for one trade date. This is not the ETF minute parquet input tree.
 DEFAULT_INPUT_ROOT = Path(r"D:\BaiduNetdiskDownload\2025\202501\20250102")
-# Stock orderbook outputs stay under a-share-data and are kept separate from ETF factor outputs.
-DEFAULT_OUTPUT_ROOT = Path(r"D:\workspace\stockdata\a-share-data\orderbook_factors")
+DEFAULT_MINUTE_ROOT = Path(r"D:\workspace\stockdata\a-share-data\stock_1min")
+DEFAULT_OUTPUT_ROOT = Path(
+    r"D:\workspace\stockdata\a-share-data\stock_1min_orderbook_factors"
+)
 
 QUOTE_USECOLS = [0, 2, 3, *range(17, 27), *range(27, 37), *range(37, 47), *range(47, 57)]
 QUOTE_COLUMN_NAMES = [
@@ -53,9 +51,19 @@ ORDER_USECOLS = [0, 2, 3, 7, 8, 9]
 ORDER_COLUMN_NAMES = ["ts_code", "trade_date", "raw_time", "side", "price", "qty"]
 TRADE_USECOLS = [0, 2, 3, 7, 8, 9]
 TRADE_COLUMN_NAMES = ["ts_code", "trade_date", "raw_time", "side", "price", "qty"]
-OUTPUT_COLUMNS = [
-    "ts_code",
+BASE_OUTPUT_COLUMNS = [
     "trade_date",
+    "trade_time",
+    "ts_code",
+    "open",
+    "high",
+    "low",
+    "close",
+    "vol",
+    "amount",
+    "adj_factor",
+]
+FACTOR_COLUMNS = [
     # Snapshot quote factors.
     "mid_price",
     "spread_bps",
@@ -65,6 +73,9 @@ OUTPUT_COLUMNS = [
     "normalized_ofi_l1_60s",
     "normalized_mlofi_l5",
     "normalized_mlofi_l5_60s",
+    "mlofi_event_50_l5",
+    "mlofi_deep_divergence_l5",
+    "mlofi_impact_beta",
     "weighted_depth_imbalance_l5",
     "weighted_depth_pressure_l5",
     "weighted_imbalance_velocity_l5",
@@ -114,6 +125,7 @@ OUTPUT_COLUMNS = [
     "contextual_selected_flow_imbalance_60s",
     "contextual_selected_lob_surprise_60s",
 ]
+OUTPUT_COLUMNS = BASE_OUTPUT_COLUMNS + FACTOR_COLUMNS
 
 
 def parse_args() -> argparse.Namespace:
@@ -125,6 +137,12 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=DEFAULT_INPUT_ROOT,
         help="Directory containing per-symbol folders with quote/order/trade CSV files.",
+    )
+    parser.add_argument(
+        "--minute-root",
+        type=Path,
+        default=DEFAULT_MINUTE_ROOT,
+        help="Directory containing one 1-minute parquet file per stock.",
     )
     parser.add_argument(
         "--output-root",
@@ -276,29 +294,106 @@ def normalize_trade_frame(symbol_dir: Path) -> pd.DataFrame:
     return df[["event_time", "side", "price", "qty", "notional"]]
 
 
-def build_output_frame(quotes: pd.DataFrame, factors: pd.DataFrame) -> pd.DataFrame:
-    result = pd.concat([quotes[["ts_code", "trade_date"]], factors], axis=1)
+def load_minute_frame(
+    minute_root: Path, symbol: str, trade_date: str
+) -> pd.DataFrame:
+    minute_path = minute_root / f"{symbol}.parquet"
+    if not minute_path.exists():
+        raise FileNotFoundError(f"Missing minute parquet: {minute_path}")
+
+    trade_day = pd.Timestamp(trade_date)
+    df = pd.read_parquet(
+        minute_path,
+        filters=[("trade_date", "==", trade_day)],
+    )
+    if isinstance(df.index, pd.MultiIndex) or df.index.name in {
+        "trade_date",
+        "trade_time",
+    }:
+        df = df.reset_index()
+    if df.empty:
+        raise ValueError(f"No minute rows for {symbol} on {trade_date}")
+    if "volume" in df.columns and "vol" not in df.columns:
+        df = df.rename(columns={"volume": "vol"})
+    df["trade_time"] = pd.to_datetime(df["trade_time"])
+    df = df.sort_values("trade_time", kind="mergesort").drop_duplicates(
+        "trade_time", keep="last"
+    )
+    df["trade_date"] = pd.to_datetime(df["trade_date"]).dt.strftime("%Y-%m-%d")
+    df["trade_time"] = df["trade_time"].dt.strftime("%Y-%m-%d %H:%M:%S")
+    df["ts_code"] = symbol
+    missing = [column for column in BASE_OUTPUT_COLUMNS if column not in df.columns]
+    if missing:
+        raise ValueError(f"Missing minute columns for {symbol}: {missing}")
+    return df[BASE_OUTPUT_COLUMNS]
+
+
+def build_output_frame(minute_df: pd.DataFrame, factors: pd.DataFrame) -> pd.DataFrame:
+    minute_times = pd.to_datetime(minute_df["trade_time"])
+    factor_frame = factors.reset_index().sort_values("trade_time")
+    aligned = pd.merge_asof(
+        pd.DataFrame({"trade_time": minute_times}).sort_values("trade_time"),
+        factor_frame,
+        on="trade_time",
+        direction="backward",
+        tolerance=pd.Timedelta("60s"),
+    )
+    aligned.index = minute_df.index
+    result = pd.concat(
+        [minute_df.reset_index(drop=True), aligned[FACTOR_COLUMNS].reset_index(drop=True)],
+        axis=1,
+    )
     result = result[OUTPUT_COLUMNS]
     result = result.replace([np.inf, -np.inf], np.nan)
-    result.index.name = "trade_time"
     return result
 
 
+def merge_symbol_output(
+    output_path: Path,
+    result: pd.DataFrame,
+    overwrite: bool,
+) -> pd.DataFrame:
+    if not output_path.exists():
+        return result.reset_index(drop=True)
+
+    existing = pd.read_parquet(output_path)
+    incoming_dates = set(result["trade_date"].astype(str))
+    existing_dates = existing["trade_date"].astype(str)
+    if overwrite:
+        existing = existing.loc[~existing_dates.isin(incoming_dates)]
+    else:
+        result = result.loc[~result["trade_date"].astype(str).isin(set(existing_dates))]
+    combined = pd.concat([existing, result], ignore_index=True)
+    return combined.sort_values(["trade_date", "trade_time"], kind="mergesort").reset_index(
+        drop=True
+    )
+
+
 def process_symbol_dir(
-    symbol_dir: Path, output_root: Path, date_dir_name: str, overwrite: bool
+    symbol_dir: Path,
+    minute_root: Path,
+    output_root: Path,
+    date_dir_name: str,
+    overwrite: bool,
 ) -> tuple[str, Path, int | None, int | None]:
-    output_dir = output_root / date_dir_name
-    output_path = output_dir / f"{symbol_dir.name}.parquet"
+    output_path = output_root / f"{symbol_dir.name}.parquet"
     if output_path.exists() and not overwrite:
-        return ("skipped", output_path, None, None)
+        existing_dates = pd.read_parquet(output_path, columns=["trade_date"])[
+            "trade_date"
+        ].astype(str)
+        normalized_date = pd.Timestamp(date_dir_name).strftime("%Y-%m-%d")
+        if normalized_date in set(existing_dates):
+            return ("skipped", output_path, None, None)
 
     quotes = normalize_quote_frame(symbol_dir)
     orders = normalize_order_frame(symbol_dir)
     trades = normalize_trade_frame(symbol_dir)
     factors = build_stock_orderbook_factor_frame(quotes, orders, trades)
-    result = build_output_frame(quotes, factors)
+    minute_df = load_minute_frame(minute_root, symbol_dir.name, date_dir_name)
+    result = build_output_frame(minute_df, factors)
+    result = merge_symbol_output(output_path, result, overwrite)
 
-    output_dir.mkdir(parents=True, exist_ok=True)
+    output_root.mkdir(parents=True, exist_ok=True)
     result.to_parquet(output_path)
     return ("written", output_path, len(result), len(result.columns))
 
@@ -329,7 +424,11 @@ def main() -> int:
         for symbol_dir in symbol_dirs:
             try:
                 status, output_path, row_count, column_count = process_symbol_dir(
-                    symbol_dir, args.output_root, date_dir_name, args.overwrite
+                    symbol_dir,
+                    args.minute_root,
+                    args.output_root,
+                    date_dir_name,
+                    args.overwrite,
                 )
                 if status == "skipped":
                     LOGGER.info("Skipping existing output: %s", output_path)
@@ -350,6 +449,7 @@ def main() -> int:
                 executor.submit(
                     process_symbol_dir,
                     symbol_dir,
+                    args.minute_root,
                     args.output_root,
                     date_dir_name,
                     args.overwrite,
