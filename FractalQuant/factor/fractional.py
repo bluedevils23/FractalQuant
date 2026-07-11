@@ -30,10 +30,12 @@ def fixed_width_fractional_weights(
 class FractionalDiffLogCloseFactor(PriceFactor):
     """Fractionally difference log close after removing the input segment's starting level."""
 
-    def __init__(self, order: float = 0.4, threshold: float = 1e-3):
+    def __init__(self, order: float = 0.4, threshold: float = 1e-3, window: int = 50):
+        if window <= 0:
+            raise ValueError("window must be positive")
         self.order = order
         self.threshold = threshold
-        self.weights = fixed_width_fractional_weights(order, threshold)
+        self.weights = fixed_width_fractional_weights(order, threshold)[:window]
         order_label = f"{order:g}".replace(".", "")
         super().__init__(f"fractional_diff_log_close_d{order_label}", len(self.weights))
 

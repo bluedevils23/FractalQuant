@@ -71,6 +71,7 @@ from .microstructure import (
 )
 from .stock_orderbook import (
     build_stock_orderbook_factor_frame,
+    calculate_contextual_orderflow_factors,
     calculate_order_flow_factors,
     calculate_snapshot_factors,
     calculate_trade_flow_factors,
@@ -119,6 +120,7 @@ __all__ = [
     "RealizedVolatilityFactor",
     "ReturnsFactor",
     "build_stock_orderbook_factor_frame",
+    "calculate_contextual_orderflow_factors",
     "calculate_order_flow_factors",
     "calculate_snapshot_factors",
     "calculate_trade_flow_factors",

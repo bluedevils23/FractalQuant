@@ -26,6 +26,7 @@ def test_fractional_diff_is_price_level_invariant_and_causal() -> None:
     baseline = factor.calculate(_minute_frame(index, close))
 
     assert factor.name == "fractional_diff_log_close_d04"
+    assert factor.window == 50
     assert baseline.iloc[: factor.window - 1].isna().all()
     assert np.allclose(baseline.iloc[factor.window - 1 :], 0.0)
 
@@ -44,7 +45,7 @@ def test_fractional_diff_warmup_is_restarted_per_day() -> None:
     result = calculate_factor_frame(_minute_frame(index, np.full(len(index), 100.0)))
     values = result["fractional_diff_log_close_d04"]
 
-    assert values.iloc[:54].isna().all()
-    assert values.iloc[54] == 0.0
-    assert values.iloc[60:114].isna().all()
-    assert values.iloc[114] == 0.0
+    assert values.iloc[:49].isna().all()
+    assert values.iloc[49] == 0.0
+    assert values.iloc[60:109].isna().all()
+    assert values.iloc[109] == 0.0

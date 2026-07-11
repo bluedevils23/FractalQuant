@@ -3,7 +3,10 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from factor.stock_orderbook import calculate_snapshot_factors
+from factor.stock_orderbook import (
+    calculate_contextual_orderflow_factors,
+    calculate_snapshot_factors,
+)
 
 
 def _quotes(bid_sizes: list[list[float]], ask_sizes: list[list[float]]) -> pd.DataFrame:
@@ -48,3 +51,29 @@ def test_weighted_velocity_is_five_snapshot_difference() -> None:
         - factors["weighted_depth_imbalance_l5"].iloc[0]
     )
     assert np.isclose(factors["weighted_imbalance_velocity_l5"].iloc[5], expected)
+
+
+def test_contextual_lob_surprise_uses_only_preceding_snapshots() -> None:
+    stable = [[10.0] * 5 for _ in range(30)]
+    changed = stable + [[30.0] * 5]
+    factors = calculate_snapshot_factors(_quotes(changed, stable + [[10.0] * 5]))
+
+    assert factors["contextual_lob_surprise_l5"].iloc[:10].isna().all()
+    assert factors["contextual_lob_surprise_l5"].iloc[-1] > 1.0
+
+
+def test_contextual_selector_is_causal_and_marks_late_anomaly() -> None:
+    index = pd.date_range("2026-01-05 09:30:00", periods=65, freq="s")
+    snapshot = pd.DataFrame(
+        {
+            "contextual_lob_surprise_l5": [0.0] * 64 + [10.0],
+            "contextual_imbalance_surprise_l5": [0.0] * 65,
+        },
+        index=index,
+    )
+    trade = pd.DataFrame({"trade_qty_imbalance_60s": [0.0] * 65}, index=index)
+
+    factors = calculate_contextual_orderflow_factors(snapshot, trade)
+
+    assert factors["contextual_segment_selected_60s"].iloc[:30].eq(0.0).all()
+    assert factors["contextual_segment_selected_60s"].iloc[-1] == 1.0

@@ -68,6 +68,8 @@ OUTPUT_COLUMNS = [
     "weighted_depth_imbalance_l5",
     "weighted_depth_pressure_l5",
     "weighted_imbalance_velocity_l5",
+    "contextual_lob_surprise_l5",
+    "contextual_imbalance_surprise_l5",
     "bid_refill_intensity_l5",
     "ask_refill_intensity_l5",
     "bid_ask_qty_ratio_l1",
@@ -105,6 +107,12 @@ OUTPUT_COLUMNS = [
     "liquidity_ratio_60s",
     "volume_weighted_price_60s",
     "orderbook_pressure_60s",
+    # Causal contextual anomaly-segment factors.
+    "contextual_flow_surprise_60s",
+    "contextual_segment_anomaly_60s",
+    "contextual_segment_selected_60s",
+    "contextual_selected_flow_imbalance_60s",
+    "contextual_selected_lob_surprise_60s",
 ]
 
 

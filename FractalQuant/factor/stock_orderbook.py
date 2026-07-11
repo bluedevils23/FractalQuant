@@ -23,6 +23,11 @@ OFI_WINDOW = "60s"
 NEAR_TOUCH_LEVELS = 5
 REFILL_LOOKBACK_SNAPSHOTS = 6
 PRESSURE_SPREAD_FLOOR_BPS = 1.0
+CONTEXT_LOOKBACK_SNAPSHOTS = 20
+CONTEXT_MIN_HISTORY = 10
+CONTEXT_SELECTION_WINDOW = "15min"
+CONTEXT_SELECTION_MIN_PERIODS = 30
+CONTEXT_SELECTION_QUANTILE = 0.98
 # Legacy mapping below is only for the stock orderbook CSV pipeline. ETF minute factors live elsewhere.
 # Existing output coverage against legacy factor/orderbook.py:
 # - SpreadFactor -> spread_bps
@@ -59,6 +64,12 @@ PRESSURE_SPREAD_FLOOR_BPS = 1.0
 # - volume_weighted_price_60s
 # Sixth batch trade-window pressure factor in this module:
 # - orderbook_pressure_60s
+# Contextual anomaly factors, inspired by the expectation-reality and
+# informative-segment selection stages in Jiao et al. (2023):
+# - contextual_lob_surprise_l5
+# - contextual_imbalance_surprise_l5
+# - contextual_segment_anomaly_60s
+# - contextual_segment_selected_60s
 
 
 def _safe_divide(
@@ -295,6 +306,75 @@ def _safe_kurtosis(values: np.ndarray) -> float:
     return float(0.0 if not np.isfinite(kurtosis) else kurtosis)
 
 
+def _causal_rolling_zscore(
+    values: np.ndarray | pd.Series,
+    index: pd.DatetimeIndex,
+    window: str | int,
+    min_periods: int,
+) -> np.ndarray:
+    """Standardize against strictly preceding observations, independently per day."""
+    result = np.full(len(index), np.nan, dtype=float)
+    value_array = np.asarray(values, dtype=float)
+    for day in pd.unique(index.normalize()):
+        positions = np.flatnonzero(index.normalize() == day)
+        series = pd.Series(value_array[positions], index=index[positions])
+        history = series.shift(1)
+        mean = history.rolling(window, min_periods=min_periods).mean()
+        std = history.rolling(window, min_periods=min_periods).std(ddof=0)
+        std = std.where(std.isna(), std.clip(lower=1e-3))
+        result[positions] = _safe_divide(
+            series.to_numpy(dtype=float) - mean.to_numpy(dtype=float),
+            std.to_numpy(dtype=float),
+        )
+    return result
+
+
+def _contextual_lob_surprises(
+    bid_qty: np.ndarray,
+    ask_qty: np.ndarray,
+    weighted_imbalance: np.ndarray,
+    index: pd.DatetimeIndex,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Compare the current L5 book with a causal expected-book baseline.
+
+    The rolling mean is a lightweight, training-free replacement for the paper's
+    order-book generator.  It is deliberately based only on preceding snapshots,
+    so it is safe for both A-share and ETF prediction datasets.
+    """
+    book = np.concatenate((bid_qty, ask_qty), axis=1)
+    book_frame = pd.DataFrame(book, index=index)
+    expected_array = np.full(book.shape, np.nan, dtype=float)
+    scale_array = np.full(book.shape, np.nan, dtype=float)
+    day_labels = index.normalize()
+    for day in pd.unique(day_labels):
+        positions = np.flatnonzero(day_labels == day)
+        history = book_frame.iloc[positions].shift(1)
+        expected_array[positions] = history.rolling(
+            CONTEXT_LOOKBACK_SNAPSHOTS, min_periods=CONTEXT_MIN_HISTORY
+        ).mean().to_numpy(dtype=float)
+        scale_array[positions] = history.rolling(
+            CONTEXT_LOOKBACK_SNAPSHOTS, min_periods=CONTEXT_MIN_HISTORY
+        ).std(ddof=0).to_numpy(dtype=float)
+    residual = book_frame.to_numpy(dtype=float) - expected_array
+    scale_floor = np.maximum(np.abs(expected_array) * 0.01, 1.0)
+    scale_array = np.where(np.isfinite(scale_array), np.maximum(scale_array, scale_floor), np.nan)
+    valid = np.isfinite(residual) & np.isfinite(scale_array) & (scale_array > 0)
+    standardized = np.full(residual.shape, np.nan, dtype=float)
+    standardized[valid] = residual[valid] / scale_array[valid]
+    valid_count = np.isfinite(standardized).sum(axis=1)
+    squared_sum = np.nansum(np.square(standardized), axis=1)
+    lob_surprise = np.full(len(index), np.nan, dtype=float)
+    has_history = valid_count > 0
+    lob_surprise[has_history] = np.sqrt(squared_sum[has_history] / valid_count[has_history])
+    imbalance_surprise = _causal_rolling_zscore(
+        weighted_imbalance,
+        index,
+        CONTEXT_LOOKBACK_SNAPSHOTS,
+        CONTEXT_MIN_HISTORY,
+    )
+    return lob_surprise, imbalance_surprise
+
+
 def calculate_snapshot_factors(quotes: pd.DataFrame) -> pd.DataFrame:
     ask_price_cols = [f"ask_price{i}" for i in range(1, 6)]
     ask_qty_cols = [f"ask_qty{i}" for i in range(1, 6)]
@@ -330,6 +410,11 @@ def calculate_snapshot_factors(quotes: pd.DataFrame) -> pd.DataFrame:
     weighted_ask_depth_l5 = _near_touch_depth(ask_qty[:, :NEAR_TOUCH_LEVELS])
     weighted_depth_imbalance_l5 = _imbalance(
         weighted_bid_depth_l5, weighted_ask_depth_l5
+    )
+    contextual_lob_surprise_l5, contextual_imbalance_surprise_l5 = (
+        _contextual_lob_surprises(
+            bid_qty, ask_qty, weighted_depth_imbalance_l5, quotes.index
+        )
     )
     (
         normalized_ofi_l1,
@@ -371,6 +456,8 @@ def calculate_snapshot_factors(quotes: pd.DataFrame) -> pd.DataFrame:
     result["weighted_imbalance_velocity_l5"] = (
         pd.Series(weighted_depth_imbalance_l5, index=quotes.index).diff(5)
     )
+    result["contextual_lob_surprise_l5"] = contextual_lob_surprise_l5
+    result["contextual_imbalance_surprise_l5"] = contextual_imbalance_surprise_l5
     result["bid_refill_intensity_l5"] = _positive_refill_intensity(
         weighted_bid_depth_l5, quotes.index
     )
@@ -763,6 +850,63 @@ def calculate_trade_flow_factors(
     return result.replace([np.inf, -np.inf], np.nan)
 
 
+def calculate_contextual_orderflow_factors(
+    snapshot_factors: pd.DataFrame,
+    trade_factors: pd.DataFrame,
+) -> pd.DataFrame:
+    """Select unusual order-flow segments conditional on the current LOB state.
+
+    A segment is unusual when the actual L5 book differs from its causal expected
+    book and/or its signed traded quantity differs from its own recent history.
+    The selection threshold is the preceding 15-minute 98th percentile, mirroring
+    the paper's top-mu signal selection without using future observations.
+    """
+    index = snapshot_factors.index
+    flow_surprise = _causal_rolling_zscore(
+        trade_factors["trade_qty_imbalance_60s"].to_numpy(dtype=float, copy=False),
+        index,
+        CONTEXT_SELECTION_WINDOW,
+        CONTEXT_SELECTION_MIN_PERIODS,
+    )
+    components = np.column_stack(
+        [
+            snapshot_factors["contextual_lob_surprise_l5"].to_numpy(dtype=float, copy=False),
+            snapshot_factors["contextual_imbalance_surprise_l5"].to_numpy(dtype=float, copy=False),
+            flow_surprise,
+        ]
+    )
+    available = np.isfinite(components).any(axis=1)
+    score = np.sqrt(np.nansum(np.square(components), axis=1))
+    score[~available] = np.nan
+
+    threshold = np.full(len(index), np.nan, dtype=float)
+    day_labels = index.normalize()
+    for day in pd.unique(day_labels):
+        positions = np.flatnonzero(day_labels == day)
+        history = pd.Series(score[positions], index=index[positions]).shift(1)
+        threshold[positions] = history.rolling(
+            CONTEXT_SELECTION_WINDOW,
+            min_periods=CONTEXT_SELECTION_MIN_PERIODS,
+        ).quantile(CONTEXT_SELECTION_QUANTILE).to_numpy(dtype=float)
+    selected = np.isfinite(score) & np.isfinite(threshold) & (score >= threshold)
+
+    result = pd.DataFrame(index=index)
+    result["contextual_flow_surprise_60s"] = flow_surprise
+    result["contextual_segment_anomaly_60s"] = score
+    result["contextual_segment_selected_60s"] = selected.astype(float)
+    result["contextual_selected_flow_imbalance_60s"] = np.where(
+        selected,
+        trade_factors["trade_qty_imbalance_60s"].to_numpy(dtype=float, copy=False),
+        0.0,
+    )
+    result["contextual_selected_lob_surprise_60s"] = np.where(
+        selected,
+        snapshot_factors["contextual_lob_surprise_l5"].to_numpy(dtype=float, copy=False),
+        0.0,
+    )
+    return result
+
+
 def build_stock_orderbook_factor_frame(
     quotes: pd.DataFrame,
     orders: pd.DataFrame,
@@ -775,4 +919,5 @@ def build_stock_orderbook_factor_frame(
     quote_input = quotes.join(quote_factors)
     order_factors = calculate_order_flow_factors(orders, quote_input.index)
     trade_factors = calculate_trade_flow_factors(trades, quote_input)
-    return pd.concat([quote_factors, order_factors, trade_factors], axis=1)
+    contextual_factors = calculate_contextual_orderflow_factors(quote_factors, trade_factors)
+    return pd.concat([quote_factors, order_factors, trade_factors, contextual_factors], axis=1)
