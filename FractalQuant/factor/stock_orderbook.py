@@ -19,6 +19,9 @@ from scipy import stats
 
 ORDER_WINDOW = "60s"
 TRADE_WINDOW = "60s"
+NEAR_TOUCH_LEVELS = 5
+REFILL_LOOKBACK_SNAPSHOTS = 6
+PRESSURE_SPREAD_FLOOR_BPS = 1.0
 # Legacy mapping below is only for the stock orderbook CSV pipeline. ETF minute factors live elsewhere.
 # Existing output coverage against legacy factor/orderbook.py:
 # - SpreadFactor -> spread_bps
@@ -81,6 +84,25 @@ def _imbalance(
     valid = np.isfinite(total) & (total != 0)
     result[valid] = (buy_arr[valid] - sell_arr[valid]) / total[valid]
     return result
+
+
+def _near_touch_depth(quantities: np.ndarray) -> np.ndarray:
+    """Weight displayed depth by proximity to the touch: q1 + q2/2 + ... + q5/5."""
+    weights = 1.0 / np.arange(1, quantities.shape[1] + 1, dtype=float)
+    clean_qty = np.where(np.isfinite(quantities) & (quantities > 0), quantities, 0.0)
+    return np.sum(clean_qty * weights, axis=1)
+
+
+def _positive_refill_intensity(depth: np.ndarray, index: pd.Index) -> np.ndarray:
+    """Measure positive depth growth against the preceding six snapshots."""
+    depth_series = pd.Series(depth, index=index)
+    prior_mean = (
+        depth_series.shift(1)
+        .rolling(REFILL_LOOKBACK_SNAPSHOTS, min_periods=REFILL_LOOKBACK_SNAPSHOTS)
+        .mean()
+    )
+    refill = _safe_divide(depth, prior_mean.to_numpy(dtype=float)) - 1.0
+    return np.where(np.isfinite(refill), np.maximum(refill, 0.0), np.nan)
 
 
 def _weighted_average(prices: np.ndarray, quantities: np.ndarray) -> np.ndarray:
@@ -187,6 +209,12 @@ def calculate_snapshot_factors(quotes: pd.DataFrame) -> pd.DataFrame:
     bid_depth_l5 = np.sum(bid_qty, axis=1)
     ask_depth_l5 = np.sum(ask_qty, axis=1)
     depth_l5_total = bid_depth_l5 + ask_depth_l5
+    weighted_bid_depth_l5 = _near_touch_depth(bid_qty[:, :NEAR_TOUCH_LEVELS])
+    weighted_ask_depth_l5 = _near_touch_depth(ask_qty[:, :NEAR_TOUCH_LEVELS])
+    weighted_depth_imbalance_l5 = _imbalance(
+        weighted_bid_depth_l5, weighted_ask_depth_l5
+    )
+    pressure_denominator = np.maximum(spread_bps, PRESSURE_SPREAD_FLOOR_BPS)
 
     bid_wap5 = _weighted_average(bid_prices, bid_qty)
     ask_wap5 = _weighted_average(ask_prices, ask_qty)
@@ -207,6 +235,19 @@ def calculate_snapshot_factors(quotes: pd.DataFrame) -> pd.DataFrame:
     result["spread_bps"] = spread_bps
     result["depth_imbalance_l1"] = _imbalance(bid_depth_l1, ask_depth_l1)
     result["depth_imbalance_l5"] = _imbalance(bid_depth_l5, ask_depth_l5)
+    result["weighted_depth_imbalance_l5"] = weighted_depth_imbalance_l5
+    result["weighted_depth_pressure_l5"] = np.clip(
+        _safe_divide(weighted_depth_imbalance_l5, pressure_denominator), -1.0, 1.0
+    )
+    result["weighted_imbalance_velocity_l5"] = (
+        pd.Series(weighted_depth_imbalance_l5, index=quotes.index).diff(5)
+    )
+    result["bid_refill_intensity_l5"] = _positive_refill_intensity(
+        weighted_bid_depth_l5, quotes.index
+    )
+    result["ask_refill_intensity_l5"] = _positive_refill_intensity(
+        weighted_ask_depth_l5, quotes.index
+    )
     result["bid_ask_qty_ratio_l1"] = _safe_divide(bid_qty1, ask_qty1)
     result["depth_l5_total"] = depth_l5_total
     result["orderbook_decay_l5"] = (bid_decay_l5 + ask_decay_l5) / 2.0
