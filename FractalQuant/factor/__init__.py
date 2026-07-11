@@ -20,6 +20,7 @@ from .price import (
     VolumePriceConfirmFactor,
     VolumePriceTrendFactor,
 )
+from .fractional import FractionalDiffLogCloseFactor
 from .volatility import (
     ATRFactor,
     AnnualizedVolatilityFactor,
@@ -85,6 +86,7 @@ __all__ = [
     "CCIFactor",
     "CMOFactor",
     "EMAFactor",
+    "FractionalDiffLogCloseFactor",
     "GarmanKlassVolatilityFactor",
     "HistoricalVolatilityFactor",
     "LSMAFactor",

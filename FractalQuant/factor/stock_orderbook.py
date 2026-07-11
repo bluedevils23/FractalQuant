@@ -19,6 +19,7 @@ from scipy import stats
 
 ORDER_WINDOW = "60s"
 TRADE_WINDOW = "60s"
+OFI_WINDOW = "60s"
 NEAR_TOUCH_LEVELS = 5
 REFILL_LOOKBACK_SNAPSHOTS = 6
 PRESSURE_SPREAD_FLOOR_BPS = 1.0
@@ -103,6 +104,122 @@ def _positive_refill_intensity(depth: np.ndarray, index: pd.Index) -> np.ndarray
     )
     refill = _safe_divide(depth, prior_mean.to_numpy(dtype=float)) - 1.0
     return np.where(np.isfinite(refill), np.maximum(refill, 0.0), np.nan)
+
+
+def _quote_depth_event(
+    prices: np.ndarray,
+    quantities: np.ndarray,
+    side: str,
+) -> np.ndarray:
+    """Calculate Cont-style queue events for one side of a levelled book."""
+    previous_prices = np.vstack((np.full((1, prices.shape[1]), np.nan), prices[:-1]))
+    previous_quantities = np.vstack(
+        (np.full((1, quantities.shape[1]), np.nan), quantities[:-1])
+    )
+    valid = (
+        np.isfinite(prices)
+        & np.isfinite(previous_prices)
+        & (prices > 0)
+        & (previous_prices > 0)
+        & np.isfinite(quantities)
+        & np.isfinite(previous_quantities)
+        & (quantities >= 0)
+        & (previous_quantities >= 0)
+    )
+    event = np.full(prices.shape, np.nan, dtype=float)
+
+    if side == "bid":
+        event[valid & (prices > previous_prices)] = quantities[valid & (prices > previous_prices)]
+        event[valid & (prices == previous_prices)] = (
+            quantities[valid & (prices == previous_prices)]
+            - previous_quantities[valid & (prices == previous_prices)]
+        )
+        event[valid & (prices < previous_prices)] = -previous_quantities[
+            valid & (prices < previous_prices)
+        ]
+    elif side == "ask":
+        event[valid & (prices < previous_prices)] = -quantities[valid & (prices < previous_prices)]
+        event[valid & (prices == previous_prices)] = (
+            previous_quantities[valid & (prices == previous_prices)]
+            - quantities[valid & (prices == previous_prices)]
+        )
+        event[valid & (prices > previous_prices)] = previous_quantities[
+            valid & (prices > previous_prices)
+        ]
+    else:
+        raise ValueError(f"Unsupported book side: {side}")
+
+    return event
+
+
+def _normalize_ofi_events(
+    events: np.ndarray,
+    depth_scale: np.ndarray,
+    index: pd.DatetimeIndex,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Normalize instantaneous and 60-second OFI without crossing trading days."""
+    instantaneous = _safe_divide(events, depth_scale)
+    rolling = np.full(len(events), np.nan, dtype=float)
+    day_labels = index.normalize()
+
+    for day in pd.unique(day_labels):
+        positions = np.flatnonzero(day_labels == day)
+        event_series = pd.Series(events[positions], index=index[positions])
+        depth_series = pd.Series(depth_scale[positions], index=index[positions])
+        rolling_event = event_series.rolling(OFI_WINDOW, min_periods=1).sum()
+        rolling_depth = depth_series.rolling(OFI_WINDOW, min_periods=1).mean()
+        rolling[positions] = _safe_divide(
+            rolling_event.to_numpy(dtype=float), rolling_depth.to_numpy(dtype=float)
+        )
+
+    return instantaneous, rolling
+
+
+def _calculate_normalized_ofi(
+    bid_prices: np.ndarray,
+    bid_qty: np.ndarray,
+    ask_prices: np.ndarray,
+    ask_qty: np.ndarray,
+    index: pd.DatetimeIndex,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Return L1 and near-touch L5 OFI, each instantaneously and over 60 seconds."""
+    bid_events = _quote_depth_event(bid_prices, bid_qty, side="bid")
+    ask_events = _quote_depth_event(ask_prices, ask_qty, side="ask")
+    day_starts = np.zeros(len(index), dtype=bool)
+    if len(index):
+        day_starts[0] = True
+        day_starts[1:] = index.normalize()[1:] != index.normalize()[:-1]
+    bid_events[day_starts] = np.nan
+    ask_events[day_starts] = np.nan
+
+    l1_events = bid_events[:, 0] + ask_events[:, 0]
+    l1_depth = bid_qty[:, 0] + ask_qty[:, 0]
+    l1_depth_scale = (np.concatenate(([np.nan], l1_depth[:-1])) + l1_depth) / 2.0
+    l1_depth_scale[day_starts] = np.nan
+    l1_instantaneous, l1_rolling = _normalize_ofi_events(
+        l1_events, l1_depth_scale, index
+    )
+
+    level_weights = 1.0 / np.arange(1, NEAR_TOUCH_LEVELS + 1, dtype=float)
+    level_events = bid_events[:, :NEAR_TOUCH_LEVELS] + ask_events[:, :NEAR_TOUCH_LEVELS]
+    valid_l1_event = np.isfinite(level_events[:, 0])
+    mlofi_events = np.sum(
+        np.where(np.isfinite(level_events), level_events, 0.0) * level_weights,
+        axis=1,
+    )
+    mlofi_events[~valid_l1_event] = np.nan
+    mlofi_depth = (
+        _near_touch_depth(bid_qty[:, :NEAR_TOUCH_LEVELS])
+        + _near_touch_depth(ask_qty[:, :NEAR_TOUCH_LEVELS])
+    )
+    mlofi_depth_scale = (
+        np.concatenate(([np.nan], mlofi_depth[:-1])) + mlofi_depth
+    ) / 2.0
+    mlofi_depth_scale[day_starts] = np.nan
+    mlofi_instantaneous, mlofi_rolling = _normalize_ofi_events(
+        mlofi_events, mlofi_depth_scale, index
+    )
+    return l1_instantaneous, l1_rolling, mlofi_instantaneous, mlofi_rolling
 
 
 def _weighted_average(prices: np.ndarray, quantities: np.ndarray) -> np.ndarray:
@@ -214,6 +331,14 @@ def calculate_snapshot_factors(quotes: pd.DataFrame) -> pd.DataFrame:
     weighted_depth_imbalance_l5 = _imbalance(
         weighted_bid_depth_l5, weighted_ask_depth_l5
     )
+    (
+        normalized_ofi_l1,
+        normalized_ofi_l1_60s,
+        normalized_mlofi_l5,
+        normalized_mlofi_l5_60s,
+    ) = _calculate_normalized_ofi(
+        bid_prices, bid_qty, ask_prices, ask_qty, quotes.index
+    )
     pressure_denominator = np.maximum(spread_bps, PRESSURE_SPREAD_FLOOR_BPS)
 
     bid_wap5 = _weighted_average(bid_prices, bid_qty)
@@ -235,6 +360,10 @@ def calculate_snapshot_factors(quotes: pd.DataFrame) -> pd.DataFrame:
     result["spread_bps"] = spread_bps
     result["depth_imbalance_l1"] = _imbalance(bid_depth_l1, ask_depth_l1)
     result["depth_imbalance_l5"] = _imbalance(bid_depth_l5, ask_depth_l5)
+    result["normalized_ofi_l1"] = normalized_ofi_l1
+    result["normalized_ofi_l1_60s"] = normalized_ofi_l1_60s
+    result["normalized_mlofi_l5"] = normalized_mlofi_l5
+    result["normalized_mlofi_l5_60s"] = normalized_mlofi_l5_60s
     result["weighted_depth_imbalance_l5"] = weighted_depth_imbalance_l5
     result["weighted_depth_pressure_l5"] = np.clip(
         _safe_divide(weighted_depth_imbalance_l5, pressure_denominator), -1.0, 1.0

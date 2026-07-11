@@ -29,6 +29,7 @@ from factor.price import (  # noqa: E402
     VolumePriceConfirmFactor,
     VolumePriceTrendFactor,
 )
+from factor.fractional import FractionalDiffLogCloseFactor  # noqa: E402
 from factor.microstructure import (  # noqa: E402
     LiquidityDepthFactor,
     LiquidityMigrationFactor,
@@ -93,6 +94,7 @@ def build_factors() -> list[object]:
         LogReturnsFactor(window=5),
         PriceMomentumFactor(window=20),
         PriceZScoreFactor(window=20),
+        FractionalDiffLogCloseFactor(order=0.4, threshold=1e-3),
         HistoricalVolatilityFactor(window=20),
         ParkinsonVolatilityFactor(window=20),
         MACDFactor(),
