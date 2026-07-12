@@ -17,11 +17,13 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent
 PACKAGE_ROOT = PROJECT_ROOT / "FractalQuant"
 
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 if str(PACKAGE_ROOT) not in sys.path:
     sys.path.insert(0, str(PACKAGE_ROOT))
 
 from factor.stock_orderbook import build_stock_orderbook_factor_frame  # noqa: E402
-from generate_stock_orderbook_factors import (  # noqa: E402
+from scripts.generate_stock_orderbook_factors import (  # noqa: E402
     build_output_frame,
     load_minute_frame,
     merge_symbol_output,
@@ -181,6 +183,19 @@ def load_requested_symbols(
     return dedupe_symbols(requested)
 
 
+def discover_minute_symbols(minute_root: Path) -> list[str]:
+    if not minute_root.exists():
+        raise FileNotFoundError(f"Minute root does not exist: {minute_root}")
+
+    symbols: list[str] = []
+    for parquet_path in sorted(minute_root.glob("*.parquet")):
+        try:
+            symbols.append(normalize_symbol(parquet_path.stem))
+        except ValueError:
+            LOGGER.warning("Skipping invalid minute parquet name: %s", parquet_path.name)
+    return dedupe_symbols(symbols)
+
+
 def dedupe_symbols(symbols: list[str]) -> list[str]:
     deduped: list[str] = []
     seen: set[str] = set()
@@ -264,6 +279,7 @@ def build_tasks(
     date_dirs: list[Path],
     requested_symbols: list[str] | None,
     strict_suffix: bool,
+    log_missing: bool = True,
 ) -> tuple[list[tuple[Path, str]], int]:
     tasks: list[tuple[Path, str]] = []
     missing_count = 0
@@ -280,16 +296,17 @@ def build_tasks(
             if symbol_dir is None:
                 missing_for_date.append(symbol)
                 continue
-            tasks.append((symbol_dir, symbol_dir.name.upper()))
+            tasks.append((symbol_dir, symbol.upper()))
 
         if missing_for_date:
             missing_count += len(missing_for_date)
-            LOGGER.warning(
-                "%s missing %s requested symbols: %s",
-                date_dir.name,
-                len(missing_for_date),
-                ", ".join(missing_for_date[:10]),
-            )
+            if log_missing:
+                LOGGER.warning(
+                    "%s missing %s requested symbols: %s",
+                    date_dir.name,
+                    len(missing_for_date),
+                    ", ".join(missing_for_date[:10]),
+                )
 
     return tasks, missing_count
 
@@ -359,7 +376,15 @@ def main() -> int:
         raise ValueError("--date-from cannot be later than --date-to")
 
     requested_symbols = load_requested_symbols(args.symbols, args.symbols_file)
-    if requested_symbols is not None:
+    auto_discovered_symbols = requested_symbols is None
+    if auto_discovered_symbols:
+        requested_symbols = discover_minute_symbols(args.minute_root)
+        LOGGER.info(
+            "Discovered %s ETF symbols from %s",
+            len(requested_symbols),
+            args.minute_root,
+        )
+    else:
         LOGGER.info("Loaded %s requested ETF symbols", len(requested_symbols))
 
     date_dirs = discover_trade_date_dirs(args.tick_root, args.input_root, date_from, date_to)
@@ -367,7 +392,12 @@ def main() -> int:
         LOGGER.warning("No trade-date directories matched the requested inputs.")
         return 0
 
-    tasks, missing_count = build_tasks(date_dirs, requested_symbols, args.strict_suffix)
+    tasks, missing_count = build_tasks(
+        date_dirs,
+        requested_symbols,
+        args.strict_suffix,
+        log_missing=not auto_discovered_symbols,
+    )
     if args.limit is not None:
         tasks = tasks[: args.limit]
 
