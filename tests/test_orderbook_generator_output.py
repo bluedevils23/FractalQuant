@@ -12,6 +12,7 @@ from scripts.generate_stock_orderbook_factors import (
     build_minute_file_index,
     discover_symbol_dirs,
     discover_trade_date_dirs,
+    load_minute_frame,
     merge_symbol_output,
     numeric_code,
 )
@@ -152,3 +153,25 @@ def test_etf_task_builder_keeps_universe_suffix_when_tick_dir_suffix_is_wrong(tm
 
     assert tasks == [(wrong_suffix_dir, "511360.SH")]
     assert missing_count == 0
+
+
+def test_minute_frame_is_cached_per_symbol(tmp_path, monkeypatch) -> None:
+    minute_root = tmp_path / "minute"
+    minute_root.mkdir()
+    minute_path = minute_root / "159001.SZ.parquet"
+    _minute_frame("2026-01-05").to_parquet(minute_path)
+
+    calls = {"count": 0}
+    real_read_parquet = pd.read_parquet
+
+    def spy(*args, **kwargs):
+        calls["count"] += 1
+        return real_read_parquet(*args, **kwargs)
+
+    monkeypatch.setattr(pd, "read_parquet", spy)
+
+    first = load_minute_frame(minute_root, "159001.SZ", "2026-01-05")
+    second = load_minute_frame(minute_root, "159001.SZ", "2026-01-05")
+
+    assert calls["count"] == 1
+    assert first.equals(second)

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""Generate A-share stock orderbook factors from raw per-symbol tick CSV folders.
+"""Generate stock and ETF orderbook factors from raw per-symbol tick CSV folders.
 
 It reads one trade-date directory of stock quote/order/trade CSV files, computes
 snapshot-level orderbook factors via ``factor.stock_orderbook``, aligns them to
@@ -10,7 +10,9 @@ the stock 1-minute bars, and writes one advanced-compatible parquet per symbol.
 import argparse
 import logging
 import os
+import re
 import sys
+from functools import lru_cache
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
@@ -30,11 +32,15 @@ from factor.stock_orderbook import build_stock_orderbook_factor_frame  # noqa: E
 
 LOGGER = logging.getLogger("generate_stock_orderbook_factors")
 
-# Raw A-share tick CSV root for one trade date. This is not the ETF minute parquet input tree.
-DEFAULT_INPUT_ROOT = Path(r"D:\BaiduNetdiskDownload\2025\202501\20250102")
-DEFAULT_MINUTE_ROOT = Path(r"D:\workspace\stockdata\a-share-data\stock_1min")
-DEFAULT_OUTPUT_ROOT = Path(
+# Raw tick root organized as YYYY/YYYYMM/YYYYMMDD/symbol.
+DEFAULT_INPUT_ROOT = Path(r"E:\逐笔数据")
+DEFAULT_STOCK_MINUTE_ROOT = Path(r"D:\workspace\stockdata\a-share-data\stock_1min")
+DEFAULT_ETF_MINUTE_ROOT = Path(r"D:\workspace\stockdata\etf-data\etf_1min")
+DEFAULT_STOCK_OUTPUT_ROOT = Path(
     r"D:\workspace\stockdata\a-share-data\stock_1min_orderbook_factors"
+)
+DEFAULT_ETF_OUTPUT_ROOT = Path(
+    r"D:\workspace\stockdata\etf-data\etf_1min_orderbook_factors"
 )
 
 QUOTE_USECOLS = [0, 2, 3, *range(17, 27), *range(27, 37), *range(37, 47), *range(47, 57)]
@@ -71,6 +77,8 @@ FACTOR_COLUMNS = [
     "depth_imbalance_l5",
     "normalized_ofi_l1",
     "normalized_ofi_l1_60s",
+    "ofi_spread_scaled_impact",
+    "ofi_level_entropy_l5",
     "normalized_mlofi_l5",
     "normalized_mlofi_l5_60s",
     "mlofi_event_50_l5",
@@ -85,6 +93,9 @@ FACTOR_COLUMNS = [
     "ask_refill_intensity_l5",
     "bid_ask_qty_ratio_l1",
     "depth_l5_total",
+    "bid_resilience_30s",
+    "ask_resilience_30s",
+    "resilience_imbalance_30s",
     "orderbook_decay_l5",
     "orderbook_asymmetry_l5",
     "depth_concentration_l5",
@@ -118,6 +129,8 @@ FACTOR_COLUMNS = [
     "liquidity_ratio_60s",
     "volume_weighted_price_60s",
     "orderbook_pressure_60s",
+    "vpin_50bucket",
+    "adverse_selection_markout_30s",
     # Causal contextual anomaly-segment factors.
     "contextual_flow_surprise_60s",
     "contextual_segment_anomaly_60s",
@@ -130,37 +143,49 @@ OUTPUT_COLUMNS = BASE_OUTPUT_COLUMNS + FACTOR_COLUMNS
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Generate stock orderbook factor parquet files from local tick CSVs."
+        description="Generate stock and ETF orderbook factor parquet files from local tick CSVs."
     )
     parser.add_argument(
         "--input-root",
         type=Path,
         default=DEFAULT_INPUT_ROOT,
-        help="Directory containing per-symbol folders with quote/order/trade CSV files.",
+        help="Tick root organized as YYYY/YYYYMM/YYYYMMDD/symbol.",
     )
     parser.add_argument(
-        "--minute-root",
+        "--stock-minute-root",
         type=Path,
-        default=DEFAULT_MINUTE_ROOT,
+        default=DEFAULT_STOCK_MINUTE_ROOT,
         help="Directory containing one 1-minute parquet file per stock.",
     )
     parser.add_argument(
-        "--output-root",
+        "--etf-minute-root",
         type=Path,
-        default=DEFAULT_OUTPUT_ROOT,
-        help="Directory where orderbook factor parquet files will be written.",
+        default=DEFAULT_ETF_MINUTE_ROOT,
+        help="Directory containing one 1-minute parquet file per ETF.",
+    )
+    parser.add_argument(
+        "--stock-output-root",
+        type=Path,
+        default=DEFAULT_STOCK_OUTPUT_ROOT,
+        help="Directory where stock orderbook factor parquet files will be written.",
+    )
+    parser.add_argument(
+        "--etf-output-root",
+        type=Path,
+        default=DEFAULT_ETF_OUTPUT_ROOT,
+        help="Directory where ETF orderbook factor parquet files will be written.",
     )
     parser.add_argument(
         "--symbols",
         nargs="*",
         default=None,
-        help="Optional stock symbols such as 000001.SZ 600000.SH.",
+        help="Optional symbols or six-digit codes; exchange suffixes are ignored.",
     )
     parser.add_argument(
         "--limit",
         type=int,
         default=None,
-        help="Only process the first N symbol directories after filtering.",
+        help="Only process the first N matched date/symbol tasks.",
     )
     parser.add_argument(
         "--overwrite",
@@ -183,26 +208,61 @@ def configure_logging() -> None:
     )
 
 
+def numeric_code(name: str) -> str | None:
+    match = re.match(r"^(\d{6})", name)
+    return match.group(1) if match else None
+
+
+def discover_trade_date_dirs(input_root: Path) -> list[Path]:
+    if not input_root.exists():
+        raise FileNotFoundError(f"Input directory does not exist: {input_root}")
+    date_dirs = [
+        path
+        for path in input_root.glob("*/*/*")
+        if path.is_dir() and re.fullmatch(r"\d{8}", path.name)
+    ]
+    return sorted(date_dirs)
+
+
+def build_minute_file_index(minute_root: Path) -> dict[str, Path]:
+    if not minute_root.exists():
+        raise FileNotFoundError(f"Minute directory does not exist: {minute_root}")
+    candidates: dict[str, list[Path]] = {}
+    for path in minute_root.glob("*.parquet"):
+        code = numeric_code(path.stem)
+        if code is not None:
+            candidates.setdefault(code, []).append(path)
+
+    result: dict[str, Path] = {}
+    canonical = re.compile(r"^\d{6}\.(?:SH|SZ|BJ)$", re.IGNORECASE)
+    for code, paths in candidates.items():
+        result[code] = sorted(
+            paths,
+            key=lambda path: (not bool(canonical.fullmatch(path.stem)), path.name),
+        )[0]
+    return result
+
+
 def discover_symbol_dirs(input_root: Path, symbols: list[str] | None) -> list[Path]:
+    """Discover symbol directories inside one YYYYMMDD directory."""
     if not input_root.exists():
         raise FileNotFoundError(f"Input directory does not exist: {input_root}")
 
     if symbols:
-        symbol_dirs = [input_root / symbol for symbol in symbols]
+        requested_codes = {code for symbol in symbols if (code := numeric_code(symbol))}
+        symbol_dirs = sorted(
+            path
+            for path in input_root.iterdir()
+            if path.is_dir() and numeric_code(path.name) in requested_codes
+        )
     else:
         symbol_dirs = sorted(path for path in input_root.iterdir() if path.is_dir())
-
-    missing_dirs = [path for path in symbol_dirs if not path.exists()]
-    if missing_dirs:
-        missing_text = ", ".join(str(path) for path in missing_dirs[:5])
-        raise FileNotFoundError(f"Missing symbol directories: {missing_text}")
-
     return symbol_dirs
 
 
 def parse_trade_time(trade_date: pd.Series, raw_time: pd.Series) -> pd.Series:
-    date_text = trade_date.astype(str).str.extract(r"(\d{8})", expand=False)
-    time_text = raw_time.astype(str).str.extract(r"(\d+)", expand=False).str.zfill(9)
+    date_text = trade_date.astype(str).str.zfill(8)
+    time_text = raw_time.astype(str).str.zfill(9)
     combined = date_text + time_text
     return pd.to_datetime(combined, format="%Y%m%d%H%M%S%f", errors="raise")
 
@@ -217,6 +277,22 @@ def read_csv_subset(path: Path, usecols: list[int], names: list[str]) -> pd.Data
     )
     df.columns = names
     return df
+
+
+@lru_cache(maxsize=4)
+def _load_minute_table(minute_path: str) -> pd.DataFrame:
+    df = pd.read_parquet(Path(minute_path))
+    if isinstance(df.index, pd.MultiIndex) or df.index.name in {
+        "trade_date",
+        "trade_time",
+    }:
+        df = df.reset_index()
+    if "volume" in df.columns and "vol" not in df.columns:
+        df = df.rename(columns={"volume": "vol"})
+    df["trade_date"] = pd.to_datetime(df["trade_date"])
+    df["trade_time"] = pd.to_datetime(df["trade_time"])
+    df = df.sort_values(["trade_date", "trade_time"], kind="mergesort")
+    return df.set_index("trade_date", drop=False)
 
 
 def normalize_quote_frame(symbol_dir: Path) -> pd.DataFrame:
@@ -302,20 +378,15 @@ def load_minute_frame(
         raise FileNotFoundError(f"Missing minute parquet: {minute_path}")
 
     trade_day = pd.Timestamp(trade_date)
-    df = pd.read_parquet(
-        minute_path,
-        filters=[("trade_date", "==", trade_day)],
-    )
-    if isinstance(df.index, pd.MultiIndex) or df.index.name in {
-        "trade_date",
-        "trade_time",
-    }:
-        df = df.reset_index()
+    minute_table = _load_minute_table(str(minute_path))
+    try:
+        df = minute_table.loc[trade_day].copy()
+    except KeyError as exc:
+        raise ValueError(f"No minute rows for {symbol} on {trade_date}") from exc
+    if isinstance(df, pd.Series):
+        df = df.to_frame().T
     if df.empty:
         raise ValueError(f"No minute rows for {symbol} on {trade_date}")
-    if "volume" in df.columns and "vol" not in df.columns:
-        df = df.rename(columns={"volume": "vol"})
-    df["trade_time"] = pd.to_datetime(df["trade_time"])
     df = df.sort_values("trade_time", kind="mergesort").drop_duplicates(
         "trade_time", keep="last"
     )
@@ -371,12 +442,13 @@ def merge_symbol_output(
 
 def process_symbol_dir(
     symbol_dir: Path,
-    minute_root: Path,
+    minute_path: Path,
     output_root: Path,
     date_dir_name: str,
     overwrite: bool,
 ) -> tuple[str, Path, int | None, int | None]:
-    output_path = output_root / f"{symbol_dir.name}.parquet"
+    canonical_symbol = minute_path.stem
+    output_path = output_root / f"{canonical_symbol}.parquet"
     if output_path.exists() and not overwrite:
         existing_dates = pd.read_parquet(output_path, columns=["trade_date"])[
             "trade_date"
@@ -389,7 +461,7 @@ def process_symbol_dir(
     orders = normalize_order_frame(symbol_dir)
     trades = normalize_trade_frame(symbol_dir)
     factors = build_stock_orderbook_factor_frame(quotes, orders, trades)
-    minute_df = load_minute_frame(minute_root, symbol_dir.name, date_dir_name)
+    minute_df = load_minute_frame(minute_path.parent, canonical_symbol, date_dir_name)
     result = build_output_frame(minute_df, factors)
     result = merge_symbol_output(output_path, result, overwrite)
 
@@ -401,60 +473,47 @@ def process_symbol_dir(
 def main() -> int:
     args = parse_args()
     configure_logging()
-
-    symbol_dirs = discover_symbol_dirs(args.input_root, args.symbols)
-    if args.limit is not None:
-        symbol_dirs = symbol_dirs[: args.limit]
-
-    if not symbol_dirs:
-        LOGGER.warning("No symbol directories matched the requested inputs.")
-        return 0
-
-    date_dir_name = args.input_root.name
-    LOGGER.info(
-        "Processing %s stock orderbook directories for %s",
-        len(symbol_dirs),
-        date_dir_name,
-    )
-
+    date_dirs = discover_trade_date_dirs(args.input_root)
+    stock_minutes = build_minute_file_index(args.stock_minute_root)
+    etf_minutes = build_minute_file_index(args.etf_minute_root)
     failures: list[tuple[Path, str]] = []
     worker_count = max(1, args.workers)
+    processed_tasks = 0
+    skipped_without_minute = 0
 
-    if worker_count == 1:
-        for symbol_dir in symbol_dirs:
-            try:
-                status, output_path, row_count, column_count = process_symbol_dir(
-                    symbol_dir,
-                    args.minute_root,
-                    args.output_root,
-                    date_dir_name,
-                    args.overwrite,
+    for date_dir in date_dirs:
+        tasks: list[tuple[Path, Path, Path]] = []
+        for symbol_dir in discover_symbol_dirs(date_dir, args.symbols):
+            code = numeric_code(symbol_dir.name)
+            if code in stock_minutes:
+                tasks.append(
+                    (symbol_dir, stock_minutes[code], args.stock_output_root)
                 )
-                if status == "skipped":
-                    LOGGER.info("Skipping existing output: %s", output_path)
-                else:
-                    LOGGER.info(
-                        "Wrote %s rows and %s columns to %s",
-                        row_count,
-                        column_count,
-                        output_path,
-                    )
-            except Exception as exc:  # noqa: BLE001
-                failures.append((symbol_dir, str(exc)))
-                LOGGER.exception("Failed to process %s", symbol_dir)
-    else:
-        LOGGER.info("Using %s parallel workers", worker_count)
+            elif code in etf_minutes:
+                tasks.append((symbol_dir, etf_minutes[code], args.etf_output_root))
+            else:
+                skipped_without_minute += 1
+
+        if args.limit is not None:
+            remaining = args.limit - processed_tasks
+            if remaining <= 0:
+                break
+            tasks = tasks[:remaining]
+        if not tasks:
+            continue
+
+        LOGGER.info("Processing %s matched symbols for %s", len(tasks), date_dir.name)
         with ProcessPoolExecutor(max_workers=worker_count) as executor:
             future_map = {
                 executor.submit(
                     process_symbol_dir,
                     symbol_dir,
-                    args.minute_root,
-                    args.output_root,
-                    date_dir_name,
+                    minute_path,
+                    output_root,
+                    date_dir.name,
                     args.overwrite,
                 ): symbol_dir
-                for symbol_dir in symbol_dirs
+                for symbol_dir, minute_path, output_root in tasks
             }
             for future in as_completed(future_map):
                 symbol_dir = future_map[future]
@@ -472,7 +531,13 @@ def main() -> int:
                 except Exception as exc:  # noqa: BLE001
                     failures.append((symbol_dir, str(exc)))
                     LOGGER.exception("Failed to process %s", symbol_dir)
+        processed_tasks += len(tasks)
 
+    LOGGER.info(
+        "Matched %s date/symbol tasks; skipped %s without minute data",
+        processed_tasks,
+        skipped_without_minute,
+    )
     if failures:
         LOGGER.error("Completed with %s failures", len(failures))
         for failed_path, reason in failures[:10]:

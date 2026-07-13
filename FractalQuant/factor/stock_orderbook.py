@@ -14,7 +14,6 @@ implementation and from the ETF minute-parquet factor pipeline.
 
 import numpy as np
 import pandas as pd
-from scipy import stats
 
 
 ORDER_WINDOW = "60s"
@@ -32,6 +31,11 @@ CONTEXT_MIN_HISTORY = 10
 CONTEXT_SELECTION_WINDOW = "15min"
 CONTEXT_SELECTION_MIN_PERIODS = 30
 CONTEXT_SELECTION_QUANTILE = 0.98
+VPIN_NUM_BUCKETS = 50
+VPIN_TARGET_TRADES_PER_BUCKET = 20
+VPIN_SIZE_EWMA_SPAN = 100
+MARKOUT_HORIZON = "30s"
+MARKOUT_ROLLING_WINDOW = "60s"
 # Legacy mapping below is only for the stock orderbook CSV pipeline. ETF minute factors live elsewhere.
 # Existing output coverage against legacy factor/orderbook.py:
 # - SpreadFactor -> spread_bps
@@ -239,7 +243,58 @@ def _calculate_normalized_ofi(
 
 def _trading_session_labels(index: pd.DatetimeIndex) -> np.ndarray:
     afternoon = (index.hour >= 13).astype(np.int64)
-    return index.normalize().asi8 * 2 + afternoon
+    normalized_ns = index.normalize().astype("datetime64[ns]").asi8
+    return normalized_ns * 2 + afternoon
+
+
+def _calculate_ofi_level_entropy(
+    bid_prices: np.ndarray,
+    bid_qty: np.ndarray,
+    ask_prices: np.ndarray,
+    ask_qty: np.ndarray,
+    index: pd.DatetimeIndex,
+) -> np.ndarray:
+    bid_events = _quote_depth_event(bid_prices, bid_qty, side="bid")
+    ask_events = _quote_depth_event(ask_prices, ask_qty, side="ask")
+    level_magnitudes = np.abs(bid_events + ask_events)
+    session_labels = _trading_session_labels(index)
+    session_starts = np.r_[True, session_labels[1:] != session_labels[:-1]]
+    level_magnitudes[session_starts] = np.nan
+    totals = np.nansum(level_magnitudes, axis=1)
+    probabilities = np.divide(
+        level_magnitudes,
+        totals[:, None],
+        out=np.full_like(level_magnitudes, np.nan),
+        where=np.isfinite(totals[:, None]) & (totals[:, None] > 0),
+    )
+    terms = np.zeros_like(probabilities)
+    positive = probabilities > 0
+    terms[positive] = -probabilities[positive] * np.log(probabilities[positive])
+    entropy = np.sum(terms, axis=1) / np.log(level_magnitudes.shape[1])
+    entropy[~np.isfinite(totals) | (totals <= 0)] = np.nan
+    return entropy
+
+
+def _calculate_book_resilience(
+    depth: np.ndarray,
+    index: pd.DatetimeIndex,
+    window: str = "30s",
+) -> np.ndarray:
+    result = np.full(len(index), np.nan, dtype=float)
+    session_labels = _trading_session_labels(index)
+    for session in pd.unique(session_labels):
+        positions = np.flatnonzero(session_labels == session)
+        series = pd.Series(depth[positions], index=index[positions])
+        initial = series.rolling(window, min_periods=2, closed="both").apply(
+            lambda values: values[0], raw=True
+        )
+        trough = series.rolling(window, min_periods=2, closed="both").min()
+        depletion = initial - trough
+        recovered = series - trough
+        values = (recovered / depletion.replace(0.0, np.nan)).clip(0.0, 1.0)
+        values = values.where(depletion > 0, 1.0).where(initial.notna())
+        result[positions] = values.to_numpy(dtype=float)
+    return result
 
 
 def _calculate_mlofi_extensions(
@@ -377,18 +432,40 @@ def _coefficient_of_variation(values: np.ndarray) -> np.ndarray:
     return cv
 
 
-def _safe_skew(values: np.ndarray) -> float:
-    if len(values) < 3 or np.std(values) == 0:
+def _size_distribution_score(values: np.ndarray) -> float:
+    n = len(values)
+    if n < 3:
         return 0.0
-    skewness = stats.skew(values, bias=False)
-    return float(0.0 if not np.isfinite(skewness) else skewness)
+    centered = values - np.mean(values)
+    m2 = np.mean(np.square(centered))
+    if m2 <= 0 or not np.isfinite(m2):
+        return 0.0
+    m3 = np.mean(centered * centered * centered)
+    skewness = np.sqrt(n * (n - 1.0)) / (n - 2.0) * (m3 / np.power(m2, 1.5))
+    if not np.isfinite(skewness):
+        skewness = 0.0
+
+    kurtosis = 0.0
+    if n >= 4:
+        m4 = np.mean(centered * centered * centered * centered)
+        g2 = m4 / (m2 * m2) - 3.0
+        kurtosis = ((n - 1.0) / ((n - 2.0) * (n - 3.0))) * ((n + 1.0) * g2 + 6.0)
+        if not np.isfinite(kurtosis):
+            kurtosis = 0.0
+    return float(abs(skewness) + abs(kurtosis) / 10.0)
 
 
-def _safe_kurtosis(values: np.ndarray) -> float:
-    if len(values) < 4 or np.std(values) == 0:
-        return 0.0
-    kurtosis = stats.kurtosis(values, fisher=True, bias=False)
-    return float(0.0 if not np.isfinite(kurtosis) else kurtosis)
+def _safe_correlation(x: np.ndarray, y: np.ndarray) -> float | None:
+    if len(x) != len(y) or len(x) == 0:
+        return None
+    x_centered = x - x.mean()
+    y_centered = y - y.mean()
+    x_var = np.mean(np.square(x_centered))
+    y_var = np.mean(np.square(y_centered))
+    if x_var <= 0 or y_var <= 0:
+        return None
+    correlation = np.mean(x_centered * y_centered) / np.sqrt(x_var * y_var)
+    return float(correlation) if np.isfinite(correlation) else None
 
 
 def _causal_rolling_zscore(
@@ -485,7 +562,6 @@ def calculate_snapshot_factors(quotes: pd.DataFrame) -> pd.DataFrame:
     spread_bps[valid_spread] = (
         (ask1[valid_spread] - bid1[valid_spread]) / mid_price[valid_spread] * 10000.0
     )
-
     bid_depth_l1 = bid_qty1
     ask_depth_l1 = ask_qty1
     bid_depth_l5 = np.sum(bid_qty, axis=1)
@@ -507,6 +583,9 @@ def calculate_snapshot_factors(quotes: pd.DataFrame) -> pd.DataFrame:
         normalized_mlofi_l5,
         normalized_mlofi_l5_60s,
     ) = _calculate_normalized_ofi(
+        bid_prices, bid_qty, ask_prices, ask_qty, quotes.index
+    )
+    ofi_level_entropy_l5 = _calculate_ofi_level_entropy(
         bid_prices, bid_qty, ask_prices, ask_qty, quotes.index
     )
     (
@@ -545,6 +624,10 @@ def calculate_snapshot_factors(quotes: pd.DataFrame) -> pd.DataFrame:
     result["depth_imbalance_l5"] = _imbalance(bid_depth_l5, ask_depth_l5)
     result["normalized_ofi_l1"] = normalized_ofi_l1
     result["normalized_ofi_l1_60s"] = normalized_ofi_l1_60s
+    result["ofi_spread_scaled_impact"] = (
+        normalized_ofi_l1_60s * spread_bps / 2.0
+    )
+    result["ofi_level_entropy_l5"] = ofi_level_entropy_l5
     result["normalized_mlofi_l5"] = normalized_mlofi_l5
     result["normalized_mlofi_l5_60s"] = normalized_mlofi_l5_60s
     result["mlofi_event_50_l5"] = mlofi_event_50_l5
@@ -567,6 +650,11 @@ def calculate_snapshot_factors(quotes: pd.DataFrame) -> pd.DataFrame:
     )
     result["bid_ask_qty_ratio_l1"] = _safe_divide(bid_qty1, ask_qty1)
     result["depth_l5_total"] = depth_l5_total
+    bid_resilience_30s = _calculate_book_resilience(bid_depth_l5, quotes.index)
+    ask_resilience_30s = _calculate_book_resilience(ask_depth_l5, quotes.index)
+    result["bid_resilience_30s"] = bid_resilience_30s
+    result["ask_resilience_30s"] = ask_resilience_30s
+    result["resilience_imbalance_30s"] = bid_resilience_30s - ask_resilience_30s
     result["orderbook_decay_l5"] = (bid_decay_l5 + ask_decay_l5) / 2.0
     result["orderbook_asymmetry_l5"] = np.abs(bid_cv - ask_cv)
     result["depth_concentration_l5"] = (
@@ -651,9 +739,9 @@ def _calculate_trade_impact_factors(
         "volume_weighted_price_60s",
         "orderbook_pressure_60s",
     ]
-    result = pd.DataFrame(np.nan, index=quote_index, columns=factor_columns)
+    result_array = np.full((len(quote_index), len(factor_columns)), np.nan, dtype=float)
     if trades.empty:
-        return result
+        return pd.DataFrame(result_array, index=quote_index, columns=factor_columns)
 
     window_delta = pd.Timedelta(window).to_timedelta64()
     trade_times = trades["event_time"].to_numpy(dtype="datetime64[ns]", copy=False)
@@ -679,9 +767,7 @@ def _calculate_trade_impact_factors(
         window_notionals = notionals[start:end]
         window_directions = directions[start:end]
 
-        size_distribution = abs(_safe_skew(window_notionals)) + abs(
-            _safe_kurtosis(window_notionals)
-        ) / 10.0
+        size_distribution = _size_distribution_score(window_notionals)
 
         persistence_pairs = window_directions[1:] == window_directions[:-1]
         if len(persistence_pairs) > 0:
@@ -706,8 +792,12 @@ def _calculate_trade_impact_factors(
             window_notionals * window_directions
         ) / 1_000_000.0
         relative_price_bps = (window_prices / window_prices[0] - 1.0) * 10000.0
-        if np.std(cumulative_signed_millions) > 0:
-            slope = stats.linregress(cumulative_signed_millions, relative_price_bps).slope
+        x = cumulative_signed_millions
+        x_centered = x - x.mean()
+        x_var = np.mean(np.square(x_centered))
+        if x_var > 0:
+            y = relative_price_bps
+            slope = np.mean(x_centered * (y - y.mean())) / x_var
             if np.isfinite(slope):
                 market_impact = float(slope)
 
@@ -801,8 +891,8 @@ def _calculate_trade_impact_factors(
                 and np.std(returns) > 0
                 and np.std(vol_returns) > 0
             ):
-                correlation = np.corrcoef(returns, vol_returns)[0, 1]
-                if np.isfinite(correlation):
+                correlation = _safe_correlation(returns, vol_returns)
+                if correlation is not None:
                     price_volume_decoupling = float(1.0 - abs(correlation))
 
             path_length = np.abs(returns).sum()
@@ -819,7 +909,7 @@ def _calculate_trade_impact_factors(
                 if first_half > 0:
                     liquidity_migration = float((second_half - first_half) / first_half)
 
-        result.iloc[idx] = [
+        result_array[idx] = [
             size_distribution,
             persistence,
             liquidity_shock,
@@ -840,7 +930,7 @@ def _calculate_trade_impact_factors(
             orderbook_pressure,
         ]
 
-    return result
+    return pd.DataFrame(result_array, index=quote_index, columns=factor_columns)
 
 
 def calculate_order_flow_factors(
@@ -887,6 +977,166 @@ def calculate_order_flow_factors(
     return rolling[factor_columns].fillna(0.0)
 
 
+def calculate_vpin_factor(
+    trades: pd.DataFrame,
+    quote_index: pd.DatetimeIndex,
+    bucket_volume: float | None = None,
+    num_buckets: int = VPIN_NUM_BUCKETS,
+) -> pd.Series:
+    """Causal VPIN from completed volume buckets, reset each session.
+
+    When ``bucket_volume`` is omitted, each new bucket is sized from the causal
+    EWMA trade size available when that bucket starts. This avoids a fixed share
+    threshold that has incompatible meanings across stocks and ETFs.
+    """
+    result = pd.Series(np.nan, index=quote_index, name="vpin_50bucket", dtype=float)
+    if trades.empty:
+        return result
+    if (bucket_volume is not None and bucket_volume <= 0) or num_buckets <= 0:
+        raise ValueError("bucket_volume and num_buckets must be positive")
+
+    event_times = pd.DatetimeIndex(pd.to_datetime(trades["event_time"]))
+    event_sessions = _trading_session_labels(event_times)
+    quote_sessions = _trading_session_labels(quote_index)
+    sides = trades["side"].to_numpy(dtype=str, copy=False)
+    quantities = trades["qty"].to_numpy(dtype=float, copy=False)
+
+    for session in pd.unique(event_sessions):
+        event_positions = np.flatnonzero(event_sessions == session)
+        quote_positions = np.flatnonzero(quote_sessions == session)
+        if not len(quote_positions):
+            continue
+        completed_times: list[pd.Timestamp] = []
+        bucket_imbalances: list[float] = []
+        buy_volume = sell_volume = filled = 0.0
+        adaptive_target: float | None = bucket_volume
+        ewma_trade_size: float | None = None
+        ewma_alpha = 2.0 / (VPIN_SIZE_EWMA_SPAN + 1.0)
+        for position in event_positions:
+            remaining = quantities[position]
+            if not np.isfinite(remaining) or remaining <= 0:
+                continue
+            trade_size = remaining
+            while remaining > 0:
+                if adaptive_target is None:
+                    reference_size = (
+                        ewma_trade_size if ewma_trade_size is not None else trade_size
+                    )
+                    adaptive_target = max(
+                        reference_size * VPIN_TARGET_TRADES_PER_BUCKET, 1.0
+                    )
+                allocation = min(remaining, adaptive_target - filled)
+                if sides[position] == "B":
+                    buy_volume += allocation
+                else:
+                    sell_volume += allocation
+                filled += allocation
+                remaining -= allocation
+                if filled >= adaptive_target - 1e-12:
+                    completed_times.append(event_times[position])
+                    bucket_imbalances.append(
+                        abs(buy_volume - sell_volume) / adaptive_target
+                    )
+                    buy_volume = sell_volume = filled = 0.0
+                    adaptive_target = bucket_volume
+            ewma_trade_size = (
+                trade_size
+                if ewma_trade_size is None
+                else ewma_alpha * trade_size + (1.0 - ewma_alpha) * ewma_trade_size
+            )
+
+        if len(bucket_imbalances) < num_buckets:
+            continue
+        bucket_series = pd.Series(bucket_imbalances, index=completed_times)
+        bucket_vpin = bucket_series.rolling(
+            num_buckets, min_periods=num_buckets
+        ).mean()
+        bucket_frame = bucket_vpin.rename("vpin").rename_axis("time").reset_index()
+        aligned = pd.merge_asof(
+            pd.DataFrame({"time": quote_index[quote_positions]}),
+            bucket_frame,
+            on="time",
+            direction="backward",
+        )
+        result.iloc[quote_positions] = aligned["vpin"].to_numpy(dtype=float)
+    return result
+
+
+def _calculate_adverse_selection_markout(
+    trades: pd.DataFrame,
+    quotes: pd.DataFrame,
+    horizon: str = MARKOUT_HORIZON,
+    rolling_window: str = MARKOUT_ROLLING_WINDOW,
+) -> pd.Series:
+    """Average signed trade markout, exposed only once its horizon has matured."""
+    result = pd.Series(
+        np.nan, index=quotes.index, name="adverse_selection_markout_30s", dtype=float
+    )
+    if trades.empty:
+        return result
+
+    horizon_delta = pd.Timedelta(horizon)
+    rolling_delta = pd.Timedelta(rolling_window)
+    trade_times = pd.DatetimeIndex(pd.to_datetime(trades["event_time"]))
+    trade_sessions = _trading_session_labels(trade_times)
+    quote_sessions = _trading_session_labels(quotes.index)
+    directions = np.where(trades["side"].to_numpy(dtype=str) == "B", 1.0, -1.0)
+    mid = quotes["mid_price"].to_numpy(dtype=float, copy=False)
+
+    for session in pd.unique(trade_sessions):
+        trade_positions = np.flatnonzero(trade_sessions == session)
+        quote_positions = np.flatnonzero(quote_sessions == session)
+        if not len(quote_positions):
+            continue
+        session_quote_times = quotes.index[quote_positions]
+        session_trade_times = trade_times[trade_positions]
+        initial_offsets = session_quote_times.searchsorted(session_trade_times, side="right") - 1
+        mature_offsets = session_quote_times.searchsorted(
+            session_trade_times + horizon_delta, side="left"
+        )
+        valid = (initial_offsets >= 0) & (mature_offsets < len(session_quote_times))
+        if not np.any(valid):
+            continue
+
+        valid_trade_positions = trade_positions[valid]
+        valid_initial_offsets = initial_offsets[valid]
+        valid_mature_offsets = mature_offsets[valid]
+        initial_mid = mid[quote_positions[valid_initial_offsets]]
+        mature_mid = mid[quote_positions[valid_mature_offsets]]
+        finite = np.isfinite(initial_mid) & (initial_mid > 0) & np.isfinite(mature_mid)
+        if not np.any(finite):
+            continue
+
+        valid_trade_positions = valid_trade_positions[finite]
+        valid_mature_offsets = valid_mature_offsets[finite]
+        initial_mid = initial_mid[finite]
+        mature_mid = mature_mid[finite]
+        maturity_times = session_quote_times[valid_mature_offsets]
+        markouts = (
+            directions[valid_trade_positions]
+            * (mature_mid - initial_mid)
+            / initial_mid
+            * 10000.0
+        )
+
+        maturity_ns = pd.DatetimeIndex(maturity_times).astype("datetime64[ns]").asi8
+        order = np.argsort(maturity_ns, kind="stable")
+        maturity_ns = maturity_ns[order]
+        markout_values = np.asarray(markouts, dtype=float)[order]
+        quote_ns = session_quote_times.astype("datetime64[ns]").asi8
+        starts = np.searchsorted(maturity_ns, quote_ns - rolling_delta.value, side="left")
+        ends = np.searchsorted(maturity_ns, quote_ns, side="right")
+        cumulative = np.r_[0.0, np.cumsum(markout_values)]
+        counts = ends - starts
+        valid = counts > 0
+        session_result = np.full(len(quote_positions), np.nan, dtype=float)
+        session_result[valid] = (
+            cumulative[ends[valid]] - cumulative[starts[valid]]
+        ) / counts[valid]
+        result.iloc[quote_positions] = session_result
+    return result
+
+
 def calculate_trade_flow_factors(
     trades: pd.DataFrame,
     quotes: pd.DataFrame,
@@ -914,6 +1164,8 @@ def calculate_trade_flow_factors(
         "liquidity_ratio_60s",
         "volume_weighted_price_60s",
         "orderbook_pressure_60s",
+        "vpin_50bucket",
+        "adverse_selection_markout_30s",
     ]
     if trades.empty:
         empty = pd.DataFrame(0.0, index=quotes.index, columns=factor_columns[:2])
@@ -950,6 +1202,10 @@ def calculate_trade_flow_factors(
     )
     advanced = _calculate_trade_impact_factors(trades, quotes.index, window)
     result = pd.concat([result, advanced], axis=1)
+    result["vpin_50bucket"] = calculate_vpin_factor(trades, quotes.index)
+    result["adverse_selection_markout_30s"] = _calculate_adverse_selection_markout(
+        trades, quotes
+    )
     result.index = quotes.index
     return result.replace([np.inf, -np.inf], np.nan)
 
