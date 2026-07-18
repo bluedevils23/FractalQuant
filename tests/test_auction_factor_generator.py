@@ -13,6 +13,7 @@ from scripts.generate_auction_factors import (
     calculate_daily_auction_factors,
     group_symbol_paths,
     load_auction_event_frame,
+    load_daily_amount_history,
     merge_symbol_output,
 )
 
@@ -193,9 +194,52 @@ def test_second_batch_event_factor_formulas_and_boundaries() -> None:
     assert np.isclose(row["auction_stage2_add_imbalance"], 0.6)
     assert np.isclose(row["auction_stage2_commitment_ratio"], 5000 / 7300)
     assert np.isclose(row["auction_stage2_last60s_add_share"], 0.2)
+    assert row["auction_submitted_volume"] == 800.0
+    assert np.isclose(row["auction_matched_volume_to_submitted_ratio"], 1.25)
     expected_fake_pressure = (-1000 / 3000) - ((800 - 1500) / 2300)
     assert np.isclose(row["auction_fake_pressure_proxy"], expected_fake_pressure)
     assert row["auction_stage_reversal_strength_bps"] == 0.0
+
+
+def test_third_batch_price_path_and_robust_imbalance_formulas() -> None:
+    row = calculate_daily_auction_factors(_auction_quotes(), "000001.SZ")
+
+    assert np.isclose(row["auction_stage2_mid_mean_return"], 10.04 / 10.0 - 1.0)
+    assert np.isclose(row["auction_stage2_mid_max_return"], 10.06 / 10.0 - 1.0)
+    assert np.isclose(row["auction_stage2_mid_min_return"], 10.02 / 10.0 - 1.0)
+    assert np.isclose(row["auction_stage2_total_variation_bps"], 40.0)
+    assert row["auction_stage2_up_step_ratio"] == 1.0
+    assert row["auction_stage2_reversal_count"] == 0
+    assert np.isclose(row["auction_imbalance_relative_change_stage1"], 2.0)
+    assert np.isclose(row["auction_imbalance_relative_change_stage2"], 1 / 3)
+    assert np.isclose(
+        row["auction_imbalance_fisher_change_stage1"],
+        np.arctanh(0.6) - np.arctanh(0.2),
+    )
+    assert np.isclose(
+        row["auction_imbalance_fisher_change_stage2"],
+        np.arctanh(0.8) - np.arctanh(0.6),
+    )
+
+
+def test_flat_and_reversing_stage2_paths_have_stable_direction_statistics() -> None:
+    flat = calculate_daily_auction_factors(
+        _auction_quotes(constant_stage2=True), "000001.SZ"
+    )
+    assert flat["auction_stage2_total_variation_bps"] == 0.0
+    assert flat["auction_stage2_up_step_ratio"] == 0.0
+    assert flat["auction_stage2_reversal_count"] == 0
+
+    quotes = _auction_quotes()
+    stage2_indexes = quotes.index[
+        quotes["trade_time"].between("2026-03-31 09:20", "2026-03-31 09:24:59")
+    ]
+    quotes.loc[stage2_indexes, ["ask_price1", "bid_price1"]] = np.array(
+        [[10.02, 10.02], [10.06, 10.06], [10.01, 10.01]]
+    )
+    reversing = calculate_daily_auction_factors(quotes, "000001.SZ")
+    assert reversing["auction_stage2_up_step_ratio"] == 0.5
+    assert reversing["auction_stage2_reversal_count"] == 1
 
 
 def test_stage_reversal_is_signed_and_missing_events_do_not_remove_quote_factor() -> (
@@ -322,6 +366,15 @@ def test_zero_depth_and_zero_previous_close_do_not_create_infinity() -> None:
     assert np.isnan(row["auction_stage2_range_bps"])
 
 
+def test_zero_initial_imbalance_uses_relative_floor_without_infinity() -> None:
+    quotes = _auction_quotes()
+    quotes.loc[0, ["bid_qty1", "ask_qty1"]] = [500.0, 500.0]
+    row = calculate_daily_auction_factors(quotes, "000001.SZ")
+
+    assert np.isclose(row["auction_imbalance_relative_change_stage1"], 12.0)
+    assert np.isfinite(row["auction_imbalance_fisher_change_stage1"])
+
+
 def _historical_frame(amounts: list[float]) -> pd.DataFrame:
     rows = []
     for offset, amount in enumerate(amounts):
@@ -365,6 +418,69 @@ def test_history_skips_invalid_days_when_selecting_five_observations() -> None:
     result = apply_historical_ratios(frame)
     assert np.isnan(result.loc[5, "auction_amount_ratio_5d"])
     assert np.isclose(result.loc[6, "auction_amount_ratio_5d"], 60 / 30)
+
+
+def test_twenty_day_auction_zscore_and_prior_adv_are_strictly_historical() -> None:
+    auction_amounts = [float(value) for value in range(10, 230, 10)]
+    frame = _historical_frame(auction_amounts)
+    daily_index = pd.date_range("2026-01-01", periods=22, freq="D")
+    daily_amounts = pd.Series(np.arange(1.0, 23.0) * 1000.0, index=daily_index)
+
+    result = apply_historical_ratios(frame, daily_amount_history=daily_amounts)
+    recent_auction = np.arange(10.0, 201.0, 10.0)
+    expected_adv = np.arange(1000.0, 21000.0, 1000.0).mean()
+    assert np.isnan(result.loc[19, "auction_amount_zscore_20d"])
+    assert np.isclose(
+        result.loc[20, "auction_amount_zscore_20d"],
+        (210.0 - recent_auction.mean()) / recent_auction.std(ddof=0),
+    )
+    assert np.isclose(result.loc[20, "previous_20d_average_daily_amount"], expected_adv)
+    assert np.isclose(
+        result.loc[20, "auction_amount_to_prev20d_adv"], 210.0 / expected_adv
+    )
+
+    changed_future = daily_amounts.copy()
+    changed_future.iloc[21] = 999_999_999.0
+    changed = apply_historical_ratios(frame, daily_amount_history=changed_future)
+    assert np.isclose(
+        result.loc[20, "auction_amount_to_prev20d_adv"],
+        changed.loc[20, "auction_amount_to_prev20d_adv"],
+    )
+
+    changed_auction_frame = frame.copy()
+    changed_auction_frame.loc[21, "auction_amount"] = 999_999_999.0
+    changed_auction = apply_historical_ratios(
+        changed_auction_frame, daily_amount_history=daily_amounts
+    )
+    assert np.isclose(
+        result.loc[20, "auction_amount_zscore_20d"],
+        changed_auction.loc[20, "auction_amount_zscore_20d"],
+    )
+
+
+def test_daily_amount_history_sums_minute_bars_by_trade_date(tmp_path) -> None:
+    index = pd.MultiIndex.from_arrays(
+        [
+            pd.to_datetime(["2026-01-01", "2026-01-01", "2026-01-02"]),
+            pd.to_datetime(
+                [
+                    "2026-01-01 09:30",
+                    "2026-01-01 09:31",
+                    "2026-01-02 09:30",
+                ]
+            ),
+        ],
+        names=["trade_date", "trade_time"],
+    )
+    minute_path = tmp_path / "000001.SZ.parquet"
+    pd.DataFrame({"amount": [100.0, 200.0, 400.0]}, index=index).to_parquet(minute_path)
+
+    daily = load_daily_amount_history(minute_path)
+
+    assert daily.to_dict() == {
+        pd.Timestamp("2026-01-01"): 300.0,
+        pd.Timestamp("2026-01-02"): 400.0,
+    }
 
 
 def _dated_event(

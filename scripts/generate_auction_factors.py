@@ -50,6 +50,8 @@ REFERENCE_COLUMNS = [
     "auction_stage1_cancel_notional",
     "auction_stage2_add_notional",
     "auction_large_order_threshold",
+    "previous_20d_average_daily_amount",
+    "auction_submitted_volume",
 ]
 CORE_FACTOR_COLUMNS = [
     "auction_overnight_return",
@@ -79,7 +81,32 @@ EVENT_FACTOR_COLUMNS = [
     "auction_fake_pressure_proxy",
     "auction_stage_reversal_strength_bps",
 ]
-FACTOR_COLUMNS = CORE_FACTOR_COLUMNS + EVENT_FACTOR_COLUMNS
+PATH_FACTOR_COLUMNS = [
+    "auction_stage2_mid_mean_return",
+    "auction_stage2_mid_max_return",
+    "auction_stage2_mid_min_return",
+    "auction_stage2_total_variation_bps",
+    "auction_stage2_up_step_ratio",
+    "auction_stage2_reversal_count",
+]
+ROBUST_IMBALANCE_FACTOR_COLUMNS = [
+    "auction_imbalance_relative_change_stage1",
+    "auction_imbalance_relative_change_stage2",
+    "auction_imbalance_fisher_change_stage1",
+    "auction_imbalance_fisher_change_stage2",
+]
+PARTICIPATION_FACTOR_COLUMNS = [
+    "auction_amount_to_prev20d_adv",
+    "auction_amount_zscore_20d",
+    "auction_matched_volume_to_submitted_ratio",
+]
+FACTOR_COLUMNS = (
+    CORE_FACTOR_COLUMNS
+    + EVENT_FACTOR_COLUMNS
+    + PATH_FACTOR_COLUMNS
+    + ROBUST_IMBALANCE_FACTOR_COLUMNS
+    + PARTICIPATION_FACTOR_COLUMNS
+)
 OUTPUT_COLUMNS = KEY_COLUMNS + DIAGNOSTIC_COLUMNS + REFERENCE_COLUMNS + FACTOR_COLUMNS
 
 EVENT_COLUMNS = [
@@ -94,6 +121,9 @@ EVENT_COLUMNS = [
 ]
 LARGE_ORDER_LOOKBACK_DAYS = 20
 LARGE_ORDER_QUANTILE = 0.90
+HISTORICAL_AMOUNT_LOOKBACK_DAYS = 20
+IMBALANCE_RELATIVE_FLOOR = 0.05
+IMBALANCE_FISHER_CLIP = 1.0 - 1e-6
 
 RAW_COLUMN_MAP = {
     "自然日": "raw_trade_date",
@@ -634,6 +664,54 @@ def _stage2_efficiency(stage2: pd.DataFrame) -> float:
     return float(abs(prices[-1] - prices[0]) / total_variation)
 
 
+def _apply_stage2_path_factors(
+    row: dict[str, object], stage2: pd.DataFrame, previous_close: float
+) -> None:
+    prices = stage2["indicative_price"].dropna().to_numpy(dtype=float)
+    if prices.size == 0:
+        return
+    if np.isfinite(previous_close) and previous_close > 0:
+        row["auction_stage2_mid_mean_return"] = float(
+            prices.mean() / previous_close - 1.0
+        )
+        row["auction_stage2_mid_max_return"] = float(
+            prices.max() / previous_close - 1.0
+        )
+        row["auction_stage2_mid_min_return"] = float(
+            prices.min() / previous_close - 1.0
+        )
+    if prices.size < 2:
+        return
+
+    changes = np.diff(prices)
+    if np.isfinite(previous_close) and previous_close > 0:
+        row["auction_stage2_total_variation_bps"] = float(
+            np.abs(changes).sum() / previous_close * 10000.0
+        )
+    row["auction_stage2_up_step_ratio"] = float(
+        np.count_nonzero(changes > 0) / len(changes)
+    )
+    nonzero_directions = np.sign(changes[changes != 0])
+    row["auction_stage2_reversal_count"] = int(
+        np.count_nonzero(nonzero_directions[1:] != nonzero_directions[:-1])
+    )
+
+
+def _relative_imbalance_change(end_value: float, start_value: float) -> float:
+    if not np.isfinite(end_value) or not np.isfinite(start_value):
+        return np.nan
+    denominator = max(abs(float(start_value)), IMBALANCE_RELATIVE_FLOOR)
+    return float((end_value - start_value) / denominator)
+
+
+def _fisher_imbalance_change(end_value: float, start_value: float) -> float:
+    if not np.isfinite(end_value) or not np.isfinite(start_value):
+        return np.nan
+    end_clipped = np.clip(end_value, -IMBALANCE_FISHER_CLIP, IMBALANCE_FISHER_CLIP)
+    start_clipped = np.clip(start_value, -IMBALANCE_FISHER_CLIP, IMBALANCE_FISHER_CLIP)
+    return float(np.arctanh(end_clipped) - np.arctanh(start_clipped))
+
+
 def _safe_ratio(numerator: float, denominator: float) -> float:
     if not np.isfinite(numerator) or not np.isfinite(denominator) or denominator <= 0:
         return np.nan
@@ -696,6 +774,9 @@ def _apply_event_factors(
     row["auction_stage1_add_notional"] = stage1_add_notional
     row["auction_stage1_cancel_notional"] = stage1_cancel_notional
     row["auction_stage2_add_notional"] = stage2_add_notional
+    row["auction_submitted_volume"] = float(
+        stage1_adds["quantity"].sum() + stage2_adds["quantity"].sum()
+    )
     if not reconstruction_ok:
         return
 
@@ -757,6 +838,16 @@ def _apply_event_factors(
         row["auction_fake_pressure_proxy"] = float(
             initial_imbalance - surviving_imbalance
         )
+
+
+def _apply_matched_volume_participation(row: dict[str, object]) -> None:
+    if not bool(row["auction_event_reconstruction_ok"]):
+        return
+    matched_volume = row["auction_matched_volume"]
+    submitted_volume = row["auction_submitted_volume"]
+    row["auction_matched_volume_to_submitted_ratio"] = _safe_ratio(
+        matched_volume, submitted_volume
+    )
 
 
 def _apply_stage_reversal(row: dict[str, object]) -> None:
@@ -854,6 +945,8 @@ def calculate_daily_auction_factors(
     elif not auction.empty:
         row["available_time"] = pd.Timestamp(auction["trade_time"].iloc[-1])
 
+    _apply_matched_volume_participation(row)
+
     if split_candidates.empty or final_candidates.empty:
         _apply_stage_reversal(row)
         return row
@@ -891,9 +984,21 @@ def calculate_daily_auction_factors(
         row["auction_imbalance_change_stage1"] = float(
             split_imbalance - first_imbalance
         )
+        row["auction_imbalance_relative_change_stage1"] = _relative_imbalance_change(
+            split_imbalance, first_imbalance
+        )
+        row["auction_imbalance_fisher_change_stage1"] = _fisher_imbalance_change(
+            split_imbalance, first_imbalance
+        )
     if np.isfinite(split_imbalance) and np.isfinite(final_imbalance):
         row["auction_imbalance_change_stage2"] = float(
             final_imbalance - split_imbalance
+        )
+        row["auction_imbalance_relative_change_stage2"] = _relative_imbalance_change(
+            final_imbalance, split_imbalance
+        )
+        row["auction_imbalance_fisher_change_stage2"] = _fisher_imbalance_change(
+            final_imbalance, split_imbalance
         )
 
     stage1_imbalance = stage1["l3_imbalance"].dropna()
@@ -916,6 +1021,7 @@ def calculate_daily_auction_factors(
             * 10000.0
         )
     row["auction_stage2_efficiency_ratio"] = _stage2_efficiency(stage2_valid)
+    _apply_stage2_path_factors(row, stage2_valid, previous_close)
 
     unmatched_bid = float(final["bid_qty2"])
     unmatched_ask = float(final["ask_qty2"])
@@ -962,9 +1068,31 @@ def _apply_large_order_factors(
         )
 
 
+def load_daily_amount_history(minute_path: Path) -> pd.Series:
+    if not minute_path.exists():
+        raise FileNotFoundError(f"Minute file does not exist: {minute_path}")
+    frame = pd.read_parquet(minute_path, columns=["amount"])
+    if isinstance(frame.index, pd.MultiIndex):
+        level = "trade_date" if "trade_date" in frame.index.names else 0
+        trade_dates = pd.to_datetime(frame.index.get_level_values(level))
+    elif frame.index.name == "trade_date":
+        trade_dates = pd.to_datetime(frame.index)
+    elif "trade_date" in frame.columns:
+        trade_dates = pd.to_datetime(frame["trade_date"])
+    else:
+        raise ValueError(
+            f"Minute file has no trade_date index or column: {minute_path}"
+        )
+
+    amounts = pd.to_numeric(frame["amount"], errors="coerce")
+    daily = amounts.groupby(trade_dates.normalize()).sum(min_count=1).sort_index()
+    return daily.where(np.isfinite(daily) & daily.gt(0)).dropna().astype(float)
+
+
 def apply_historical_ratios(
     frame: pd.DataFrame,
     event_frames: dict[str, pd.DataFrame] | None = None,
+    daily_amount_history: pd.Series | None = None,
 ) -> pd.DataFrame:
     result = (
         frame.sort_values("trade_date", kind="mergesort").reset_index(drop=True).copy()
@@ -989,10 +1117,37 @@ def apply_historical_ratios(
                 mean = float(np.mean(history[-5:]))
                 if np.isfinite(value) and mean > 0:
                     result.at[index, target] = float(value / mean)
+            if source == "auction_amount":
+                result.at[index, "auction_amount_zscore_20d"] = np.nan
+                if len(history) >= HISTORICAL_AMOUNT_LOOKBACK_DAYS:
+                    recent = np.asarray(
+                        history[-HISTORICAL_AMOUNT_LOOKBACK_DAYS:], dtype=float
+                    )
+                    standard_deviation = float(recent.std(ddof=0))
+                    if np.isfinite(value) and standard_deviation > 0:
+                        result.at[index, "auction_amount_zscore_20d"] = float(
+                            (value - recent.mean()) / standard_deviation
+                        )
             if np.isfinite(value) and value > 0:
                 history.append(float(value))
 
         trade_date = pd.Timestamp(row["trade_date"]).strftime("%Y-%m-%d")
+        result.at[index, "previous_20d_average_daily_amount"] = np.nan
+        result.at[index, "auction_amount_to_prev20d_adv"] = np.nan
+        if daily_amount_history is not None:
+            prior_daily_amounts = daily_amount_history.loc[
+                daily_amount_history.index < pd.Timestamp(trade_date)
+            ].tail(HISTORICAL_AMOUNT_LOOKBACK_DAYS)
+            if len(prior_daily_amounts) >= HISTORICAL_AMOUNT_LOOKBACK_DAYS:
+                average_daily_amount = float(prior_daily_amounts.mean())
+                result.at[index, "previous_20d_average_daily_amount"] = (
+                    average_daily_amount
+                )
+                if np.isfinite(row["auction_amount"]) and average_daily_amount > 0:
+                    result.at[index, "auction_amount_to_prev20d_adv"] = float(
+                        row["auction_amount"] / average_daily_amount
+                    )
+
         events = event_frames.get(trade_date)
         result.at[index, "auction_large_order_history_days"] = min(
             len(order_notional_history), LARGE_ORDER_LOOKBACK_DAYS
@@ -1080,6 +1235,7 @@ def process_symbol_series(
     asset_type: str,
     ts_code: str,
     symbol_paths: list[Path],
+    minute_path: Path,
     output_root: Path,
     date_from: str | None,
     date_to: str | None,
@@ -1100,7 +1256,7 @@ def process_symbol_series(
         path for path in ordered_paths if path.parent.name < first_requested_date
     ]
     warmup_records: list[tuple[dict[str, object], pd.DataFrame]] = []
-    valid_ratio_history_count = 0
+    valid_amount_history_count = 0
     valid_event_history_count = 0
     for path in reversed(prior_paths):
         events, event_ok = load_auction_event_frame(path, ts_code)
@@ -1114,11 +1270,11 @@ def process_symbol_series(
             and np.isfinite(daily["auction_matched_volume"])
             and daily["auction_matched_volume"] > 0
         ):
-            valid_ratio_history_count += 1
+            valid_amount_history_count += 1
         if event_ok and not events.loc[events["event_type"].eq("A")].empty:
             valid_event_history_count += 1
         if (
-            valid_ratio_history_count >= 5
+            valid_amount_history_count >= HISTORICAL_AMOUNT_LOOKBACK_DAYS
             and valid_event_history_count >= LARGE_ORDER_LOOKBACK_DAYS
         ):
             break
@@ -1134,8 +1290,11 @@ def process_symbol_series(
     all_records = list(reversed(warmup_records)) + requested_records
     all_rows = [row for row, _ in all_records]
     event_frames = {row["trade_date"]: events for row, events in all_records}
+    daily_amount_history = load_daily_amount_history(minute_path)
     factor_frame = apply_historical_ratios(
-        pd.DataFrame(all_rows), event_frames=event_frames
+        pd.DataFrame(all_rows),
+        event_frames=event_frames,
+        daily_amount_history=daily_amount_history,
     )
     requested_dates = {
         pd.Timestamp(path.parent.name).strftime("%Y-%m-%d") for path in requested_paths
@@ -1179,6 +1338,10 @@ def main() -> int:
         "stock": args.stock_output_root,
         "etf": args.etf_output_root,
     }
+    minute_roots = {
+        "stock": args.stock_minute_root,
+        "etf": args.etf_minute_root,
+    }
     tasks = [
         (kind, code, symbol, grouped_paths.get(code, []))
         for kind, code, symbol in assets
@@ -1200,6 +1363,7 @@ def main() -> int:
                     kind,
                     symbol,
                     paths,
+                    minute_roots[kind] / f"{symbol}.parquet",
                     output_roots[kind],
                     date_from,
                     date_to,
@@ -1218,6 +1382,7 @@ def main() -> int:
                     kind,
                     symbol,
                     paths,
+                    minute_roots[kind] / f"{symbol}.parquet",
                     output_roots[kind],
                     date_from,
                     date_to,
