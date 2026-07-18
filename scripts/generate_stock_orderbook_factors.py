@@ -42,6 +42,13 @@ DEFAULT_STOCK_OUTPUT_ROOT = Path(
 DEFAULT_ETF_OUTPUT_ROOT = Path(
     r"D:\workspace\stockdata\etf-data\etf_1min_orderbook_factors"
 )
+DEFAULT_STOCK_MULTIWINDOW_OUTPUT_ROOT = Path(
+    r"D:\workspace\stockdata\a-share-data\stock_1min_orderbook_factors_multiwindow"
+)
+DEFAULT_ETF_MULTIWINDOW_OUTPUT_ROOT = Path(
+    r"D:\workspace\stockdata\etf-data\etf_1min_orderbook_factors_multiwindow"
+)
+WINDOW_PROFILES = ("base", "multi")
 
 QUOTE_USECOLS = [0, 2, 3, *range(17, 27), *range(27, 37), *range(37, 47), *range(47, 57)]
 QUOTE_COLUMN_NAMES = [
@@ -69,7 +76,7 @@ BASE_OUTPUT_COLUMNS = [
     "amount",
     "adj_factor",
 ]
-FACTOR_COLUMNS = [
+BASE_FACTOR_COLUMNS = [
     # Snapshot quote factors.
     "mid_price",
     "spread_bps",
@@ -138,7 +145,73 @@ FACTOR_COLUMNS = [
     "contextual_selected_flow_imbalance_60s",
     "contextual_selected_lob_surprise_60s",
 ]
+FACTOR_COLUMNS = BASE_FACTOR_COLUMNS
 OUTPUT_COLUMNS = BASE_OUTPUT_COLUMNS + FACTOR_COLUMNS
+
+
+def factor_columns_for_profile(window_profile: str) -> list[str]:
+    if window_profile not in WINDOW_PROFILES:
+        raise ValueError(f"Unsupported window profile: {window_profile}")
+    if window_profile == "base":
+        return list(BASE_FACTOR_COLUMNS)
+
+    additional: list[str] = []
+    for window in ("10s", "30s", "300s"):
+        additional.extend(
+            [
+                f"normalized_ofi_l1_{window}",
+                f"normalized_mlofi_l5_{window}",
+                f"ofi_spread_scaled_impact_{window}",
+            ]
+        )
+    for window in ("10s", "30s", "300s"):
+        additional.extend(
+            f"order_{metric}_imbalance_{window}"
+            for metric in ("count", "qty", "notional")
+        )
+    for window in ("10s", "30s", "300s"):
+        additional.extend(
+            f"trade_{metric}_{window}"
+            for metric in ("count_imbalance", "qty_imbalance", "vwap_gap")
+        )
+    impact_bases = (
+        "trade_size_distribution",
+        "trade_direction_persistence",
+        "liquidity_shock",
+        "market_impact",
+        "orderflow_significance",
+        "volatility_adj_volume",
+        "price_velocity",
+        "momentum_acceleration",
+        "volume_spike",
+        "volume_clustering",
+        "liquidity_depth",
+        "price_volume_decoupling",
+        "market_efficiency",
+        "liquidity_migration",
+        "order_flow_imbalance",
+        "liquidity_ratio",
+        "volume_weighted_price",
+        "orderbook_pressure",
+    )
+    for window in ("30s", "300s"):
+        additional.extend(f"{base}_{window}" for base in impact_bases)
+    for window in ("10s", "60s", "300s"):
+        additional.extend(
+            [
+                f"bid_resilience_{window}",
+                f"ask_resilience_{window}",
+                f"resilience_imbalance_{window}",
+            ]
+        )
+    columns = list(BASE_FACTOR_COLUMNS) + additional
+    if len(columns) != len(set(columns)):
+        raise ValueError("Multi-window factor columns must be unique")
+    return columns
+
+
+def output_columns_for_profile(window_profile: str) -> list[str]:
+    return BASE_OUTPUT_COLUMNS + factor_columns_for_profile(window_profile)
 
 
 def parse_args() -> argparse.Namespace:
@@ -166,14 +239,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--stock-output-root",
         type=Path,
-        default=DEFAULT_STOCK_OUTPUT_ROOT,
+        default=None,
         help="Directory where stock orderbook factor parquet files will be written.",
     )
     parser.add_argument(
         "--etf-output-root",
         type=Path,
-        default=DEFAULT_ETF_OUTPUT_ROOT,
+        default=None,
         help="Directory where ETF orderbook factor parquet files will be written.",
+    )
+    parser.add_argument(
+        "--window-profile",
+        choices=WINDOW_PROFILES,
+        default="base",
+        help="Factor window profile; base preserves legacy output and multi adds short/long windows.",
     )
     parser.add_argument(
         "--symbols",
@@ -199,6 +278,17 @@ def parse_args() -> argparse.Namespace:
         help="Number of parallel workers to use.",
     )
     return parser.parse_args()
+
+
+def resolve_output_root(
+    requested_root: Path | None,
+    window_profile: str,
+    base_root: Path,
+    multiwindow_root: Path,
+) -> Path:
+    if requested_root is not None:
+        return requested_root
+    return multiwindow_root if window_profile == "multi" else base_root
 
 
 def configure_logging() -> None:
@@ -399,7 +489,11 @@ def load_minute_frame(
     return df[BASE_OUTPUT_COLUMNS]
 
 
-def build_output_frame(minute_df: pd.DataFrame, factors: pd.DataFrame) -> pd.DataFrame:
+def build_output_frame(
+    minute_df: pd.DataFrame,
+    factors: pd.DataFrame,
+    factor_columns: list[str] = FACTOR_COLUMNS,
+) -> pd.DataFrame:
     minute_times = pd.to_datetime(minute_df["trade_time"])
     factor_frame = factors.reset_index().sort_values("trade_time")
     aligned = pd.merge_asof(
@@ -411,10 +505,10 @@ def build_output_frame(minute_df: pd.DataFrame, factors: pd.DataFrame) -> pd.Dat
     )
     aligned.index = minute_df.index
     result = pd.concat(
-        [minute_df.reset_index(drop=True), aligned[FACTOR_COLUMNS].reset_index(drop=True)],
+        [minute_df.reset_index(drop=True), aligned[factor_columns].reset_index(drop=True)],
         axis=1,
     )
-    result = result[OUTPUT_COLUMNS]
+    result = result[BASE_OUTPUT_COLUMNS + factor_columns]
     result = result.replace([np.inf, -np.inf], np.nan)
     return result
 
@@ -446,6 +540,8 @@ def process_symbol_dir(
     output_root: Path,
     date_dir_name: str,
     overwrite: bool,
+    window_profile: str,
+    factor_columns: list[str],
 ) -> tuple[str, Path, int | None, int | None]:
     canonical_symbol = minute_path.stem
     output_path = output_root / f"{canonical_symbol}.parquet"
@@ -460,9 +556,11 @@ def process_symbol_dir(
     quotes = normalize_quote_frame(symbol_dir)
     orders = normalize_order_frame(symbol_dir)
     trades = normalize_trade_frame(symbol_dir)
-    factors = build_stock_orderbook_factor_frame(quotes, orders, trades)
+    factors = build_stock_orderbook_factor_frame(
+        quotes, orders, trades, window_profile=window_profile
+    )
     minute_df = load_minute_frame(minute_path.parent, canonical_symbol, date_dir_name)
-    result = build_output_frame(minute_df, factors)
+    result = build_output_frame(minute_df, factors, factor_columns)
     result = merge_symbol_output(output_path, result, overwrite)
 
     output_root.mkdir(parents=True, exist_ok=True)
@@ -476,6 +574,19 @@ def main() -> int:
     date_dirs = discover_trade_date_dirs(args.input_root)
     stock_minutes = build_minute_file_index(args.stock_minute_root)
     etf_minutes = build_minute_file_index(args.etf_minute_root)
+    stock_output_root = resolve_output_root(
+        args.stock_output_root,
+        args.window_profile,
+        DEFAULT_STOCK_OUTPUT_ROOT,
+        DEFAULT_STOCK_MULTIWINDOW_OUTPUT_ROOT,
+    )
+    etf_output_root = resolve_output_root(
+        args.etf_output_root,
+        args.window_profile,
+        DEFAULT_ETF_OUTPUT_ROOT,
+        DEFAULT_ETF_MULTIWINDOW_OUTPUT_ROOT,
+    )
+    factor_columns = factor_columns_for_profile(args.window_profile)
     failures: list[tuple[Path, str]] = []
     worker_count = max(1, args.workers)
     processed_tasks = 0
@@ -487,10 +598,10 @@ def main() -> int:
             code = numeric_code(symbol_dir.name)
             if code in stock_minutes:
                 tasks.append(
-                    (symbol_dir, stock_minutes[code], args.stock_output_root)
+                    (symbol_dir, stock_minutes[code], stock_output_root)
                 )
             elif code in etf_minutes:
-                tasks.append((symbol_dir, etf_minutes[code], args.etf_output_root))
+                tasks.append((symbol_dir, etf_minutes[code], etf_output_root))
             else:
                 skipped_without_minute += 1
 
@@ -512,6 +623,8 @@ def main() -> int:
                     output_root,
                     date_dir.name,
                     args.overwrite,
+                    args.window_profile,
+                    factor_columns,
                 ): symbol_dir
                 for symbol_dir, minute_path, output_root in tasks
             }

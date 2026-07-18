@@ -5,7 +5,8 @@ from __future__ import annotations
 This module is intentionally scoped to the stock snapshot pipeline used by
 ``scripts/generate_stock_orderbook_factors.py``:
 - quotes are the master snapshot index
-- order/trade events are summarized on 60s windows
+- base order/trade events are summarized on 60s windows
+- multi-window output adds causal 10s, 30s, and 300s summaries
 - event features are aligned back to snapshots with ``merge_asof``
 
 It is kept separate from the legacy single-snapshot ``factor/orderbook.py``
@@ -19,6 +20,11 @@ import pandas as pd
 ORDER_WINDOW = "60s"
 TRADE_WINDOW = "60s"
 OFI_WINDOW = "60s"
+WINDOW_PROFILE_BASE = "base"
+WINDOW_PROFILE_MULTI = "multi"
+FLOW_WINDOWS = ("10s", "30s", "60s", "300s")
+IMPACT_WINDOWS = ("30s", "60s", "300s")
+RESILIENCE_WINDOWS = ("10s", "30s", "60s", "300s")
 MLOFI_EVENT_WINDOW = 50
 MLOFI_IMPACT_WINDOW = 100
 MLOFI_IMPACT_MIN_HISTORY = 30
@@ -175,18 +181,19 @@ def _normalize_ofi_events(
     events: np.ndarray,
     depth_scale: np.ndarray,
     index: pd.DatetimeIndex,
+    window: str = OFI_WINDOW,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Normalize instantaneous and 60-second OFI without crossing trading days."""
+    """Normalize instantaneous and rolling OFI without crossing sessions."""
     instantaneous = _safe_divide(events, depth_scale)
     rolling = np.full(len(events), np.nan, dtype=float)
-    day_labels = index.normalize()
+    session_labels = _trading_session_labels(index)
 
-    for day in pd.unique(day_labels):
-        positions = np.flatnonzero(day_labels == day)
+    for session in pd.unique(session_labels):
+        positions = np.flatnonzero(session_labels == session)
         event_series = pd.Series(events[positions], index=index[positions])
         depth_series = pd.Series(depth_scale[positions], index=index[positions])
-        rolling_event = event_series.rolling(OFI_WINDOW, min_periods=1).sum()
-        rolling_depth = depth_series.rolling(OFI_WINDOW, min_periods=1).mean()
+        rolling_event = event_series.rolling(window, min_periods=1).sum()
+        rolling_depth = depth_series.rolling(window, min_periods=1).mean()
         rolling[positions] = _safe_divide(
             rolling_event.to_numpy(dtype=float), rolling_depth.to_numpy(dtype=float)
         )
@@ -200,23 +207,29 @@ def _calculate_normalized_ofi(
     ask_prices: np.ndarray,
     ask_qty: np.ndarray,
     index: pd.DatetimeIndex,
+    window: str = OFI_WINDOW,
+    reset_sessions: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Return L1 and near-touch L5 OFI, each instantaneously and over 60 seconds."""
+    """Return L1 and near-touch L5 OFI, instantaneously and over one window."""
     bid_events = _quote_depth_event(bid_prices, bid_qty, side="bid")
     ask_events = _quote_depth_event(ask_prices, ask_qty, side="ask")
-    day_starts = np.zeros(len(index), dtype=bool)
+    reset_starts = np.zeros(len(index), dtype=bool)
     if len(index):
-        day_starts[0] = True
-        day_starts[1:] = index.normalize()[1:] != index.normalize()[:-1]
-    bid_events[day_starts] = np.nan
-    ask_events[day_starts] = np.nan
+        reset_starts[0] = True
+        if reset_sessions:
+            session_labels = _trading_session_labels(index)
+            reset_starts[1:] = session_labels[1:] != session_labels[:-1]
+        else:
+            reset_starts[1:] = index.normalize()[1:] != index.normalize()[:-1]
+    bid_events[reset_starts] = np.nan
+    ask_events[reset_starts] = np.nan
 
     l1_events = bid_events[:, 0] + ask_events[:, 0]
     l1_depth = bid_qty[:, 0] + ask_qty[:, 0]
     l1_depth_scale = (np.concatenate(([np.nan], l1_depth[:-1])) + l1_depth) / 2.0
-    l1_depth_scale[day_starts] = np.nan
+    l1_depth_scale[reset_starts] = np.nan
     l1_instantaneous, l1_rolling = _normalize_ofi_events(
-        l1_events, l1_depth_scale, index
+        l1_events, l1_depth_scale, index, window
     )
 
     level_weights = 1.0 / np.arange(1, NEAR_TOUCH_LEVELS + 1, dtype=float)
@@ -234,11 +247,16 @@ def _calculate_normalized_ofi(
     mlofi_depth_scale = (
         np.concatenate(([np.nan], mlofi_depth[:-1])) + mlofi_depth
     ) / 2.0
-    mlofi_depth_scale[day_starts] = np.nan
+    mlofi_depth_scale[reset_starts] = np.nan
     mlofi_instantaneous, mlofi_rolling = _normalize_ofi_events(
-        mlofi_events, mlofi_depth_scale, index
+        mlofi_events, mlofi_depth_scale, index, window
     )
     return l1_instantaneous, l1_rolling, mlofi_instantaneous, mlofi_rolling
+
+
+def _validate_window_profile(window_profile: str) -> None:
+    if window_profile not in {WINDOW_PROFILE_BASE, WINDOW_PROFILE_MULTI}:
+        raise ValueError(f"Unsupported window profile: {window_profile}")
 
 
 def _trading_session_labels(index: pd.DatetimeIndex) -> np.ndarray:
@@ -537,7 +555,11 @@ def _contextual_lob_surprises(
     return lob_surprise, imbalance_surprise
 
 
-def calculate_snapshot_factors(quotes: pd.DataFrame) -> pd.DataFrame:
+def calculate_snapshot_factors(
+    quotes: pd.DataFrame,
+    window_profile: str = WINDOW_PROFILE_BASE,
+) -> pd.DataFrame:
+    _validate_window_profile(window_profile)
     ask_price_cols = [f"ask_price{i}" for i in range(1, 6)]
     ask_qty_cols = [f"ask_qty{i}" for i in range(1, 6)]
     bid_price_cols = [f"bid_price{i}" for i in range(1, 6)]
@@ -685,6 +707,45 @@ def calculate_snapshot_factors(quotes: pd.DataFrame) -> pd.DataFrame:
     )
     result["book_pressure_wap5"] = _imbalance(bid_notional_l5, ask_notional_l5)
     result["book_slope_diff_l5"] = bid_slope - ask_slope
+
+    if window_profile == WINDOW_PROFILE_MULTI:
+        for window in FLOW_WINDOWS:
+            if window == OFI_WINDOW:
+                continue
+            (
+                _,
+                normalized_ofi,
+                _,
+                normalized_mlofi,
+            ) = _calculate_normalized_ofi(
+                bid_prices,
+                bid_qty,
+                ask_prices,
+                ask_qty,
+                quotes.index,
+                window,
+                reset_sessions=True,
+            )
+            result[f"normalized_ofi_l1_{window}"] = normalized_ofi
+            result[f"normalized_mlofi_l5_{window}"] = normalized_mlofi
+            result[f"ofi_spread_scaled_impact_{window}"] = (
+                normalized_ofi * spread_bps / 2.0
+            )
+
+        for window in RESILIENCE_WINDOWS:
+            if window == "30s":
+                continue
+            bid_resilience = _calculate_book_resilience(
+                bid_depth_l5, quotes.index, window
+            )
+            ask_resilience = _calculate_book_resilience(
+                ask_depth_l5, quotes.index, window
+            )
+            result[f"bid_resilience_{window}"] = bid_resilience
+            result[f"ask_resilience_{window}"] = ask_resilience
+            result[f"resilience_imbalance_{window}"] = (
+                bid_resilience - ask_resilience
+            )
     return result.replace([np.inf, -np.inf], np.nan)
 
 
@@ -698,20 +759,36 @@ def _rolling_event_sums_at_quotes(
         return pd.DataFrame(0.0, index=quote_index, columns=value_columns)
 
     ordered = events.sort_values("event_time", kind="stable")
-    event_times = ordered["event_time"].to_numpy(dtype="datetime64[ns]", copy=False)
-    quote_times = quote_index.to_numpy(dtype="datetime64[ns]", copy=False)
-    window_delta = pd.Timedelta(window).to_timedelta64()
-    starts = np.searchsorted(event_times, quote_times - window_delta, side="right")
-    ends = np.searchsorted(event_times, quote_times, side="right")
     values = ordered[value_columns].to_numpy(dtype=float, copy=False)
-    cumulative = np.vstack(
-        (np.zeros((1, len(value_columns))), np.cumsum(values, axis=0))
-    )
-    return pd.DataFrame(
-        cumulative[ends] - cumulative[starts],
-        index=quote_index,
-        columns=value_columns,
-    )
+    result = np.zeros((len(quote_index), len(value_columns)), dtype=float)
+    event_times = pd.DatetimeIndex(pd.to_datetime(ordered["event_time"]))
+    event_sessions = _trading_session_labels(event_times)
+    quote_sessions = _trading_session_labels(quote_index)
+    window_delta = pd.Timedelta(window).to_timedelta64()
+
+    for session in pd.unique(quote_sessions):
+        quote_positions = np.flatnonzero(quote_sessions == session)
+        event_positions = np.flatnonzero(event_sessions == session)
+        if not len(event_positions):
+            continue
+        session_event_times = event_times[event_positions].to_numpy(
+            dtype="datetime64[ns]", copy=False
+        )
+        session_quote_times = quote_index[quote_positions].to_numpy(
+            dtype="datetime64[ns]", copy=False
+        )
+        starts = np.searchsorted(
+            session_event_times, session_quote_times - window_delta, side="right"
+        )
+        ends = np.searchsorted(session_event_times, session_quote_times, side="right")
+        cumulative = np.vstack(
+            (
+                np.zeros((1, len(value_columns))),
+                np.cumsum(values[event_positions], axis=0),
+            )
+        )
+        result[quote_positions] = cumulative[ends] - cumulative[starts]
+    return pd.DataFrame(result, index=quote_index, columns=value_columns)
 
 
 def _calculate_trade_impact_factors(
@@ -719,26 +796,27 @@ def _calculate_trade_impact_factors(
     quote_index: pd.DatetimeIndex,
     window: str,
 ) -> pd.DataFrame:
-    factor_columns = [
-        "trade_size_distribution_60s",
-        "trade_direction_persistence_60s",
-        "liquidity_shock_60s",
-        "market_impact_60s",
-        "orderflow_significance_60s",
-        "volatility_adj_volume_60s",
-        "price_velocity_60s",
-        "momentum_acceleration_60s",
-        "volume_spike_60s",
-        "volume_clustering_60s",
-        "liquidity_depth_60s",
-        "price_volume_decoupling_60s",
-        "market_efficiency_60s",
-        "liquidity_migration_60s",
-        "order_flow_imbalance_60s",
-        "liquidity_ratio_60s",
-        "volume_weighted_price_60s",
-        "orderbook_pressure_60s",
+    factor_bases = [
+        "trade_size_distribution",
+        "trade_direction_persistence",
+        "liquidity_shock",
+        "market_impact",
+        "orderflow_significance",
+        "volatility_adj_volume",
+        "price_velocity",
+        "momentum_acceleration",
+        "volume_spike",
+        "volume_clustering",
+        "liquidity_depth",
+        "price_volume_decoupling",
+        "market_efficiency",
+        "liquidity_migration",
+        "order_flow_imbalance",
+        "liquidity_ratio",
+        "volume_weighted_price",
+        "orderbook_pressure",
     ]
+    factor_columns = [f"{base}_{window}" for base in factor_bases]
     result_array = np.full((len(quote_index), len(factor_columns)), np.nan, dtype=float)
     if trades.empty:
         return pd.DataFrame(result_array, index=quote_index, columns=factor_columns)
@@ -937,12 +1015,22 @@ def calculate_order_flow_factors(
     orders: pd.DataFrame,
     quote_index: pd.DatetimeIndex,
     window: str = ORDER_WINDOW,
+    window_profile: str = WINDOW_PROFILE_BASE,
 ) -> pd.DataFrame:
-    factor_columns = [
+    _validate_window_profile(window_profile)
+    base_factor_columns = [
         "order_count_imbalance_60s",
         "order_qty_imbalance_60s",
         "order_notional_imbalance_60s",
     ]
+    factor_columns = list(base_factor_columns)
+    if window_profile == WINDOW_PROFILE_MULTI:
+        factor_columns.extend(
+            f"order_{metric}_imbalance_{multi_window}"
+            for multi_window in FLOW_WINDOWS
+            if multi_window != window
+            for metric in ("count", "qty", "notional")
+        )
     if orders.empty:
         return pd.DataFrame(0.0, index=quote_index, columns=factor_columns)
 
@@ -974,7 +1062,25 @@ def calculate_order_flow_factors(
     rolling["order_notional_imbalance_60s"] = _imbalance(
         rolling["buy_notional"], rolling["sell_notional"]
     )
-    return rolling[factor_columns].fillna(0.0)
+    result = rolling[base_factor_columns].fillna(0.0)
+
+    if window_profile == WINDOW_PROFILE_MULTI:
+        for multi_window in FLOW_WINDOWS:
+            if multi_window == window:
+                continue
+            windowed = _rolling_event_sums_at_quotes(
+                order_metrics, quote_index, value_columns, multi_window
+            )
+            result[f"order_count_imbalance_{multi_window}"] = _imbalance(
+                windowed["buy_count"], windowed["sell_count"]
+            )
+            result[f"order_qty_imbalance_{multi_window}"] = _imbalance(
+                windowed["buy_qty"], windowed["sell_qty"]
+            )
+            result[f"order_notional_imbalance_{multi_window}"] = _imbalance(
+                windowed["buy_notional"], windowed["sell_notional"]
+            )
+    return result.fillna(0.0)
 
 
 def calculate_vpin_factor(
@@ -1137,11 +1243,47 @@ def _calculate_adverse_selection_markout(
     return result
 
 
+def _calculate_trade_window_summary(
+    trade_metrics: pd.DataFrame,
+    quotes: pd.DataFrame,
+    window: str,
+) -> pd.DataFrame:
+    """Aggregate simple signed trade flow over one causal event-time window."""
+    rolling = _rolling_event_sums_at_quotes(
+        trade_metrics,
+        quotes.index,
+        ["buy_count", "sell_count", "buy_qty", "sell_qty", "qty", "notional"],
+        window,
+    )
+    suffix = window
+    result = pd.DataFrame(index=quotes.index)
+    result[f"trade_count_imbalance_{suffix}"] = _imbalance(
+        rolling["buy_count"], rolling["sell_count"]
+    )
+    result[f"trade_qty_imbalance_{suffix}"] = _imbalance(
+        rolling["buy_qty"], rolling["sell_qty"]
+    )
+    trade_vwap = _safe_divide(rolling["notional"], rolling["qty"])
+    result[f"trade_vwap_gap_{suffix}"] = _safe_divide(
+        trade_vwap - quotes["mid_price"].to_numpy(dtype=float, copy=False),
+        quotes["mid_price"].to_numpy(dtype=float, copy=False),
+    )
+    result[f"trade_count_imbalance_{suffix}"] = result[
+        f"trade_count_imbalance_{suffix}"
+    ].fillna(0.0)
+    result[f"trade_qty_imbalance_{suffix}"] = result[
+        f"trade_qty_imbalance_{suffix}"
+    ].fillna(0.0)
+    return result
+
+
 def calculate_trade_flow_factors(
     trades: pd.DataFrame,
     quotes: pd.DataFrame,
     window: str = TRADE_WINDOW,
+    window_profile: str = WINDOW_PROFILE_BASE,
 ) -> pd.DataFrame:
+    _validate_window_profile(window_profile)
     factor_columns = [
         "trade_count_imbalance_60s",
         "trade_qty_imbalance_60s",
@@ -1167,11 +1309,47 @@ def calculate_trade_flow_factors(
         "vpin_50bucket",
         "adverse_selection_markout_30s",
     ]
+    multi_summary_columns = [
+        f"trade_{metric}_{multi_window}"
+        for multi_window in FLOW_WINDOWS
+        if multi_window != window
+        for metric in ("count_imbalance", "qty_imbalance", "vwap_gap")
+    ]
+    multi_impact_columns = [
+        f"{base}_{multi_window}"
+        for multi_window in IMPACT_WINDOWS
+        if multi_window != window
+        for base in (
+            "trade_size_distribution",
+            "trade_direction_persistence",
+            "liquidity_shock",
+            "market_impact",
+            "orderflow_significance",
+            "volatility_adj_volume",
+            "price_velocity",
+            "momentum_acceleration",
+            "volume_spike",
+            "volume_clustering",
+            "liquidity_depth",
+            "price_volume_decoupling",
+            "market_efficiency",
+            "liquidity_migration",
+            "order_flow_imbalance",
+            "liquidity_ratio",
+            "volume_weighted_price",
+            "orderbook_pressure",
+        )
+    ]
     if trades.empty:
         empty = pd.DataFrame(0.0, index=quotes.index, columns=factor_columns[:2])
         empty["trade_vwap_gap_60s"] = np.nan
         for column in factor_columns[3:]:
             empty[column] = np.nan
+        if window_profile == WINDOW_PROFILE_MULTI:
+            for column in multi_summary_columns:
+                empty[column] = 0.0 if "imbalance" in column else np.nan
+            for column in multi_impact_columns:
+                empty[column] = np.nan
         return empty
 
     trade_metrics = trades.copy()
@@ -1180,32 +1358,28 @@ def calculate_trade_flow_factors(
     trade_metrics["buy_qty"] = np.where(trade_metrics["side"] == "B", trade_metrics["qty"], 0.0)
     trade_metrics["sell_qty"] = np.where(trade_metrics["side"] == "S", trade_metrics["qty"], 0.0)
 
-    rolling = _rolling_event_sums_at_quotes(
-        trade_metrics,
-        quotes.index,
-        ["buy_count", "sell_count", "buy_qty", "sell_qty", "qty", "notional"],
-        window,
-    )
-    rolling["trade_count_imbalance_60s"] = _imbalance(rolling["buy_count"], rolling["sell_count"])
-    rolling["trade_qty_imbalance_60s"] = _imbalance(rolling["buy_qty"], rolling["sell_qty"])
-    rolling["trade_vwap_60s"] = _safe_divide(rolling["notional"], rolling["qty"])
-
-    result = rolling[
-        ["trade_count_imbalance_60s", "trade_qty_imbalance_60s", "trade_vwap_60s"]
-    ].rename(columns={"trade_vwap_60s": "trade_vwap_gap_60s"})
-    result["trade_count_imbalance_60s"] = result["trade_count_imbalance_60s"].fillna(0.0)
-    result["trade_qty_imbalance_60s"] = result["trade_qty_imbalance_60s"].fillna(0.0)
-    result["trade_vwap_gap_60s"] = _safe_divide(
-        result["trade_vwap_gap_60s"].to_numpy(dtype=float, copy=False)
-        - quotes["mid_price"].to_numpy(dtype=float, copy=False),
-        quotes["mid_price"].to_numpy(dtype=float, copy=False),
-    )
+    result = _calculate_trade_window_summary(trade_metrics, quotes, window)
     advanced = _calculate_trade_impact_factors(trades, quotes.index, window)
     result = pd.concat([result, advanced], axis=1)
     result["vpin_50bucket"] = calculate_vpin_factor(trades, quotes.index)
     result["adverse_selection_markout_30s"] = _calculate_adverse_selection_markout(
         trades, quotes
     )
+    if window_profile == WINDOW_PROFILE_MULTI:
+        for multi_window in FLOW_WINDOWS:
+            if multi_window != window:
+                result = result.join(
+                    _calculate_trade_window_summary(
+                        trade_metrics, quotes, multi_window
+                    )
+                )
+        for multi_window in IMPACT_WINDOWS:
+            if multi_window != window:
+                result = result.join(
+                    _calculate_trade_impact_factors(
+                        trades, quotes.index, multi_window
+                    )
+                )
     result.index = quotes.index
     return result.replace([np.inf, -np.inf], np.nan)
 
@@ -1271,14 +1445,20 @@ def build_stock_orderbook_factor_frame(
     quotes: pd.DataFrame,
     orders: pd.DataFrame,
     trades: pd.DataFrame,
+    window_profile: str = WINDOW_PROFILE_BASE,
 ) -> pd.DataFrame:
-    quote_factors = calculate_snapshot_factors(quotes)
+    _validate_window_profile(window_profile)
+    quote_factors = calculate_snapshot_factors(quotes, window_profile)
     elapsed_seconds = quote_factors.index.to_series().diff(5).dt.total_seconds()
     quote_factors["orderbook_velocity_l5"] = _safe_divide(
         quote_factors["depth_imbalance_l5"].diff(5), elapsed_seconds
     )
     quote_input = quotes.join(quote_factors)
-    order_factors = calculate_order_flow_factors(orders, quote_input.index)
-    trade_factors = calculate_trade_flow_factors(trades, quote_input)
+    order_factors = calculate_order_flow_factors(
+        orders, quote_input.index, window_profile=window_profile
+    )
+    trade_factors = calculate_trade_flow_factors(
+        trades, quote_input, window_profile=window_profile
+    )
     contextual_factors = calculate_contextual_orderflow_factors(quote_factors, trade_factors)
     return pd.concat([quote_factors, order_factors, trade_factors, contextual_factors], axis=1)

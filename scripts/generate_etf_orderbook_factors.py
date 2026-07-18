@@ -24,7 +24,11 @@ if str(PACKAGE_ROOT) not in sys.path:
 
 from factor.stock_orderbook import build_stock_orderbook_factor_frame  # noqa: E402
 from scripts.generate_stock_orderbook_factors import (  # noqa: E402
+    DEFAULT_ETF_MULTIWINDOW_OUTPUT_ROOT,
+    DEFAULT_ETF_OUTPUT_ROOT,
+    WINDOW_PROFILES,
     build_output_frame,
+    factor_columns_for_profile,
     load_minute_frame,
     merge_symbol_output,
     normalize_order_frame,
@@ -37,9 +41,7 @@ LOGGER = logging.getLogger("generate_etf_orderbook_factors")
 
 DEFAULT_TICK_ROOT = Path(r"E:\逐笔数据")
 DEFAULT_MINUTE_ROOT = Path(r"D:\workspace\stockdata\etf-data\etf_1min")
-DEFAULT_OUTPUT_ROOT = Path(
-    r"D:\workspace\stockdata\etf-data\etf_1min_orderbook_factors"
-)
+DEFAULT_OUTPUT_ROOT = DEFAULT_ETF_OUTPUT_ROOT
 SYMBOL_PATTERN = re.compile(r"^(\d{6})(?:\.([A-Z]{2}))?$")
 DATE_PATTERN = re.compile(r"^\d{8}$")
 
@@ -69,8 +71,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-root",
         type=Path,
-        default=DEFAULT_OUTPUT_ROOT,
+        default=None,
         help="Directory where ETF orderbook factor parquet files will be written.",
+    )
+    parser.add_argument(
+        "--window-profile",
+        choices=WINDOW_PROFILES,
+        default="base",
+        help="Factor window profile; base preserves legacy output and multi adds short/long windows.",
     )
     parser.add_argument(
         "--symbols",
@@ -317,6 +325,8 @@ def process_symbol_tasks(
     minute_root: Path,
     output_root: Path,
     overwrite: bool,
+    window_profile: str,
+    factor_columns: list[str],
 ) -> tuple[str, Path, int | None, int | None]:
     output_path = output_root / f"{output_symbol}.parquet"
     existing_dates: set[str] = set()
@@ -335,9 +345,11 @@ def process_symbol_tasks(
         quotes["ts_code"] = output_symbol
         orders = normalize_order_frame(symbol_dir)
         trades = normalize_trade_frame(symbol_dir)
-        factors = build_stock_orderbook_factor_frame(quotes, orders, trades)
+        factors = build_stock_orderbook_factor_frame(
+            quotes, orders, trades, window_profile=window_profile
+        )
         minute_df = load_minute_frame(minute_root, output_symbol, trade_date)
-        daily_frames.append(build_output_frame(minute_df, factors))
+        daily_frames.append(build_output_frame(minute_df, factors, factor_columns))
 
     if not daily_frames:
         return ("skipped", output_path, None, None)
@@ -369,6 +381,12 @@ def log_task_result(
 def main() -> int:
     args = parse_args()
     configure_logging()
+    output_root = args.output_root or (
+        DEFAULT_ETF_MULTIWINDOW_OUTPUT_ROOT
+        if args.window_profile == "multi"
+        else DEFAULT_OUTPUT_ROOT
+    )
+    factor_columns = factor_columns_for_profile(args.window_profile)
 
     date_from = normalize_trade_date_arg(args.date_from)
     date_to = normalize_trade_date_arg(args.date_to)
@@ -430,8 +448,10 @@ def main() -> int:
                     symbol_dirs,
                     output_symbol,
                     args.minute_root,
-                    args.output_root,
+                    output_root,
                     args.overwrite,
+                    args.window_profile,
+                    factor_columns,
                 )
                 written_count += int(status == "written")
                 skipped_count += int(status == "skipped")
@@ -448,8 +468,10 @@ def main() -> int:
                     symbol_dirs,
                     output_symbol,
                     args.minute_root,
-                    args.output_root,
+                    output_root,
                     args.overwrite,
+                    args.window_profile,
+                    factor_columns,
                 ): (output_symbol, symbol_dirs[0])
                 for output_symbol, symbol_dirs in tasks_by_symbol.items()
             }

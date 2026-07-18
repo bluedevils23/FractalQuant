@@ -12,9 +12,11 @@ from scripts.generate_stock_orderbook_factors import (
     build_minute_file_index,
     discover_symbol_dirs,
     discover_trade_date_dirs,
+    factor_columns_for_profile,
     load_minute_frame,
     merge_symbol_output,
     numeric_code,
+    output_columns_for_profile,
 )
 
 
@@ -52,6 +54,24 @@ def test_output_matches_advanced_parquet_layout() -> None:
     assert result["trade_date"].dtype == minute["trade_date"].dtype
     assert result["trade_time"].dtype == minute["trade_time"].dtype
     assert result["mid_price"].tolist() == [10.0, 10.1]
+
+
+def test_multiwindow_output_uses_expanded_schema() -> None:
+    minute = _minute_frame("2026-01-05")
+    factor_columns = factor_columns_for_profile("multi")
+    factors = pd.DataFrame(
+        0.0,
+        index=pd.DatetimeIndex(
+            ["2026-01-05 09:29:59", "2026-01-05 09:30:59"],
+            name="trade_time",
+        ),
+        columns=factor_columns,
+    )
+
+    result = build_output_frame(minute, factors, factor_columns)
+
+    assert result.columns.tolist() == output_columns_for_profile("multi")
+    assert "market_impact_300s" in result.columns
 
 
 def test_incremental_merge_replaces_only_requested_trade_date(tmp_path) -> None:
