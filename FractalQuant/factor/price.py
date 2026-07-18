@@ -131,3 +131,54 @@ class VolumePriceConfirmFactor(VolumeFactor):
             (price_change < 0) & (volume_change < 0)
         )
         return confirm.astype(float)
+
+
+class RollingOBVFactor(VolumeFactor):
+    """Rolling signed-volume change over a fixed number of bars."""
+
+    def __init__(self, window: int = 20):
+        super().__init__('obv_delta', window)
+
+    def calculate(self, df: pd.DataFrame) -> pd.Series:
+        close_change = df['close'].diff()
+        signed_volume = np.sign(close_change) * df['volume']
+        signed_volume = signed_volume.where(
+            close_change.notna() & df['volume'].notna()
+        )
+        return signed_volume.rolling(
+            window=self.window, min_periods=self.window
+        ).sum()
+
+
+class RollingVolumePriceTrendFactor(VolumeFactor):
+    """Rolling sum of volume-price-trend increments."""
+
+    def __init__(self, window: int = 20):
+        super().__init__('volume_price_trend_delta', window)
+
+    def calculate(self, df: pd.DataFrame) -> pd.Series:
+        previous_close = df['close'].shift(1)
+        increment = df['volume'] * (df['close'] - previous_close) / previous_close
+        return increment.rolling(
+            window=self.window, min_periods=self.window
+        ).sum()
+
+
+class VolumePriceConfirmRateFactor(VolumeFactor):
+    """Share of recent bars whose price and volume changes have the same sign."""
+
+    def __init__(self, window: int = 10):
+        super().__init__('volume_price_confirm_rate', window)
+
+    def calculate(self, df: pd.DataFrame) -> pd.Series:
+        price_change = df['close'].pct_change(fill_method=None)
+        volume_change = df['volume'].pct_change(fill_method=None)
+        valid = price_change.notna() & volume_change.notna()
+        confirm = (
+            ((price_change > 0) & (volume_change > 0))
+            | ((price_change < 0) & (volume_change < 0))
+        ).astype(float)
+        confirm = confirm.where(valid)
+        return confirm.rolling(
+            window=self.window, min_periods=self.window
+        ).mean()

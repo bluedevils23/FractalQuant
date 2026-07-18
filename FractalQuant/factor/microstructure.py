@@ -415,9 +415,23 @@ class TradeDirectionPersistenceFactor(BaseFactor):
 class MarketImpactFactor(BaseFactor):
     """市场冲击因子"""
     
-    def __init__(self, window: int = 50, alpha: float = 0.5):
+    def __init__(
+        self,
+        window: int = 50,
+        alpha: float = 0.5,
+        flow_window: int = 5,
+        volatility_window: int = 10,
+    ):
+        if min(window, flow_window, volatility_window) <= 0:
+            raise ValueError("market impact windows must be positive")
+        if window < max(flow_window, volatility_window):
+            raise ValueError(
+                "window must cover both flow_window and volatility_window"
+            )
         super().__init__('market_impact', window)
         self.alpha = alpha
+        self.flow_window = flow_window
+        self.volatility_window = volatility_window
         
     def calculate(self, df: pd.DataFrame) -> pd.Series:
         """计算市场冲击（订单流对价格的影响）"""
@@ -426,8 +440,10 @@ class MarketImpactFactor(BaseFactor):
         
         valid = _valid_close_window(df, self.window)
         order_flow = volume * np.sign(close.diff())
-        flow_sum = order_flow.rolling(5, min_periods=5).sum()
-        price_std = _rolling_std0(close, 10)
+        flow_sum = order_flow.rolling(
+            self.flow_window, min_periods=self.flow_window
+        ).sum()
+        price_std = _rolling_std0(close, self.volatility_window)
         impact = flow_sum / (price_std * 100 + 1e-8)
         impact = impact.where(price_std > 0, 0.0)
         return impact.where(valid)

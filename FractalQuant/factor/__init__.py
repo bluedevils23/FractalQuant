@@ -16,8 +16,11 @@ from .price import (
     PriceRelativeFactor,
     PriceZScoreFactor,
     ReturnsFactor,
+    RollingOBVFactor,
+    RollingVolumePriceTrendFactor,
     VolumeMomentumFactor,
     VolumePriceConfirmFactor,
+    VolumePriceConfirmRateFactor,
     VolumePriceTrendFactor,
 )
 from .fractional import FractionalDiffLogCloseFactor
@@ -119,6 +122,8 @@ __all__ = [
     "RSIFactor",
     "RealizedVolatilityFactor",
     "ReturnsFactor",
+    "RollingOBVFactor",
+    "RollingVolumePriceTrendFactor",
     "build_stock_orderbook_factor_frame",
     "calculate_contextual_orderflow_factors",
     "calculate_order_flow_factors",
@@ -138,6 +143,7 @@ __all__ = [
     "VolumeClusteringFactor",
     "VolumeMomentumFactor",
     "VolumePriceConfirmFactor",
+    "VolumePriceConfirmRateFactor",
     "VolumePriceTrendFactor",
     "VolumeSpikeFactor",
     "VolumeWeightedPriceFactor",

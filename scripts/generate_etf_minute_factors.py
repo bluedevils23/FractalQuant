@@ -4,7 +4,10 @@ import argparse
 import logging
 import os
 import sys
+from collections import Counter
+from collections.abc import Callable
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -25,8 +28,11 @@ from factor.price import (  # noqa: E402
     PriceRelativeFactor,
     PriceZScoreFactor,
     ReturnsFactor,
+    RollingOBVFactor,
+    RollingVolumePriceTrendFactor,
     VolumeMomentumFactor,
     VolumePriceConfirmFactor,
+    VolumePriceConfirmRateFactor,
     VolumePriceTrendFactor,
 )
 from factor.fractional import FractionalDiffLogCloseFactor  # noqa: E402
@@ -84,12 +90,22 @@ LOGGER = logging.getLogger("generate_etf_minute_factors")
 
 DEFAULT_INPUT_ROOT = Path(r"D:\workspace\stockdata\etf-data\etf_1min")
 DEFAULT_OUTPUT_ROOT = Path(r"D:\workspace\stockdata\etf-data\etf_1min_factors")
+DEFAULT_MULTIWINDOW_OUTPUT_ROOT = Path(
+    r"D:\workspace\stockdata\etf-data\etf_1min_factors_multiwindow"
+)
 POSITIVE_PRICE_COLUMNS = ("open", "high", "low", "close")
 REQUIRED_COLUMNS = ("open", "high", "low", "close", "volume")
+WINDOW_PROFILES = ("base", "multi")
 
 
-def build_factors() -> list[object]:
-    return [
+@dataclass(frozen=True)
+class FactorSpec:
+    output_name: str
+    factor: object
+
+
+def _base_factor_specs() -> list[FactorSpec]:
+    factors = [
         ReturnsFactor(window=5),
         LogReturnsFactor(window=5),
         PriceMomentumFactor(window=20),
@@ -143,9 +159,202 @@ def build_factors() -> list[object]:
         VolumeClusteringFactor(window=50),
         LiquidityMigrationFactor(window=50),
     ]
+    return [FactorSpec(factor.name, factor) for factor in factors]
 
 
-FACTORS = build_factors()
+def _window_variants(
+    output_base: str,
+    windows: tuple[int, ...],
+    factory: Callable[[int], object],
+) -> list[FactorSpec]:
+    return [
+        FactorSpec(f"{output_base}_w{window}", factory(window))
+        for window in windows
+    ]
+
+
+def _multiwindow_factor_specs() -> list[FactorSpec]:
+    specs = _base_factor_specs()
+
+    specs.extend(_window_variants("returns", (3, 10, 20), ReturnsFactor))
+    specs.extend(
+        _window_variants("volume_momentum", (10, 20), VolumeMomentumFactor)
+    )
+
+    for output_name, factor_class in (
+        ("price_momentum", PriceMomentumFactor),
+        ("price_zscore", PriceZScoreFactor),
+        ("price_relative", PriceRelativeFactor),
+        ("moving_average", MovingAverageFactor),
+        ("ema", EMAFactor),
+        ("cci", CCIFactor),
+        ("lsma", LSMAFactor),
+    ):
+        specs.extend(_window_variants(output_name, (10, 40), factor_class))
+
+    for output_name, factor_class in (
+        ("rsi", RSIFactor),
+        ("atr", ATRFactor),
+        ("adx", ADXFactor),
+        ("cmo", CMOFactor),
+        ("williams_r", WilliamsRFactor),
+    ):
+        specs.extend(_window_variants(output_name, (7, 28), factor_class))
+    specs.extend(
+        _window_variants(
+            "stochastic",
+            (7, 28),
+            lambda window: StochasticFactor(window=window, smooth_k=3, smooth_d=3),
+        )
+    )
+
+    specs.extend(_window_variants("roc", (5, 24), ROCFactor))
+    specs.extend(_window_variants("trix", (8, 30), TRIXFactor))
+    specs.extend(
+        [
+            FactorSpec("macd_f6_s13_sig5", MACDFactor(6, 13, 5)),
+            FactorSpec("macd_f24_s52_sig18", MACDFactor(24, 52, 18)),
+            FactorSpec("awesome_oscillator_s3_l10", AOFactor(3, 10)),
+            FactorSpec("awesome_oscillator_s10_l68", AOFactor(10, 68)),
+        ]
+    )
+
+    for output_name, factor_class in (
+        ("historical_volatility", HistoricalVolatilityFactor),
+        ("parkinson_volatility", ParkinsonVolatilityFactor),
+        ("annualized_volatility", AnnualizedVolatilityFactor),
+        ("realized_volatility", RealizedVolatilityFactor),
+        ("garman_klass_volatility", GarmanKlassVolatilityFactor),
+        ("bollinger_band_width", BollingerBandWidthFactor),
+    ):
+        specs.extend(_window_variants(output_name, (10, 40), factor_class))
+    specs.extend(
+        [
+            FactorSpec(
+                "volatility_regime_s3_l10",
+                VolatilityRegimeFactor(short_window=3, long_window=10),
+            ),
+            FactorSpec(
+                "volatility_regime_s10_l40",
+                VolatilityRegimeFactor(short_window=10, long_window=40),
+            ),
+        ]
+    )
+    specs.extend(
+        _window_variants("volatility_skew", (40, 60), VolatilitySkewFactor)
+    )
+    specs.extend(
+        _window_variants(
+            "volatility_kurtosis", (40, 60), VolatilityKurtosisFactor
+        )
+    )
+
+    for window in (5, 20, 50):
+        specs.extend(
+            [
+                FactorSpec(f"obv_delta_w{window}", RollingOBVFactor(window)),
+                FactorSpec(
+                    f"volume_price_trend_delta_w{window}",
+                    RollingVolumePriceTrendFactor(window),
+                ),
+            ]
+        )
+    for window in (5, 10, 20):
+        specs.append(
+            FactorSpec(
+                f"volume_price_confirm_rate_w{window}",
+                VolumePriceConfirmRateFactor(window),
+            )
+        )
+
+    direct_microstructure = (
+        ("volume_weighted_price", VolumeWeightedPriceFactor),
+        ("volatility_adj_volume", VolatilityAdjustedVolumeFactor),
+        ("price_velocity", PriceVelocityFactor),
+        ("momentum_acceleration", MomentumAccelerationFactor),
+        ("order_flow_imbalance", OrderFlowImbalanceFactor),
+        ("liquidity_shock", LiquidityShockFactor),
+        ("orderbook_asymmetry", OrderBookAsymmetryFactor),
+        ("trade_direction_persistence", TradeDirectionPersistenceFactor),
+    )
+    for output_name, factor_class in direct_microstructure:
+        specs.extend(_window_variants(output_name, (10, 20), factor_class))
+    specs.extend(
+        _window_variants(
+            "volume_spike",
+            (10, 20),
+            lambda window: VolumeSpikeFactor(window=window, threshold=2.0),
+        )
+    )
+    specs.extend(
+        _window_variants(
+            "orderbook_pressure",
+            (10, 20),
+            lambda window: OrderBookPressureFactor(window=window, levels=5),
+        )
+    )
+
+    stable_microstructure = (
+        ("liquidity_ratio", LiquidityRatioFactor),
+        ("trade_size_distribution", TradeSizeDistributionFactor),
+        ("liquidity_depth", LiquidityDepthFactor),
+        ("orderflow_significance", OrderFlowSignificanceFactor),
+        ("volume_clustering", VolumeClusteringFactor),
+        ("price_volume_decoupling", PriceVolumeDecouplingFactor),
+        ("market_efficiency", MarketEfficiencyFactor),
+        ("liquidity_migration", LiquidityMigrationFactor),
+    )
+    for output_name, factor_class in stable_microstructure:
+        specs.extend(_window_variants(output_name, (30, 80), factor_class))
+
+    specs.extend(
+        [
+            FactorSpec(
+                "market_impact_w10",
+                MarketImpactFactor(
+                    window=10, flow_window=5, volatility_window=10
+                ),
+            ),
+            FactorSpec(
+                "market_impact_w20",
+                MarketImpactFactor(
+                    window=20, flow_window=10, volatility_window=20
+                ),
+            ),
+        ]
+    )
+    return specs
+
+
+def _validate_factor_specs(specs: list[FactorSpec]) -> None:
+    names = [spec.output_name for spec in specs]
+    duplicates = sorted(
+        name for name, count in Counter(names).items() if count > 1
+    )
+    if duplicates:
+        raise ValueError(f"Duplicate factor output names: {duplicates}")
+
+
+def build_factor_specs(window_profile: str = "base") -> list[FactorSpec]:
+    if window_profile == "base":
+        specs = _base_factor_specs()
+    elif window_profile == "multi":
+        specs = _multiwindow_factor_specs()
+    else:
+        raise ValueError(f"Unsupported window profile: {window_profile}")
+    _validate_factor_specs(specs)
+    return specs
+
+
+def build_factors(window_profile: str = "base") -> list[object]:
+    """Return factor objects for backward-compatible registry inspection."""
+    return [spec.factor for spec in build_factor_specs(window_profile)]
+
+
+FACTOR_SPECS_BY_PROFILE = {
+    profile: tuple(build_factor_specs(profile)) for profile in WINDOW_PROFILES
+}
+FACTORS = [spec.factor for spec in FACTOR_SPECS_BY_PROFILE["base"]]
 
 
 def parse_args() -> argparse.Namespace:
@@ -161,8 +370,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-root",
         type=Path,
-        default=DEFAULT_OUTPUT_ROOT,
-        help="Directory where factor parquet files will be written.",
+        default=None,
+        help="Output directory. Defaults depend on --window-profile.",
+    )
+    parser.add_argument(
+        "--window-profile",
+        choices=WINDOW_PROFILES,
+        default="base",
+        help="Use the compatible base factors or the expanded multi-window set.",
     )
     parser.add_argument(
         "--symbols",
@@ -195,6 +410,16 @@ def configure_logging() -> None:
         level=logging.INFO,
         format="%(asctime)s - %(levelname)s - %(message)s",
     )
+
+
+def resolve_output_root(
+    output_root: Path | None, window_profile: str
+) -> Path:
+    if output_root is not None:
+        return output_root
+    if window_profile == "multi":
+        return DEFAULT_MULTIWINDOW_OUTPUT_ROOT
+    return DEFAULT_OUTPUT_ROOT
 
 
 def discover_input_files(input_root: Path, symbols: list[str] | None) -> list[Path]:
@@ -261,9 +486,11 @@ def prepare_factor_input(df: pd.DataFrame) -> pd.DataFrame:
     return factor_input
 
 
-def calculate_factor_frame(df: pd.DataFrame) -> pd.DataFrame:
+def calculate_factor_frame(
+    df: pd.DataFrame, window_profile: str = "base"
+) -> pd.DataFrame:
     factor_input = prepare_factor_input(df)
-    factors = FACTORS
+    factor_specs = FACTOR_SPECS_BY_PROFILE[window_profile]
 
     # 按交易日分组分别计算滚动窗口因子，避免隔夜跨日污染：
     # 每个交易日开头会有窗口预热期（前若干根 bar 为 NaN），这是预期行为。
@@ -271,13 +498,15 @@ def calculate_factor_frame(df: pd.DataFrame) -> pd.DataFrame:
     trade_day_values = trade_days.to_numpy(dtype="datetime64[ns]", copy=False)
 
     if len(trade_day_values) <= 1:
-        factor_df = _calculate_factors_for_group(factor_input, factors)
+        factor_df = _calculate_factors_for_group(factor_input, factor_specs)
     else:
         split_points = np.flatnonzero(trade_day_values[1:] != trade_day_values[:-1]) + 1
         starts = np.concatenate(([0], split_points))
         stops = np.concatenate((split_points, [len(factor_input)]))
         per_day_frames = [
-            _calculate_factors_for_group(factor_input.iloc[start:stop], factors)
+            _calculate_factors_for_group(
+                factor_input.iloc[start:stop], factor_specs
+            )
             for start, stop in zip(starts, stops)
         ]
         factor_df = pd.concat(per_day_frames, axis=0)
@@ -286,11 +515,12 @@ def calculate_factor_frame(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _calculate_factors_for_group(
-    factor_input: pd.DataFrame, factors: list[object]
+    factor_input: pd.DataFrame, factor_specs: tuple[FactorSpec, ...]
 ) -> pd.DataFrame:
     factor_series: dict[str, pd.Series] = {}
 
-    for factor in factors:
+    for spec in factor_specs:
+        factor = spec.factor
         with np.errstate(divide="ignore", invalid="ignore"):
             series = factor.calculate(factor_input)
 
@@ -303,13 +533,16 @@ def _calculate_factors_for_group(
             cleaned[~np.isfinite(cleaned)] = np.nan
             series = pd.Series(cleaned, index=factor_input.index, copy=False)
 
-        factor_series[factor.name] = series
+        factor_series[spec.output_name] = series
 
     return pd.DataFrame(factor_series, index=factor_input.index)
 
 
 def process_file(
-    input_path: Path, output_root: Path, overwrite: bool
+    input_path: Path,
+    output_root: Path,
+    overwrite: bool,
+    window_profile: str = "base",
 ) -> tuple[str, Path, int | None, int | None]:
     output_path = output_root / input_path.name
     if output_path.exists() and not overwrite:
@@ -317,7 +550,7 @@ def process_file(
 
     raw_df = pd.read_parquet(input_path)
     df = normalize_minute_frame(raw_df)
-    result_df = calculate_factor_frame(df)
+    result_df = calculate_factor_frame(df, window_profile)
 
     output_root.mkdir(parents=True, exist_ok=True)
     result_df.to_parquet(output_path)
@@ -328,6 +561,7 @@ def process_file(
 def main() -> int:
     args = parse_args()
     configure_logging()
+    output_root = resolve_output_root(args.output_root, args.window_profile)
 
     files = discover_input_files(args.input_root, args.symbols)
     if args.limit is not None:
@@ -338,6 +572,11 @@ def main() -> int:
         return 0
 
     LOGGER.info("Processing %s ETF minute parquet files", len(files))
+    LOGGER.info(
+        "Using %s window profile with %s factor columns",
+        args.window_profile,
+        len(FACTOR_SPECS_BY_PROFILE[args.window_profile]),
+    )
 
     failures: list[tuple[Path, str]] = []
     worker_count = max(1, args.workers)
@@ -346,7 +585,10 @@ def main() -> int:
         for input_path in files:
             try:
                 status, output_path, row_count, column_count = process_file(
-                    input_path, args.output_root, args.overwrite
+                    input_path,
+                    output_root,
+                    args.overwrite,
+                    args.window_profile,
                 )
                 if status == "skipped":
                     LOGGER.info("Skipping existing output: %s", output_path)
@@ -365,7 +607,11 @@ def main() -> int:
         with ProcessPoolExecutor(max_workers=worker_count) as executor:
             future_map = {
                 executor.submit(
-                    process_file, input_path, args.output_root, args.overwrite
+                    process_file,
+                    input_path,
+                    output_root,
+                    args.overwrite,
+                    args.window_profile,
                 ): input_path
                 for input_path in files
             }
