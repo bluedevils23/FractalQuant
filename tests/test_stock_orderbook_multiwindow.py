@@ -91,14 +91,21 @@ def test_short_window_excludes_left_boundary_and_lunch_session() -> None:
     assert afternoon["order_qty_imbalance_300s"].iloc[0] == 0.0
 
 
-def test_multiwindow_ofi_resets_at_afternoon_open() -> None:
+def test_ofi_resets_at_afternoon_open_both_profiles() -> None:
+    """Both base and multi profiles must NaN the instantaneous OFI event at the
+    afternoon-session open so that cross-lunch queue comparisons never appear."""
     index = pd.DatetimeIndex(["2026-01-05 11:29:59", "2026-01-05 13:00:00"])
     quotes = _quotes(index)
     quotes.loc[index[1], "bid_qty1"] = 300.0
 
-    factors = calculate_snapshot_factors(quotes, window_profile="multi")
+    base_factors = calculate_snapshot_factors(quotes, window_profile="base")
+    multi_factors = calculate_snapshot_factors(quotes, window_profile="multi")
 
-    assert np.isnan(factors["normalized_ofi_l1_10s"].iloc[1])
+    # Instantaneous OFI must be NaN at the afternoon open in BOTH profiles.
+    assert np.isnan(base_factors["normalized_ofi_l1"].iloc[1])
+    assert np.isnan(base_factors["normalized_mlofi_l5"].iloc[1])
+    # Multi-window rolling columns must also be NaN at the afternoon open.
+    assert np.isnan(multi_factors["normalized_ofi_l1_10s"].iloc[1])
 
 
 def test_low_trade_count_keeps_simple_flow_and_marks_path_factors_missing() -> None:

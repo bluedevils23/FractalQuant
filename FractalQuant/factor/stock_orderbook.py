@@ -208,7 +208,7 @@ def _calculate_normalized_ofi(
     ask_qty: np.ndarray,
     index: pd.DatetimeIndex,
     window: str = OFI_WINDOW,
-    reset_sessions: bool = False,
+    reset_sessions: bool = True,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Return L1 and near-touch L5 OFI, instantaneously and over one window."""
     bid_events = _quote_depth_event(bid_prices, bid_qty, side="bid")
