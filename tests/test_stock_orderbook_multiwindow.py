@@ -64,13 +64,13 @@ def test_multi_profile_has_unique_schema_and_all_expected_columns() -> None:
     )
     columns = factor_columns_for_profile("multi")
 
-    assert len(columns) == 135
+    assert len(columns) == 150
     assert len(columns) == len(set(columns))
     assert set(columns) <= set(frame.columns)
     assert output_columns_for_profile("multi")[-len(columns) :] == columns
 
 
-def test_short_window_excludes_left_boundary_and_lunch_session() -> None:
+def test_short_window_excludes_left_boundary_and_spans_lunch_on_trading_clock() -> None:
     base = pd.Timestamp("2026-01-05 09:30:00")
     quote_index = pd.DatetimeIndex([base + pd.Timedelta(seconds=20)])
     events = _events(
@@ -88,12 +88,11 @@ def test_short_window_excludes_left_boundary_and_lunch_session() -> None:
         morning_event, afternoon_quote, window_profile="multi"
     )
 
-    assert afternoon["order_qty_imbalance_300s"].iloc[0] == 0.0
+    assert afternoon["order_qty_imbalance_300s"].iloc[0] == 1.0
 
 
-def test_ofi_resets_at_afternoon_open_both_profiles() -> None:
-    """Both base and multi profiles must NaN the instantaneous OFI event at the
-    afternoon-session open so that cross-lunch queue comparisons never appear."""
+def test_ofi_spans_lunch_at_afternoon_open_both_profiles() -> None:
+    """Both profiles treat 13:00 as the next point on the continuous trading clock."""
     index = pd.DatetimeIndex(["2026-01-05 11:29:59", "2026-01-05 13:00:00"])
     quotes = _quotes(index)
     quotes.loc[index[1], "bid_qty1"] = 300.0
@@ -101,11 +100,9 @@ def test_ofi_resets_at_afternoon_open_both_profiles() -> None:
     base_factors = calculate_snapshot_factors(quotes, window_profile="base")
     multi_factors = calculate_snapshot_factors(quotes, window_profile="multi")
 
-    # Instantaneous OFI must be NaN at the afternoon open in BOTH profiles.
-    assert np.isnan(base_factors["normalized_ofi_l1"].iloc[1])
-    assert np.isnan(base_factors["normalized_mlofi_l5"].iloc[1])
-    # Multi-window rolling columns must also be NaN at the afternoon open.
-    assert np.isnan(multi_factors["normalized_ofi_l1_10s"].iloc[1])
+    assert np.isfinite(base_factors["normalized_ofi_l1"].iloc[1])
+    assert np.isfinite(base_factors["normalized_mlofi_l5"].iloc[1])
+    assert np.isfinite(multi_factors["normalized_ofi_l1_10s"].iloc[1])
 
 
 def test_low_trade_count_keeps_simple_flow_and_marks_path_factors_missing() -> None:

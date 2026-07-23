@@ -77,7 +77,7 @@ def test_ofi_resets_at_the_start_of_each_trade_day() -> None:
     assert np.isclose(factors["normalized_ofi_l1"].iloc[3], 2.0 / 41.0)
 
 
-def test_event_mlofi_resets_across_lunch_break() -> None:
+def test_event_mlofi_continues_across_lunch_break() -> None:
     morning = pd.date_range("2026-01-05 11:29:00", periods=60, freq="s")
     afternoon = pd.date_range("2026-01-05 13:00:00", periods=60, freq="s")
     index = morning.append(afternoon)
@@ -90,8 +90,8 @@ def test_event_mlofi_resets_across_lunch_break() -> None:
 
     assert factors["mlofi_event_50_l5"].iloc[:50].isna().all()
     assert np.isfinite(factors["mlofi_event_50_l5"].iloc[50])
-    assert factors["mlofi_event_50_l5"].iloc[60:110].isna().all()
-    assert np.isfinite(factors["mlofi_event_50_l5"].iloc[110])
+    assert np.isfinite(factors["mlofi_event_50_l5"].iloc[60])
+    assert np.isfinite(factors["mlofi_event_50_l5"].iloc[-1])
 
 
 def test_deep_mlofi_divergence_detects_hidden_level_change() -> None:

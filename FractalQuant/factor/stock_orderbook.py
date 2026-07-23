@@ -42,6 +42,10 @@ VPIN_TARGET_TRADES_PER_BUCKET = 20
 VPIN_SIZE_EWMA_SPAN = 100
 MARKOUT_HORIZON = "30s"
 MARKOUT_ROLLING_WINDOW = "60s"
+MPC_STAT_WINDOW = "300s"
+PRICE_BAND_HISTORY_WINDOW = "15min"
+PRICE_BAND_MIN_HISTORY = 20
+LUNCH_BREAK = pd.Timedelta(hours=1, minutes=30)
 # Legacy mapping below is only for the stock orderbook CSV pipeline. ETF minute factors live elsewhere.
 # Existing output coverage against legacy factor/orderbook.py:
 # - SpreadFactor -> spread_bps
@@ -84,6 +88,13 @@ MARKOUT_ROLLING_WINDOW = "60s"
 # - contextual_imbalance_surprise_l5
 # - contextual_segment_anomaly_60s
 # - contextual_segment_selected_60s
+# Research-derived L2 additions:
+# - mci_bid_l5 / mci_ask_l5
+# - soir_l5_decay
+# - mpc_{1m,5m}_{mean,max,skew}_5m
+# - cautious_to_aggressive_buy_ratio_60s
+# - trade_notional_quantile_position_60s
+# - price-band trade shares and relative trade sizes
 
 
 def _safe_divide(
@@ -183,15 +194,16 @@ def _normalize_ofi_events(
     index: pd.DatetimeIndex,
     window: str = OFI_WINDOW,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Normalize instantaneous and rolling OFI without crossing sessions."""
+    """Normalize instantaneous and rolling OFI on the continuous trading clock."""
     instantaneous = _safe_divide(events, depth_scale)
     rolling = np.full(len(events), np.nan, dtype=float)
     session_labels = _trading_session_labels(index)
+    trading_index = _trading_time_index(index)
 
     for session in pd.unique(session_labels):
         positions = np.flatnonzero(session_labels == session)
-        event_series = pd.Series(events[positions], index=index[positions])
-        depth_series = pd.Series(depth_scale[positions], index=index[positions])
+        event_series = pd.Series(events[positions], index=trading_index[positions])
+        depth_series = pd.Series(depth_scale[positions], index=trading_index[positions])
         rolling_event = event_series.rolling(window, min_periods=1).sum()
         rolling_depth = depth_series.rolling(window, min_periods=1).mean()
         rolling[positions] = _safe_divide(
@@ -260,9 +272,15 @@ def _validate_window_profile(window_profile: str) -> None:
 
 
 def _trading_session_labels(index: pd.DatetimeIndex) -> np.ndarray:
-    afternoon = (index.hour >= 13).astype(np.int64)
-    normalized_ns = index.normalize().astype("datetime64[ns]").asi8
-    return normalized_ns * 2 + afternoon
+    """Return day labels; afternoon is continuous with the same day's morning."""
+    return index.normalize().astype("datetime64[ns]").asi8
+
+
+def _trading_time_index(index: pd.DatetimeIndex) -> pd.DatetimeIndex:
+    """Compress the non-trading lunch break while preserving original dates."""
+    afternoon = np.asarray(index.hour >= 13, dtype=bool)
+    offsets = pd.to_timedelta(afternoon.astype(np.int64) * LUNCH_BREAK.value, unit="ns")
+    return pd.DatetimeIndex(index - offsets)
 
 
 def _calculate_ofi_level_entropy(
@@ -300,9 +318,10 @@ def _calculate_book_resilience(
 ) -> np.ndarray:
     result = np.full(len(index), np.nan, dtype=float)
     session_labels = _trading_session_labels(index)
+    trading_index = _trading_time_index(index)
     for session in pd.unique(session_labels):
         positions = np.flatnonzero(session_labels == session)
-        series = pd.Series(depth[positions], index=index[positions])
+        series = pd.Series(depth[positions], index=trading_index[positions])
         initial = series.rolling(window, min_periods=2, closed="both").apply(
             lambda values: values[0], raw=True
         )
@@ -339,6 +358,7 @@ def _calculate_mlofi_extensions(
         MLOFI_LEVEL_DECAY, np.arange(NEAR_TOUCH_LEVELS, dtype=float)
     )
     session_labels = _trading_session_labels(index)
+    trading_index = _trading_time_index(index)
 
     for session in pd.unique(session_labels):
         positions = np.flatnonzero(session_labels == session)
@@ -346,8 +366,8 @@ def _calculate_mlofi_extensions(
             continue
         session_events = level_events[positions].copy()
         session_events[0] = np.nan
-        event_frame = pd.DataFrame(session_events, index=index[positions])
-        depth_frame = pd.DataFrame(level_depth[positions], index=index[positions])
+        event_frame = pd.DataFrame(session_events, index=trading_index[positions])
+        depth_frame = pd.DataFrame(level_depth[positions], index=trading_index[positions])
 
         time_event = event_frame.rolling(OFI_WINDOW, min_periods=1).sum()
         time_depth = depth_frame.rolling(OFI_WINDOW, min_periods=1).mean()
@@ -371,9 +391,9 @@ def _calculate_mlofi_extensions(
             deep_average - normalized_time.iloc[:, 0]
         ).to_numpy(dtype=float)
 
-        x = pd.Series(normalized_mlofi_60s[positions], index=index[positions]).shift(1)
+        x = pd.Series(normalized_mlofi_60s[positions], index=trading_index[positions]).shift(1)
         y = (
-            pd.Series(mid_price[positions], index=index[positions])
+            pd.Series(mid_price[positions], index=trading_index[positions])
             .pct_change(fill_method=None)
             .mul(10000.0)
             .shift(1)
@@ -450,6 +470,55 @@ def _coefficient_of_variation(values: np.ndarray) -> np.ndarray:
     return cv
 
 
+def _calculate_mpc_statistics(
+    mid_price: np.ndarray,
+    index: pd.DatetimeIndex,
+) -> pd.DataFrame:
+    """Calculate causal 1/5-minute mid-price-change statistics per session."""
+    columns = [
+        f"mpc_{horizon}_{stat}_5m"
+        for horizon in ("1m", "5m")
+        for stat in ("mean", "max", "skew")
+    ]
+    result = pd.DataFrame(np.nan, index=index, columns=columns)
+    session_labels = _trading_session_labels(index)
+    trading_index = _trading_time_index(index)
+
+    for session in pd.unique(session_labels):
+        positions = np.flatnonzero(session_labels == session)
+        session_index = index[positions]
+        session_trading_index = trading_index[positions]
+        session_mid = mid_price[positions]
+        quote_frame = pd.DataFrame(
+            {"quote_time": session_trading_index, "mid_price": session_mid}
+        )
+
+        for horizon in ("1m", "5m"):
+            # Use a snapshot no later than t-k; no current or future quote enters MPC.
+            target_index = session_trading_index - pd.Timedelta(horizon)
+            reference = pd.merge_asof(
+                pd.DataFrame({"target_time": target_index}),
+                quote_frame,
+                left_on="target_time",
+                right_on="quote_time",
+                direction="backward",
+            )["mid_price"].to_numpy(dtype=float)
+            mpc = _safe_divide(session_mid - reference, reference)
+            mpc_series = pd.Series(mpc, index=session_trading_index)
+            rolling = mpc_series.rolling(MPC_STAT_WINDOW, min_periods=3)
+            result.loc[session_index, f"mpc_{horizon}_mean_5m"] = rolling.mean().to_numpy(
+                dtype=float
+            )
+            result.loc[session_index, f"mpc_{horizon}_max_5m"] = rolling.max().to_numpy(
+                dtype=float
+            )
+            result.loc[session_index, f"mpc_{horizon}_skew_5m"] = rolling.skew().to_numpy(
+                dtype=float
+            )
+
+    return result
+
+
 def _size_distribution_score(values: np.ndarray) -> float:
     n = len(values)
     if n < 3:
@@ -495,9 +564,10 @@ def _causal_rolling_zscore(
     """Standardize against strictly preceding observations, independently per day."""
     result = np.full(len(index), np.nan, dtype=float)
     value_array = np.asarray(values, dtype=float)
+    trading_index = _trading_time_index(index)
     for day in pd.unique(index.normalize()):
         positions = np.flatnonzero(index.normalize() == day)
-        series = pd.Series(value_array[positions], index=index[positions])
+        series = pd.Series(value_array[positions], index=trading_index[positions])
         history = series.shift(1)
         mean = history.rolling(window, min_periods=min_periods).mean()
         std = history.rolling(window, min_periods=min_periods).std(ddof=0)
@@ -594,6 +664,16 @@ def calculate_snapshot_factors(
     weighted_depth_imbalance_l5 = _imbalance(
         weighted_bid_depth_l5, weighted_ask_depth_l5
     )
+    soir_weights = 1.0 - np.arange(NEAR_TOUCH_LEVELS, dtype=float) / NEAR_TOUCH_LEVELS
+    soir_by_level = _safe_divide(
+        bid_qty - ask_qty,
+        bid_qty + ask_qty,
+    )
+    valid_soir = np.isfinite(soir_by_level)
+    soir_weight_sum = np.sum(valid_soir * soir_weights, axis=1)
+    soir_l5_decay = _safe_divide(
+        np.nansum(soir_by_level * soir_weights, axis=1), soir_weight_sum
+    )
     contextual_lob_surprise_l5, contextual_imbalance_surprise_l5 = (
         _contextual_lob_surprises(
             bid_qty, ask_qty, weighted_depth_imbalance_l5, quotes.index
@@ -656,6 +736,7 @@ def calculate_snapshot_factors(
     result["mlofi_deep_divergence_l5"] = mlofi_deep_divergence_l5
     result["mlofi_impact_beta"] = mlofi_impact_beta
     result["weighted_depth_imbalance_l5"] = weighted_depth_imbalance_l5
+    result["soir_l5_decay"] = soir_l5_decay
     result["weighted_depth_pressure_l5"] = np.clip(
         _safe_divide(weighted_depth_imbalance_l5, pressure_denominator), -1.0, 1.0
     )
@@ -707,6 +788,9 @@ def calculate_snapshot_factors(
     )
     result["book_pressure_wap5"] = _imbalance(bid_notional_l5, ask_notional_l5)
     result["book_slope_diff_l5"] = bid_slope - ask_slope
+    result["mci_bid_l5"] = _safe_divide(mid_price - bid_wap5, bid_notional_l5)
+    result["mci_ask_l5"] = _safe_divide(ask_wap5 - mid_price, ask_notional_l5)
+    result = result.join(_calculate_mpc_statistics(mid_price, quotes.index))
 
     if window_profile == WINDOW_PROFILE_MULTI:
         for window in FLOW_WINDOWS:
@@ -764,6 +848,8 @@ def _rolling_event_sums_at_quotes(
     event_times = pd.DatetimeIndex(pd.to_datetime(ordered["event_time"]))
     event_sessions = _trading_session_labels(event_times)
     quote_sessions = _trading_session_labels(quote_index)
+    event_trading_times = _trading_time_index(event_times)
+    quote_trading_times = _trading_time_index(quote_index)
     window_delta = pd.Timedelta(window).to_timedelta64()
 
     for session in pd.unique(quote_sessions):
@@ -771,10 +857,10 @@ def _rolling_event_sums_at_quotes(
         event_positions = np.flatnonzero(event_sessions == session)
         if not len(event_positions):
             continue
-        session_event_times = event_times[event_positions].to_numpy(
+        session_event_times = event_trading_times[event_positions].to_numpy(
             dtype="datetime64[ns]", copy=False
         )
-        session_quote_times = quote_index[quote_positions].to_numpy(
+        session_quote_times = quote_trading_times[quote_positions].to_numpy(
             dtype="datetime64[ns]", copy=False
         )
         starts = np.searchsorted(
@@ -822,8 +908,12 @@ def _calculate_trade_impact_factors(
         return pd.DataFrame(result_array, index=quote_index, columns=factor_columns)
 
     window_delta = pd.Timedelta(window).to_timedelta64()
-    trade_times = trades["event_time"].to_numpy(dtype="datetime64[ns]", copy=False)
-    quote_times = quote_index.to_numpy(dtype="datetime64[ns]", copy=False)
+    trade_times = _trading_time_index(
+        pd.DatetimeIndex(pd.to_datetime(trades["event_time"]))
+    ).to_numpy(dtype="datetime64[ns]", copy=False)
+    quote_times = _trading_time_index(quote_index).to_numpy(
+        dtype="datetime64[ns]", copy=False
+    )
     start_idx = np.searchsorted(trade_times, quote_times - window_delta, side="left")
     end_idx = np.searchsorted(trade_times, quote_times, side="right")
 
@@ -1089,7 +1179,7 @@ def calculate_vpin_factor(
     bucket_volume: float | None = None,
     num_buckets: int = VPIN_NUM_BUCKETS,
 ) -> pd.Series:
-    """Causal VPIN from completed volume buckets, reset each session.
+    """Causal VPIN from completed volume buckets, reset each trade date.
 
     When ``bucket_volume`` is omitted, each new bucket is sized from the causal
     EWMA trade size available when that bucket starts. This avoids a fixed share
@@ -1168,6 +1258,124 @@ def calculate_vpin_factor(
     return result
 
 
+def _calculate_trade_report_factors(
+    trades: pd.DataFrame,
+    quotes: pd.DataFrame,
+    window: str = TRADE_WINDOW,
+) -> pd.DataFrame:
+    """Calculate causal trade-structure factors proposed by the report review."""
+    columns = [
+        "cautious_to_aggressive_buy_ratio_60s",
+        "trade_notional_quantile_position_60s",
+        "price_band_high_trade_count_share_60s",
+        "price_band_low_trade_count_share_60s",
+        "price_band_high_trade_size_rel_60s",
+        "price_band_low_trade_size_rel_60s",
+    ]
+    result = pd.DataFrame(np.nan, index=quotes.index, columns=columns)
+    if trades.empty:
+        return result
+
+    trade_frame = trades.sort_values("event_time", kind="stable").copy()
+    trade_times = pd.DatetimeIndex(pd.to_datetime(trade_frame["event_time"]))
+    trading_times = _trading_time_index(trade_times)
+    prices = trade_frame["price"].to_numpy(dtype=float, copy=False)
+    quantities = trade_frame["qty"].to_numpy(dtype=float, copy=False)
+    notionals = trade_frame["notional"].to_numpy(dtype=float, copy=False)
+    trade_sessions = _trading_session_labels(trade_times)
+    aggressive_buy_qty = np.zeros(len(trade_frame), dtype=float)
+    cautious_buy_qty = np.zeros(len(trade_frame), dtype=float)
+    if {"ask_price1", "bid_price1"} <= set(quotes.columns):
+        quote_reference = pd.DataFrame(
+            {
+                "quote_time": quotes.index,
+                "previous_ask1": quotes["ask_price1"].to_numpy(
+                    dtype=float, copy=False
+                ),
+                "previous_bid1": quotes["bid_price1"].to_numpy(
+                    dtype=float, copy=False
+                ),
+                "quote_session": _trading_session_labels(quotes.index),
+            }
+        )
+        matched_quotes = pd.merge_asof(
+            trade_frame[["event_time"]],
+            quote_reference,
+            left_on="event_time",
+            right_on="quote_time",
+            direction="backward",
+            allow_exact_matches=False,
+        )
+        same_session = matched_quotes["quote_session"].to_numpy() == trade_sessions
+        prior_ask = matched_quotes["previous_ask1"].to_numpy(dtype=float)
+        prior_bid = matched_quotes["previous_bid1"].to_numpy(dtype=float)
+        aggressive_buy_qty = np.where(
+            same_session & np.isfinite(prior_ask) & (prices >= prior_ask), quantities, 0.0
+        )
+        cautious_buy_qty = np.where(
+            same_session & np.isfinite(prior_bid) & (prices <= prior_bid), quantities, 0.0
+        )
+
+    low_band = np.full(len(trade_frame), np.nan, dtype=float)
+    high_band = np.full(len(trade_frame), np.nan, dtype=float)
+    for session in pd.unique(trade_sessions):
+        positions = np.flatnonzero(trade_sessions == session)
+        session_prices = pd.Series(prices[positions], index=trading_times[positions])
+        history = session_prices.rolling(
+            PRICE_BAND_HISTORY_WINDOW,
+            min_periods=PRICE_BAND_MIN_HISTORY,
+            closed="left",
+        )
+        low_band[positions] = history.quantile(0.2).to_numpy(dtype=float)
+        high_band[positions] = history.quantile(0.8).to_numpy(dtype=float)
+
+    window_delta = pd.Timedelta(window).to_timedelta64()
+    quote_times = _trading_time_index(quotes.index).to_numpy(
+        dtype="datetime64[ns]", copy=False
+    )
+    trade_times_array = trading_times.to_numpy(dtype="datetime64[ns]", copy=False)
+    start_idx = np.searchsorted(trade_times_array, quote_times - window_delta, side="left")
+    end_idx = np.searchsorted(trade_times_array, quote_times, side="right")
+
+    for idx, (start, end) in enumerate(zip(start_idx, end_idx, strict=False)):
+        if start == end:
+            continue
+        window_notional = notionals[start:end]
+        aggressive = aggressive_buy_qty[start:end].sum()
+        cautious = cautious_buy_qty[start:end].sum()
+        if aggressive > 0:
+            result.iloc[idx, 0] = cautious / aggressive
+
+        if end - start > 10:
+            trimmed_notional = np.sort(window_notional)[:-10]
+            lower = trimmed_notional.min()
+            upper = trimmed_notional.max()
+            if upper > lower:
+                result.iloc[idx, 1] = (np.quantile(trimmed_notional, 0.1) - lower) / (
+                    upper - lower
+                )
+
+        window_low = low_band[start:end]
+        window_high = high_band[start:end]
+        valid_bands = np.isfinite(window_low) & np.isfinite(window_high)
+        if not np.any(valid_bands):
+            continue
+        window_prices = prices[start:end]
+        window_qty = quantities[start:end]
+        high_mask = valid_bands & (window_prices >= window_high)
+        low_mask = valid_bands & (window_prices <= window_low)
+        valid_count = valid_bands.sum()
+        result.iloc[idx, 2] = high_mask.sum() / valid_count
+        result.iloc[idx, 3] = low_mask.sum() / valid_count
+        baseline_size = window_qty[valid_bands].mean()
+        if baseline_size > 0 and np.any(high_mask):
+            result.iloc[idx, 4] = window_qty[high_mask].mean() / baseline_size
+        if baseline_size > 0 and np.any(low_mask):
+            result.iloc[idx, 5] = window_qty[low_mask].mean() / baseline_size
+
+    return result
+
+
 def _calculate_adverse_selection_markout(
     trades: pd.DataFrame,
     quotes: pd.DataFrame,
@@ -1184,8 +1392,10 @@ def _calculate_adverse_selection_markout(
     horizon_delta = pd.Timedelta(horizon)
     rolling_delta = pd.Timedelta(rolling_window)
     trade_times = pd.DatetimeIndex(pd.to_datetime(trades["event_time"]))
+    trading_trade_times = _trading_time_index(trade_times)
     trade_sessions = _trading_session_labels(trade_times)
     quote_sessions = _trading_session_labels(quotes.index)
+    trading_quote_times = _trading_time_index(quotes.index)
     directions = np.where(trades["side"].to_numpy(dtype=str) == "B", 1.0, -1.0)
     mid = quotes["mid_price"].to_numpy(dtype=float, copy=False)
 
@@ -1194,8 +1404,8 @@ def _calculate_adverse_selection_markout(
         quote_positions = np.flatnonzero(quote_sessions == session)
         if not len(quote_positions):
             continue
-        session_quote_times = quotes.index[quote_positions]
-        session_trade_times = trade_times[trade_positions]
+        session_quote_times = trading_quote_times[quote_positions]
+        session_trade_times = trading_trade_times[trade_positions]
         initial_offsets = session_quote_times.searchsorted(session_trade_times, side="right") - 1
         mature_offsets = session_quote_times.searchsorted(
             session_trade_times + horizon_delta, side="left"
@@ -1308,6 +1518,12 @@ def calculate_trade_flow_factors(
         "orderbook_pressure_60s",
         "vpin_50bucket",
         "adverse_selection_markout_30s",
+        "cautious_to_aggressive_buy_ratio_60s",
+        "trade_notional_quantile_position_60s",
+        "price_band_high_trade_count_share_60s",
+        "price_band_low_trade_count_share_60s",
+        "price_band_high_trade_size_rel_60s",
+        "price_band_low_trade_size_rel_60s",
     ]
     multi_summary_columns = [
         f"trade_{metric}_{multi_window}"
@@ -1365,6 +1581,7 @@ def calculate_trade_flow_factors(
     result["adverse_selection_markout_30s"] = _calculate_adverse_selection_markout(
         trades, quotes
     )
+    result = pd.concat([result, _calculate_trade_report_factors(trades, quotes)], axis=1)
     if window_profile == WINDOW_PROFILE_MULTI:
         for multi_window in FLOW_WINDOWS:
             if multi_window != window:
@@ -1415,9 +1632,10 @@ def calculate_contextual_orderflow_factors(
 
     threshold = np.full(len(index), np.nan, dtype=float)
     day_labels = index.normalize()
+    trading_index = _trading_time_index(index)
     for day in pd.unique(day_labels):
         positions = np.flatnonzero(day_labels == day)
-        history = pd.Series(score[positions], index=index[positions]).shift(1)
+        history = pd.Series(score[positions], index=trading_index[positions]).shift(1)
         threshold[positions] = history.rolling(
             CONTEXT_SELECTION_WINDOW,
             min_periods=CONTEXT_SELECTION_MIN_PERIODS,
@@ -1449,7 +1667,7 @@ def build_stock_orderbook_factor_frame(
 ) -> pd.DataFrame:
     _validate_window_profile(window_profile)
     quote_factors = calculate_snapshot_factors(quotes, window_profile)
-    elapsed_seconds = quote_factors.index.to_series().diff(5).dt.total_seconds()
+    elapsed_seconds = _trading_time_index(quote_factors.index).to_series().diff(5).dt.total_seconds()
     quote_factors["orderbook_velocity_l5"] = _safe_divide(
         quote_factors["depth_imbalance_l5"].diff(5), elapsed_seconds
     )

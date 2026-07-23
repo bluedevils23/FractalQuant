@@ -34,7 +34,7 @@ LOGGER = logging.getLogger("generate_stock_orderbook_factors")
 
 # Raw tick root organized as YYYY/YYYYMM/YYYYMMDD/symbol.
 DEFAULT_INPUT_ROOT = Path(r"E:\逐笔数据")
-DEFAULT_STOCK_MINUTE_ROOT = Path(r"D:\workspace\stockdata\a-share-data\stock_1min")
+DEFAULT_STOCK_MINUTE_ROOT = Path(r"D:\workspace\stockdata\a-share-data\行情数据\stock_1min")
 DEFAULT_ETF_MINUTE_ROOT = Path(r"D:\workspace\stockdata\etf-data\etf_1min")
 DEFAULT_STOCK_OUTPUT_ROOT = Path(
     r"D:\workspace\stockdata\a-share-data\stock_1min_orderbook_factors"
@@ -93,6 +93,7 @@ BASE_FACTOR_COLUMNS = [
     "mlofi_impact_beta",
     "weighted_depth_imbalance_l5",
     "weighted_depth_pressure_l5",
+    "soir_l5_decay",
     "weighted_imbalance_velocity_l5",
     "contextual_lob_surprise_l5",
     "contextual_imbalance_surprise_l5",
@@ -109,6 +110,14 @@ BASE_FACTOR_COLUMNS = [
     "orderbook_liquidity_l5",
     "book_pressure_wap5",
     "book_slope_diff_l5",
+    "mci_bid_l5",
+    "mci_ask_l5",
+    "mpc_1m_mean_5m",
+    "mpc_1m_max_5m",
+    "mpc_1m_skew_5m",
+    "mpc_5m_mean_5m",
+    "mpc_5m_max_5m",
+    "mpc_5m_skew_5m",
     "orderbook_velocity_l5",
     # 60s order-flow factors aligned backward to snapshots.
     "order_count_imbalance_60s",
@@ -138,6 +147,12 @@ BASE_FACTOR_COLUMNS = [
     "orderbook_pressure_60s",
     "vpin_50bucket",
     "adverse_selection_markout_30s",
+    "cautious_to_aggressive_buy_ratio_60s",
+    "trade_notional_quantile_position_60s",
+    "price_band_high_trade_count_share_60s",
+    "price_band_low_trade_count_share_60s",
+    "price_band_high_trade_size_rel_60s",
+    "price_band_low_trade_size_rel_60s",
     # Causal contextual anomaly-segment factors.
     "contextual_flow_surprise_60s",
     "contextual_segment_anomaly_60s",

@@ -37,7 +37,7 @@ def test_ofi_level_entropy_distinguishes_concentrated_and_distributed_events() -
     assert np.isclose(entropy.iloc[2], 1.0)
 
 
-def test_vpin_uses_completed_equal_volume_buckets_and_resets_by_session() -> None:
+def test_vpin_uses_completed_equal_volume_buckets_across_lunch() -> None:
     quote_index = pd.DatetimeIndex(
         ["2026-01-05 09:30:03", "2026-01-05 13:00:03"]
     )
@@ -58,10 +58,10 @@ def test_vpin_uses_completed_equal_volume_buckets_and_resets_by_session() -> Non
         }
     )
 
-    vpin = calculate_vpin_factor(trades, quote_index, bucket_volume=10.0, num_buckets=1)
+    vpin = calculate_vpin_factor(trades, quote_index, bucket_volume=10.0, num_buckets=2)
 
-    assert np.isclose(vpin.iloc[0], 1.0)
-    assert np.isclose(vpin.iloc[1], 0.0)
+    assert np.isnan(vpin.iloc[0])
+    assert np.isclose(vpin.iloc[1], 0.5)
 
 
 def test_adaptive_vpin_is_invariant_to_trade_quantity_scale() -> None:
@@ -144,6 +144,27 @@ def test_markout_is_emitted_only_after_thirty_seconds() -> None:
     assert factors["adverse_selection_markout_30s"].iloc[:3].isna().all()
     assert factors["adverse_selection_markout_30s"].iloc[3] > 0.0
     assert np.isnan(factors["adverse_selection_markout_30s"].iloc[-1])
+
+
+def test_markout_matures_across_lunch_on_the_trading_clock() -> None:
+    index = pd.DatetimeIndex(["2026-01-05 11:29:50", "2026-01-05 13:00:20"])
+    quotes = _quotes(index)
+    for level in range(1, 6):
+        quotes.loc[index[1], f"ask_price{level}"] += 0.02
+        quotes.loc[index[1], f"bid_price{level}"] += 0.02
+    trades = pd.DataFrame(
+        {
+            "event_time": [index[0]],
+            "side": ["B"],
+            "price": [10.0],
+            "qty": [100.0],
+            "notional": [1000.0],
+        }
+    )
+
+    factors = build_stock_orderbook_factor_frame(quotes, _empty_events(), trades)
+
+    assert factors["adverse_selection_markout_30s"].iloc[1] > 0.0
 
 
 def test_first_batch_columns_are_present_end_to_end() -> None:
