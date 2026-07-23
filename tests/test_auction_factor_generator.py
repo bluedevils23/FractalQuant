@@ -9,7 +9,10 @@ from scripts.generate_auction_factors import (
     EVENT_FACTOR_COLUMNS,
     OUTPUT_COLUMNS,
     apply_historical_ratios,
+    apply_external_context,
     build_asset_universe,
+    build_historical_context,
+    build_session_path_factor_frame,
     calculate_daily_auction_factors,
     group_symbol_paths,
     load_auction_event_frame,
@@ -151,17 +154,27 @@ def test_daily_factor_formulas_and_output_contract() -> None:
     assert row["trade_date"] == "2026-03-31"
     assert row["available_time"] == pd.Timestamp("2026-03-31 09:25:03")
     assert row["auction_has_match"] is True
-    assert row["snapshot_count_stage1"] == 3
+    assert row["snapshot_count_stage1"] == 2
     assert row["snapshot_count_stage2"] == 3
     assert np.isclose(row["auction_overnight_return"], 0.005)
-    assert np.isclose(row["auction_return_stage1"], 10.02 / 10.00 - 1.0)
+    assert np.isclose(row["auction_return_stage1"], 10.01 / 10.00 - 1.0)
     assert np.isclose(row["auction_return_stage2"], 10.06 / 10.02 - 1.0)
-    assert np.isclose(row["auction_imbalance_change_stage1"], 0.4)
+    assert np.isclose(row["auction_imbalance_change_stage1"], 0.2)
     assert np.isclose(row["auction_imbalance_change_stage2"], 0.2)
-    assert np.isclose(row["auction_commitment_shift"], 0.2)
+    assert np.isclose(row["auction_commitment_shift"], 0.3)
     assert np.isclose(row["auction_stage2_range_bps"], 40.0)
     assert np.isclose(row["auction_stage2_efficiency_ratio"], 1.0)
     assert np.isclose(row["auction_unmatched_imbalance"], 1.0)
+
+    expected_twap = (10.02 * 120 + 10.04 * 179 + 10.06) / 300
+    expected_imbalance_twap = (0.6 * 120 + 0.2 * 179 + 0.8) / 300
+    assert row["auction_stage2_twap_coverage_ratio"] == 1.0
+    assert np.isclose(row["auction_stage2_twap_price"], expected_twap)
+    assert np.isclose(row["auction_final_vs_stage2_twap"], 10.05 / expected_twap - 1)
+    assert np.isclose(
+        row["auction_l3_imbalance_twap_stage2"], expected_imbalance_twap
+    )
+    assert row["auction_relative_spread_twap_stage2"] == 0.0
 
     expected_slope = (
         np.polyfit(
@@ -172,6 +185,31 @@ def test_daily_factor_formulas_and_output_contract() -> None:
         * 10000.0
     )
     assert np.isclose(row["auction_stage2_slope_bps_per_min"], expected_slope)
+
+
+def test_stage2_twap_does_not_carry_values_across_invalid_snapshots() -> None:
+    quotes = _auction_quotes()
+    invalid = quotes["trade_time"].eq(pd.Timestamp("2026-03-31 09:22:00"))
+    quotes.loc[invalid, ["ask_price1", "bid_price1"]] = [9.99, 10.01]
+    quotes.loc[invalid, ["bid_qty1", "ask_qty1", "bid_qty2", "ask_qty2"]] = 0.0
+
+    row = calculate_daily_auction_factors(quotes, "000001.SZ")
+
+    assert np.isclose(row["auction_stage2_twap_coverage_ratio"], 121 / 300)
+    assert np.isnan(row["auction_l3_imbalance_twap_stage2"])
+    assert np.isnan(row["auction_relative_spread_twap_stage2"])
+
+
+def test_quote_at_0925_is_not_part_of_the_auction_path() -> None:
+    quotes = _auction_quotes()
+    after_stage2 = _quote_row("2026-03-31 09:25:00", 99.0, 1, 999)
+    quotes = pd.concat([quotes, pd.DataFrame([after_stage2])], ignore_index=True)
+    quotes = quotes.sort_values("trade_time", kind="mergesort").reset_index(drop=True)
+
+    row = calculate_daily_auction_factors(quotes, "000001.SZ")
+
+    assert row["snapshot_count_stage2"] == 3
+    assert np.isclose(row["auction_final_indicative_price"], 10.06)
 
 
 def test_second_batch_event_factor_formulas_and_boundaries() -> None:
@@ -210,11 +248,11 @@ def test_third_batch_price_path_and_robust_imbalance_formulas() -> None:
     assert np.isclose(row["auction_stage2_total_variation_bps"], 40.0)
     assert row["auction_stage2_up_step_ratio"] == 1.0
     assert row["auction_stage2_reversal_count"] == 0
-    assert np.isclose(row["auction_imbalance_relative_change_stage1"], 2.0)
+    assert np.isclose(row["auction_imbalance_relative_change_stage1"], 1.0)
     assert np.isclose(row["auction_imbalance_relative_change_stage2"], 1 / 3)
     assert np.isclose(
         row["auction_imbalance_fisher_change_stage1"],
-        np.arctanh(0.6) - np.arctanh(0.2),
+        np.arctanh(0.4) - np.arctanh(0.2),
     )
     assert np.isclose(
         row["auction_imbalance_fisher_change_stage2"],
@@ -260,7 +298,7 @@ def test_stage_reversal_is_signed_and_missing_events_do_not_remove_quote_factor(
     ]
     row = calculate_daily_auction_factors(quotes, "000001.SZ")
 
-    stage1_return = 10.02 / 10.00 - 1.0
+    stage1_return = 10.01 / 10.00 - 1.0
     stage2_return = 9.98 / 10.02 - 1.0
     expected = -min(abs(stage1_return), abs(stage2_return)) * 10000
     assert row["auction_event_reconstruction_ok"] is False
@@ -333,7 +371,7 @@ def test_no_match_keeps_causal_path_factors_and_match_fields_missing() -> None:
     )
 
     assert row["auction_has_match"] is False
-    assert row["available_time"] == pd.Timestamp("2026-03-31 09:24:59")
+    assert row["available_time"] == pd.Timestamp("2026-03-31 09:25:00")
     assert np.isnan(row["auction_open_price"])
     assert np.isnan(row["auction_overnight_return"])
     assert np.isfinite(row["auction_return_stage1"])
@@ -371,7 +409,7 @@ def test_zero_initial_imbalance_uses_relative_floor_without_infinity() -> None:
     quotes.loc[0, ["bid_qty1", "ask_qty1"]] = [500.0, 500.0]
     row = calculate_daily_auction_factors(quotes, "000001.SZ")
 
-    assert np.isclose(row["auction_imbalance_relative_change_stage1"], 12.0)
+    assert np.isclose(row["auction_imbalance_relative_change_stage1"], 8.0)
     assert np.isfinite(row["auction_imbalance_fisher_change_stage1"])
 
 
@@ -438,6 +476,14 @@ def test_twenty_day_auction_zscore_and_prior_adv_are_strictly_historical() -> No
     assert np.isclose(
         result.loc[20, "auction_amount_to_prev20d_adv"], 210.0 / expected_adv
     )
+    expected_5d_adv = np.arange(16000.0, 21000.0, 1000.0).mean()
+    assert np.isclose(
+        result.loc[20, "previous_5d_average_daily_amount"], expected_5d_adv
+    )
+    assert np.isclose(
+        result.loc[20, "auction_amount_to_prev5d_adv_240"],
+        210.0 / (expected_5d_adv / 240.0),
+    )
 
     changed_future = daily_amounts.copy()
     changed_future.iloc[21] = 999_999_999.0
@@ -456,6 +502,18 @@ def test_twenty_day_auction_zscore_and_prior_adv_are_strictly_historical() -> No
         result.loc[20, "auction_amount_zscore_20d"],
         changed_auction.loc[20, "auction_amount_zscore_20d"],
     )
+
+
+def test_prev5d_adv_requires_five_consecutive_valid_observations() -> None:
+    frame = _historical_frame([10.0] * 7)
+    daily_index = pd.date_range("2026-01-01", periods=7, freq="D")
+    daily_amounts = pd.Series([1000, 2000, np.nan, 4000, 5000, 6000, 7000], index=daily_index)
+
+    result = apply_historical_ratios(frame, daily_amount_history=daily_amounts)
+
+    assert np.isnan(result.loc[5, "previous_5d_average_daily_amount"])
+    assert np.isnan(result.loc[5, "auction_amount_to_prev5d_adv_240"])
+    assert np.isnan(result.loc[6, "auction_amount_to_prev5d_adv_240"])
 
 
 def test_daily_amount_history_sums_minute_bars_by_trade_date(tmp_path) -> None:
@@ -481,6 +539,152 @@ def test_daily_amount_history_sums_minute_bars_by_trade_date(tmp_path) -> None:
         pd.Timestamp("2026-01-01"): 300.0,
         pd.Timestamp("2026-01-02"): 400.0,
     }
+
+
+def test_historical_context_uses_prior_day_and_full_universe_ranks(tmp_path) -> None:
+    dates = pd.date_range("2026-01-01", periods=23, freq="D")
+    closes_by_code = {
+        "000001.SZ": 100.0 + np.arange(23),
+        "000002.SZ": 100.0 + np.arange(23) * 2.0,
+        "000003.SZ": np.full(23, 100.0),
+    }
+    rows = []
+    for ts_code, closes in closes_by_code.items():
+        for trade_date, close in zip(dates, closes, strict=True):
+            rows.append(
+                {
+                    "trade_date": trade_date,
+                    "ts_code": ts_code,
+                    "close": close,
+                    "high": close + 10.0,
+                    "low": close - 10.0,
+                    "pre_close": close - 1.0,
+                    "adj_factor": 1.0,
+                }
+            )
+    daily_path = tmp_path / "daily.parquet"
+    pd.DataFrame(rows).set_index(["trade_date", "ts_code"]).to_parquet(daily_path)
+
+    contexts = build_historical_context(
+        daily_path, ["2026-01-23"], {"000001.SZ"}
+    )
+    context = contexts["000001.SZ"].iloc[0]
+
+    assert context["trade_date"] == "2026-01-23"
+    assert np.isclose(
+        context["prevday_intraday_drawdown_from_session_high"], 121 / 131 - 1
+    )
+    assert np.isclose(
+        context["prevday_intraday_rebound_from_session_low"], 121 / 111 - 1
+    )
+    assert np.isclose(
+        context["prevday_intraday_return_from_prev_close"], 121 / 120 - 1
+    )
+    assert np.isclose(context["prev_2d_return_rank_cs"], 2 / 3)
+    assert np.isclose(context["prev_20d_return_rank_cs"], 2 / 3)
+    assert context["_market_above_ma20"] == 1.0
+    assert np.isclose(context["_prev_2d_return"], 121 / 119 - 1)
+
+    suspended_path = tmp_path / "daily_with_suspension.parquet"
+    suspended = pd.DataFrame(rows).loc[
+        lambda frame: ~(
+            frame["ts_code"].eq("000001.SZ")
+            & frame["trade_date"].eq(pd.Timestamp("2026-01-20"))
+        )
+    ]
+    suspended.set_index(["trade_date", "ts_code"]).to_parquet(suspended_path)
+    suspended_context = build_historical_context(
+        suspended_path, ["2026-01-23"], {"000001.SZ"}
+    )["000001.SZ"].iloc[0]
+    assert np.isnan(suspended_context["_prev_2d_return"])
+    assert np.isnan(suspended_context["prev_2d_return_rank_cs"])
+    assert np.isnan(suspended_context["_market_above_ma20"])
+
+
+def test_external_context_applies_benchmark_time_and_excess_returns() -> None:
+    frame = _historical_frame([100.0])
+    frame.loc[0, "auction_overnight_return"] = 0.02
+    frame.loc[0, "auction_return_stage2"] = 0.01
+    frame.loc[0, "available_time"] = pd.Timestamp("2026-01-01 09:25:02")
+    symbol_context = pd.DataFrame(
+        [
+            {
+                "trade_date": "2026-01-01",
+                "prevday_intraday_drawdown_from_session_high": -0.03,
+                "prevday_intraday_rebound_from_session_low": 0.04,
+                "prevday_intraday_return_from_prev_close": 0.01,
+                "prev_2d_return_rank_cs": 0.75,
+                "prev_20d_return_rank_cs": 0.6,
+            }
+        ]
+    )
+    benchmark_context = pd.DataFrame(
+        [
+            {
+                "trade_date": "2026-01-01",
+                "benchmark_ts_code": "510300.SH",
+                "benchmark_available_time": pd.Timestamp("2026-01-01 09:25:03"),
+                "benchmark_auction_has_match": True,
+                "market_return_from_prev_close": 0.005,
+                "_benchmark_auction_return_stage2": 0.004,
+                "market_above_ma20_prevclose": 1.0,
+                "market_momentum_2d_prevclose": 0.02,
+            }
+        ]
+    )
+
+    result = apply_external_context(frame, symbol_context, benchmark_context).iloc[0]
+
+    assert result["available_time"] == pd.Timestamp("2026-01-01 09:25:03")
+    assert result["benchmark_ts_code"] == "510300.SH"
+    assert result["prev_2d_return_rank_cs"] == 0.75
+    assert result["market_above_ma20_prevclose"] == 1.0
+    assert np.isclose(result["auction_gap_excess_benchmark"], 0.015)
+    assert np.isclose(result["auction_stage2_excess_return_benchmark"], 0.006)
+
+
+def test_session_path_companion_is_minute_causal_and_resets_at_lunch(tmp_path) -> None:
+    trade_dates = pd.to_datetime(
+        ["2026-01-01", "2026-01-02", "2026-01-02", "2026-01-02"]
+    )
+    trade_times = pd.to_datetime(
+        [
+            "2026-01-01 14:59",
+            "2026-01-02 09:30",
+            "2026-01-02 09:31",
+            "2026-01-02 13:00",
+        ]
+    )
+    index = pd.MultiIndex.from_arrays(
+        [trade_dates, trade_times], names=["trade_date", "trade_time"]
+    )
+    minute_path = tmp_path / "000001.SZ.parquet"
+    pd.DataFrame(
+        {
+            "high": [10.0, 10.5, 11.0, 10.3],
+            "low": [9.8, 10.0, 10.2, 10.1],
+            "close": [10.0, 10.4, 10.3, 10.2],
+        },
+        index=index,
+    ).to_parquet(minute_path)
+
+    result = build_session_path_factor_frame(
+        minute_path, "000001.SZ", {"2026-01-02"}
+    )
+
+    assert len(result) == 3
+    assert result.loc[0, "available_time"] == pd.Timestamp("2026-01-02 09:31")
+    assert np.isclose(
+        result.loc[1, "intraday_drawdown_from_session_high"], 10.3 / 11.0 - 1
+    )
+    assert np.isclose(
+        result.loc[1, "intraday_rebound_from_session_low"], 10.3 / 10.0 - 1
+    )
+    assert np.isclose(
+        result.loc[2, "intraday_drawdown_from_session_high"], 10.2 / 10.3 - 1
+    )
+    assert np.isclose(result.loc[2, "intraday_rebound_from_session_low"], 10.2 / 10.1 - 1)
+    assert np.allclose(result["intraday_return_from_prev_close"], [0.04, 0.03, 0.02])
 
 
 def _dated_event(
