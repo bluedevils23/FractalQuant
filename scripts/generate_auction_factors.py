@@ -21,7 +21,7 @@ DEFAULT_STOCK_MINUTE_ROOT = Path(
 )
 DEFAULT_ETF_MINUTE_ROOT = Path(r"D:\workspace\stockdata\etf-data\etf_1min")
 DEFAULT_STOCK_DAILY_PATH = Path(
-    r"D:\workspace\stockdata\a-share-data\stock_daily.parquet"
+    r"D:\workspace\stockdata\a-share-data\行情数据\stock_daily.parquet"
 )
 DEFAULT_ETF_DAILY_PATH = Path(r"D:\workspace\stockdata\etf-data\etf_daily.parquet")
 DEFAULT_STOCK_OUTPUT_ROOT = Path(
@@ -540,11 +540,18 @@ def _load_sz_cancellations(symbol_dir: Path) -> pd.DataFrame:
     return frame
 
 
-def _auction_event_bounds(frame: pd.DataFrame) -> tuple[pd.Timestamp, ...]:
+def _auction_event_bounds(
+    frame: pd.DataFrame,
+    expected_trade_date: str | pd.Timestamp | None = None,
+) -> tuple[pd.Timestamp, ...]:
     valid_times = frame["trade_time"].dropna()
     if valid_times.empty:
         raise ValueError("Auction event file contains no valid timestamp")
-    trade_day = pd.Timestamp(valid_times.iloc[0]).normalize()
+    if expected_trade_date is None:
+        normalized_dates = valid_times.dt.normalize()
+        trade_day = pd.Timestamp(normalized_dates.mode().iloc[0])
+    else:
+        trade_day = pd.Timestamp(expected_trade_date).normalize()
     return (
         trade_day + pd.Timedelta(hours=9, minutes=15),
         trade_day + pd.Timedelta(hours=9, minutes=20),
@@ -563,8 +570,11 @@ def _finalize_event_frame(
         & adds["price"].gt(0)
         & adds["quantity"].gt(0)
     ].copy()
-    if len(required_add) != len(adds) or required_add["order_id"].duplicated().any():
+    duplicate_order_ids = bool(required_add["order_id"].duplicated().any())
+    if len(required_add) != len(adds) or duplicate_order_ids:
         valid = False
+    if duplicate_order_ids:
+        return _empty_event_frame(), False
 
     required_add["event_type"] = "A"
     required_add["notional"] = required_add["price"] * required_add["quantity"]
@@ -624,11 +634,18 @@ def _finalize_event_frame(
     return events.reset_index(drop=True), valid
 
 
-def _reconstruct_sh_events(orders: pd.DataFrame) -> tuple[pd.DataFrame, bool]:
-    start_time, split_time, end_time = _auction_event_bounds(orders)
+def _reconstruct_sh_events(
+    orders: pd.DataFrame,
+    expected_trade_date: str | pd.Timestamp | None = None,
+) -> tuple[pd.DataFrame, bool]:
+    start_time, split_time, end_time = _auction_event_bounds(
+        orders, expected_trade_date
+    )
     auction = orders.loc[
         orders["trade_time"].ge(start_time) & orders["trade_time"].lt(end_time)
     ].copy()
+    if auction.empty:
+        return _empty_event_frame(), False
     known_types = auction["order_type"].isin(["A", "D"])
     valid = bool(known_types.all())
     adds = auction.loc[auction["order_type"].eq("A")].copy()
@@ -640,9 +657,13 @@ def _reconstruct_sh_events(orders: pd.DataFrame) -> tuple[pd.DataFrame, bool]:
 
 
 def _reconstruct_sz_events(
-    orders: pd.DataFrame, transactions: pd.DataFrame
+    orders: pd.DataFrame,
+    transactions: pd.DataFrame,
+    expected_trade_date: str | pd.Timestamp | None = None,
 ) -> tuple[pd.DataFrame, bool]:
-    start_time, split_time, end_time = _auction_event_bounds(orders)
+    start_time, split_time, end_time = _auction_event_bounds(
+        orders, expected_trade_date
+    )
     adds = orders.loc[
         orders["trade_time"].ge(start_time) & orders["trade_time"].lt(end_time)
     ].copy()
@@ -651,6 +672,8 @@ def _reconstruct_sz_events(
         & transactions["trade_time"].lt(end_time)
         & transactions["trade_code"].eq("C")
     ].copy()
+    if adds.empty and cancellations.empty:
+        return _empty_event_frame(), False
     ask_present = cancellations["ask_order_id"].gt(0)
     bid_present = cancellations["bid_order_id"].gt(0)
     sequence_ok = ask_present ^ bid_present
@@ -667,15 +690,22 @@ def _reconstruct_sz_events(
 
 
 def load_auction_event_frame(
-    symbol_dir: Path, ts_code: str
+    symbol_dir: Path,
+    ts_code: str,
+    *,
+    expected_trade_date: str | pd.Timestamp | None = None,
 ) -> tuple[pd.DataFrame, bool]:
     exchange = ts_code.rsplit(".", 1)[-1].upper()
     try:
         orders = _load_raw_orders(symbol_dir)
         if exchange == "SH":
-            return _reconstruct_sh_events(orders)
+            return _reconstruct_sh_events(orders, expected_trade_date)
         if exchange == "SZ":
-            return _reconstruct_sz_events(orders, _load_sz_cancellations(symbol_dir))
+            return _reconstruct_sz_events(
+                orders,
+                _load_sz_cancellations(symbol_dir),
+                expected_trade_date,
+            )
         LOGGER.warning("Unsupported exchange for auction events: %s", ts_code)
     except (OSError, KeyError, ValueError, pd.errors.ParserError) as exc:
         LOGGER.warning("Could not reconstruct auction events for %s: %s", ts_code, exc)
@@ -777,18 +807,27 @@ def _apply_stage2_twap_factors(
 
 
 def _stage2_slope(stage2: pd.DataFrame, previous_close: float) -> float:
-    valid = stage2.dropna(subset=["indicative_price"])
+    valid = stage2.dropna(subset=["trade_time", "indicative_price"])
     if len(valid) < 3 or not np.isfinite(previous_close) or previous_close <= 0:
         return np.nan
     elapsed_minutes = (
         valid["trade_time"] - valid["trade_time"].iloc[0]
     ).dt.total_seconds().to_numpy(dtype=float) / 60.0
-    if np.unique(elapsed_minutes).size < 3 or np.ptp(elapsed_minutes) <= 0:
+    with np.errstate(divide="ignore", invalid="ignore"):
+        relative_log_price = np.log(
+            valid["indicative_price"].to_numpy(dtype=float) / previous_close
+        )
+    finite = np.isfinite(elapsed_minutes) & np.isfinite(relative_log_price)
+    finite_elapsed = elapsed_minutes[finite]
+    finite_log_price = relative_log_price[finite]
+    if (
+        len(finite_elapsed) < 3
+        or np.unique(finite_elapsed).size < 3
+        or np.ptp(finite_elapsed) <= 0
+    ):
         return np.nan
-    relative_log_price = np.log(
-        valid["indicative_price"].to_numpy(dtype=float) / previous_close
-    )
-    return float(np.polyfit(elapsed_minutes, relative_log_price, 1)[0] * 10000.0)
+    slope = float(np.polyfit(finite_elapsed, finite_log_price, 1)[0] * 10000.0)
+    return slope if np.isfinite(slope) else np.nan
 
 
 def _stage2_efficiency(stage2: pd.DataFrame) -> float:
@@ -1507,15 +1546,29 @@ def build_session_path_factor_frame(
         }
         work = work.loc[work["trade_date"].isin(normalized_dates)]
     result = work[SESSION_PATH_OUTPUT_COLUMNS].reset_index(drop=True)
-    numeric = result[
-        [
-            "intraday_drawdown_from_session_high",
-            "intraday_rebound_from_session_low",
-            "intraday_return_from_prev_close",
+    factor_columns = [
+        "intraday_drawdown_from_session_high",
+        "intraday_rebound_from_session_low",
+        "intraday_return_from_prev_close",
+    ]
+    numeric = result[factor_columns].to_numpy(dtype=float)
+    infinite_locations = np.argwhere(np.isinf(numeric))
+    if len(infinite_locations) > 0:
+        details = [
+            (
+                f"{result.iloc[row_index]['trade_date']} "
+                f"{result.iloc[row_index]['bar_time']} "
+                f"{factor_columns[column_index]}"
+            )
+            for row_index, column_index in infinite_locations[:10]
         ]
-    ].to_numpy(dtype=float)
-    if np.isinf(numeric).any():
-        raise ValueError(f"Infinite session path factor produced for {ts_code}")
+        remaining = len(infinite_locations) - len(details)
+        suffix = f"; and {remaining} more" if remaining > 0 else ""
+        raise ValueError(
+            f"Infinite session path factor for {ts_code}: "
+            + "; ".join(details)
+            + suffix
+        )
     return result
 
 
@@ -1752,7 +1805,9 @@ def process_symbol_series(
     valid_amount_history_count = 0
     valid_event_history_count = 0
     for path in reversed(prior_paths):
-        events, event_ok = load_auction_event_frame(path, ts_code)
+        events, event_ok = load_auction_event_frame(
+            path, ts_code, expected_trade_date=path.parent.name
+        )
         daily = calculate_daily_auction_factors(
             load_quote_frame(path), ts_code, events, event_ok
         )
@@ -1774,7 +1829,9 @@ def process_symbol_series(
 
     requested_records: list[tuple[dict[str, object], pd.DataFrame]] = []
     for path in requested_paths:
-        events, event_ok = load_auction_event_frame(path, ts_code)
+        events, event_ok = load_auction_event_frame(
+            path, ts_code, expected_trade_date=path.parent.name
+        )
         daily = calculate_daily_auction_factors(
             load_quote_frame(path), ts_code, events, event_ok
         )

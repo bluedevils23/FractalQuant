@@ -4,10 +4,13 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from scripts.generate_auction_factors import (
     EVENT_FACTOR_COLUMNS,
     OUTPUT_COLUMNS,
+    _finalize_event_frame,
+    _stage2_slope,
     apply_historical_ratios,
     apply_external_context,
     build_asset_universe,
@@ -390,6 +393,36 @@ def test_constant_stage2_has_zero_efficiency_and_insufficient_slope_is_nan() -> 
     assert np.isnan(too_short["auction_stage2_slope_bps_per_min"])
 
 
+def test_stage2_slope_filters_nonfinite_observations() -> None:
+    stage2 = pd.DataFrame(
+        {
+            "trade_time": pd.to_datetime(
+                [
+                    "2026-03-31 09:20",
+                    "2026-03-31 09:21",
+                    "2026-03-31 09:22",
+                    "2026-03-31 09:23",
+                ]
+            ),
+            "indicative_price": [10.0, np.inf, 10.2, 10.3],
+        }
+    )
+
+    result = _stage2_slope(stage2, 10.0)
+    expected = (
+        np.polyfit(
+            np.array([0.0, 2.0, 3.0]),
+            np.log(np.array([10.0, 10.2, 10.3]) / 10.0),
+            1,
+        )[0]
+        * 10000.0
+    )
+
+    assert np.isclose(result, expected)
+    stage2.loc[2, "indicative_price"] = np.inf
+    assert np.isnan(_stage2_slope(stage2, 10.0))
+
+
 def test_zero_depth_and_zero_previous_close_do_not_create_infinity() -> None:
     quotes = _auction_quotes()
     quotes.loc[0, ["bid_qty1", "ask_qty1"]] = 0.0
@@ -687,6 +720,30 @@ def test_session_path_companion_is_minute_causal_and_resets_at_lunch(tmp_path) -
     assert np.allclose(result["intraday_return_from_prev_close"], [0.04, 0.03, 0.02])
 
 
+def test_session_path_infinite_value_error_identifies_location(tmp_path) -> None:
+    index = pd.MultiIndex.from_arrays(
+        [
+            pd.to_datetime(["2026-01-02"]),
+            pd.to_datetime(["2026-01-02 09:30"]),
+        ],
+        names=["trade_date", "trade_time"],
+    )
+    minute_path = tmp_path / "000001.SZ.parquet"
+    pd.DataFrame(
+        {"high": [10.0], "low": [9.0], "close": [np.inf]},
+        index=index,
+    ).to_parquet(minute_path)
+
+    with pytest.raises(ValueError) as error:
+        build_session_path_factor_frame(minute_path, "000001.SZ")
+
+    message = str(error.value)
+    assert "000001.SZ" in message
+    assert "2026-01-02" in message
+    assert "09:30:00" in message
+    assert "intraday_drawdown_from_session_high" in message
+
+
 def _dated_event(
     trade_date: pd.Timestamp,
     event_type: str,
@@ -877,6 +934,22 @@ def test_invalid_or_stage2_cancellation_marks_reconstruction_failed(tmp_path) ->
 
 
 def test_duplicate_and_over_cancelled_orders_fail_reconstruction(tmp_path) -> None:
+    duplicate_adds = pd.DataFrame(
+        [
+            _event("2026-03-31 09:15:00", "A", "B", 1, 10.0, 100),
+            _event("2026-03-31 09:15:01", "A", "B", 1, 10.0, 100),
+        ]
+    )
+    cancellation = pd.DataFrame(
+        [_event("2026-03-31 09:18:00", "C", "B", 1, 10.0, 20)]
+    )
+    duplicate_events, duplicate_linked = _finalize_event_frame(
+        duplicate_adds, cancellation
+    )
+
+    assert duplicate_events.empty
+    assert duplicate_linked is False
+
     duplicate_dir = tmp_path / "duplicate"
     duplicate_dir.mkdir()
     _write_raw_order_file(
@@ -901,6 +974,42 @@ def test_duplicate_and_over_cancelled_orders_fail_reconstruction(tmp_path) -> No
 
     assert duplicate_ok is False
     assert over_cancel_ok is False
+
+
+def test_event_reconstruction_uses_explicit_date_or_timestamp_mode(tmp_path) -> None:
+    raw_dir = tmp_path / "20260331" / "600000.SH"
+    raw_dir.mkdir(parents=True)
+    polluted = _raw_order(91500000, 99, "A", "B", 100)
+    polluted["自然日"] = 20260330
+    _write_raw_order_file(
+        raw_dir,
+        [
+            polluted,
+            _raw_order(91500000, 1, "A", "B", 100),
+            _raw_order(91500010, 2, "A", "S", 200),
+        ],
+    )
+
+    inferred_events, inferred_ok = load_auction_event_frame(raw_dir, "600000.SH")
+    explicit_events, explicit_ok = load_auction_event_frame(
+        raw_dir, "600000.SH", expected_trade_date="20260331"
+    )
+    missing_events, missing_ok = load_auction_event_frame(
+        raw_dir, "600000.SH", expected_trade_date="20260401"
+    )
+
+    assert inferred_ok is True
+    assert explicit_ok is True
+    assert len(inferred_events) == 2
+    assert len(explicit_events) == 2
+    assert inferred_events["trade_time"].dt.normalize().eq(
+        pd.Timestamp("2026-03-31")
+    ).all()
+    assert explicit_events["trade_time"].dt.normalize().eq(
+        pd.Timestamp("2026-03-31")
+    ).all()
+    assert missing_events.empty
+    assert missing_ok is False
 
 
 def test_unmatched_sz_cancellation_fails_reconstruction(tmp_path) -> None:
