@@ -1,0 +1,2 @@
+﻿file,bytes,error
+513190.SH.parquet,6421669,ArrowInvalid: Parquet magic bytes not found in footer. Either the file is corrupted or this is not a parquet file.

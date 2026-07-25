@@ -52,6 +52,8 @@ class NumericStats:
     max_value: float = -math.inf
     batches: int = 0
     constant_batches: int = 0
+    mode_sample_rows: int = 0
+    mode_ratio_weighted_sum: float = 0.0
     max_sample_mode_ratio: float = 0.0
     max_sample_mode_value: float = math.nan
 
@@ -84,6 +86,8 @@ class NumericStats:
             unique, counts = np.unique(sample, return_counts=True)
             mode_index = int(counts.argmax())
             ratio = float(counts[mode_index] / len(sample))
+            self.mode_sample_rows += len(sample)
+            self.mode_ratio_weighted_sum += ratio * len(sample)
             if ratio > self.max_sample_mode_ratio:
                 self.max_sample_mode_ratio = ratio
                 self.max_sample_mode_value = float(unique[mode_index])
@@ -105,6 +109,8 @@ class NumericStats:
         self.max_value = max(self.max_value, other.max_value)
         self.batches += other.batches
         self.constant_batches += other.constant_batches
+        self.mode_sample_rows += other.mode_sample_rows
+        self.mode_ratio_weighted_sum += other.mode_ratio_weighted_sum
         if other.max_sample_mode_ratio > self.max_sample_mode_ratio:
             self.max_sample_mode_ratio = other.max_sample_mode_ratio
             self.max_sample_mode_value = other.max_sample_mode_value
@@ -115,17 +121,22 @@ class NumericStats:
         late_nonfinite_rate = (
             self.late_nonfinite / self.late_rows if self.late_rows else math.nan
         )
+        mean_batch_mode_rate = (
+            self.mode_ratio_weighted_sum / self.mode_sample_rows
+            if self.mode_sample_rows
+            else math.nan
+        )
         status = "ok"
         if not self.finite:
             status = "critical_all_missing"
         elif late_nonfinite_rate >= 0.05:
             status = "review_late_missing"
-        elif zero_rate >= 0.95:
-            status = "review_dominant_zero"
-        elif self.max_sample_mode_ratio >= 0.95:
-            status = "review_dominant_value"
+        elif zero_rate >= 0.80:
+            status = "sparse_dominant_zero"
         elif nonfinite_rate >= 0.20:
             status = "likely_session_warmup"
+        elif mean_batch_mode_rate >= 0.95:
+            status = "review_dominant_value"
         return {
             "field": name,
             "files_present": files_present,
@@ -142,8 +153,9 @@ class NumericStats:
             "min": None if self.min_value == math.inf else self.min_value,
             "max": None if self.max_value == -math.inf else self.max_value,
             "constant_batch_rate": self.constant_batches / self.batches if self.batches else math.nan,
-            "max_sample_mode_rate": self.max_sample_mode_ratio,
-            "sample_mode_value": self.max_sample_mode_value,
+            "mean_batch_sample_mode_rate": mean_batch_mode_rate,
+            "max_batch_sample_mode_rate": self.max_sample_mode_ratio,
+            "max_batch_sample_mode_value": self.max_sample_mode_value,
             "assessment": status,
         }
 
@@ -330,7 +342,7 @@ def markdown_report(
         "## Interpretation",
         "",
         "- Missing values in the first 80 bars of each session are treated separately as expected rolling-window warm-up. `late_missing_rate` measures missing values after that opening region.",
-        "- `zero_rate_among_finite` is exact. `max_sample_mode_rate` is a batch-level sampled concentration diagnostic; it is intended to flag nearly constant values, not to estimate global cardinality.",
+        "- `zero_rate_among_finite` is exact. `mean_batch_sample_mode_rate` is a weighted batch-level sampled concentration diagnostic; unlike a maximum, it is not triggered by one isolated flat batch.",
         "- A factor's zero/constant result is not automatically a source-data fault. The detailed source report and the factor implementation must be read together before removing a field.",
         "",
         "## Highest-priority factor fields",
@@ -342,15 +354,15 @@ def markdown_report(
             row["assessment"] == "critical_all_missing",
             row.get("late_missing_rate") or 0,
             row.get("zero_rate_among_finite") or 0,
-            row.get("max_sample_mode_rate") or 0,
+            row.get("mean_batch_sample_mode_rate") or 0,
         ),
         reverse=True,
     )[:30]
     if priority:
-        lines.extend(["| Factor | Assessment | Missing | Late missing | Zero | Sample-mode |", "|---|---:|---:|---:|---:|---:|"])
+        lines.extend(["| Factor | Assessment | Missing | Late missing | Zero | Mean sample-mode |", "|---|---:|---:|---:|---:|---:|"])
         for row in priority:
             lines.append(
-                "| {field} | {assessment} | {missing_rate:.2%} | {late_missing_rate:.2%} | {zero_rate_among_finite:.2%} | {max_sample_mode_rate:.2%} |".format(
+                "| {field} | {assessment} | {missing_rate:.2%} | {late_missing_rate:.2%} | {zero_rate_among_finite:.2%} | {mean_batch_sample_mode_rate:.2%} |".format(
                     **{key: (0.0 if value is None or (isinstance(value, float) and math.isnan(value)) else value) for key, value in row.items()}
                 )
             )
