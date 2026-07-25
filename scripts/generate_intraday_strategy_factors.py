@@ -46,7 +46,7 @@ DEFAULT_STOCK_MINUTE_ROOT = Path(
 )
 DEFAULT_ETF_MINUTE_ROOT = Path(r"D:\workspace\stockdata\etf-data\etf_1min")
 DEFAULT_STOCK_DAILY_PATH = Path(
-    r"D:\workspace\stockdata\a-share-data\stock_daily.parquet"
+    r"D:\workspace\stockdata\a-share-data\行情数据\stock_daily.parquet"
 )
 DEFAULT_ETF_DAILY_PATH = Path(r"D:\workspace\stockdata\etf-data\etf_daily.parquet")
 DEFAULT_STOCK_OUTPUT_ROOT = Path(
