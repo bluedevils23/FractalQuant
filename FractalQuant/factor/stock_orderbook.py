@@ -30,6 +30,8 @@ MLOFI_IMPACT_WINDOW = 100
 MLOFI_IMPACT_MIN_HISTORY = 30
 MLOFI_LEVEL_DECAY = 0.8
 NEAR_TOUCH_LEVELS = 5
+AMIHUD_WINDOW = "300s"
+AMIHUD_MIN_RETURNS = 2
 REFILL_LOOKBACK_SNAPSHOTS = 6
 PRESSURE_SPREAD_FLOOR_BPS = 1.0
 CONTEXT_LOOKBACK_SNAPSHOTS = 20
@@ -266,6 +268,40 @@ def _calculate_normalized_ofi(
     return l1_instantaneous, l1_rolling, mlofi_instantaneous, mlofi_rolling
 
 
+def _calculate_depth_level_ofi_slope(
+    bid_prices: np.ndarray,
+    bid_qty: np.ndarray,
+    ask_prices: np.ndarray,
+    ask_qty: np.ndarray,
+    index: pd.DatetimeIndex,
+) -> np.ndarray:
+    """Return the cross-level slope of instantaneous depth-normalized OFI."""
+    bid_events = _quote_depth_event(bid_prices, bid_qty, side="bid")
+    ask_events = _quote_depth_event(ask_prices, ask_qty, side="ask")
+    level_events = bid_events[:, :NEAR_TOUCH_LEVELS] + ask_events[:, :NEAR_TOUCH_LEVELS]
+    level_depth = (
+        bid_qty[:, :NEAR_TOUCH_LEVELS] + ask_qty[:, :NEAR_TOUCH_LEVELS]
+    )
+    previous_depth = np.vstack(
+        (np.full((1, NEAR_TOUCH_LEVELS), np.nan), level_depth[:-1])
+    )
+    depth_scale = (previous_depth + level_depth) / 2.0
+
+    session_labels = _trading_session_labels(index)
+    session_starts = np.r_[True, session_labels[1:] != session_labels[:-1]]
+    level_events[session_starts] = np.nan
+    depth_scale[session_starts] = np.nan
+    normalized = _safe_divide(level_events, depth_scale)
+
+    centered_levels = np.arange(1, NEAR_TOUCH_LEVELS + 1, dtype=float)
+    centered_levels -= centered_levels.mean()
+    denominator = float(np.dot(centered_levels, centered_levels))
+    slope = np.full(len(index), np.nan, dtype=float)
+    valid = np.all(np.isfinite(normalized), axis=1)
+    slope[valid] = normalized[valid] @ centered_levels / denominator
+    return slope
+
+
 def _validate_window_profile(window_profile: str) -> None:
     if window_profile not in {WINDOW_PROFILE_BASE, WINDOW_PROFILE_MULTI}:
         raise ValueError(f"Unsupported window profile: {window_profile}")
@@ -409,6 +445,68 @@ def _calculate_mlofi_extensions(
         )
 
     return event_window_factor, deep_divergence, impact_beta
+
+
+def _calculate_ofi_impact_nonlinearity(
+    normalized_ofi_60s: np.ndarray,
+    mid_price: np.ndarray,
+    index: pd.DatetimeIndex,
+) -> np.ndarray:
+    """Estimate the lagged nonlinear OFI impact coefficient causally."""
+    result = np.full(len(index), np.nan, dtype=float)
+    session_labels = _trading_session_labels(index)
+    trading_index = _trading_time_index(index)
+
+    for session in pd.unique(session_labels):
+        positions = np.flatnonzero(session_labels == session)
+        x = pd.Series(
+            normalized_ofi_60s[positions], index=trading_index[positions]
+        ).shift(1)
+        y = (
+            pd.Series(mid_price[positions], index=trading_index[positions])
+            .pct_change(fill_method=None)
+            .mul(10000.0)
+            .shift(1)
+        )
+        valid_pair = x.notna() & y.notna()
+        x = x.where(valid_pair)
+        y = y.where(valid_pair)
+        nonlinear_x = x * x.abs()
+
+        rolling = {
+            "var_x": x.rolling(
+                MLOFI_IMPACT_WINDOW, min_periods=MLOFI_IMPACT_MIN_HISTORY
+            ).var(),
+            "var_nonlinear": nonlinear_x.rolling(
+                MLOFI_IMPACT_WINDOW, min_periods=MLOFI_IMPACT_MIN_HISTORY
+            ).var(),
+            "cov_x_nonlinear": x.rolling(
+                MLOFI_IMPACT_WINDOW, min_periods=MLOFI_IMPACT_MIN_HISTORY
+            ).cov(nonlinear_x),
+            "cov_x_y": x.rolling(
+                MLOFI_IMPACT_WINDOW, min_periods=MLOFI_IMPACT_MIN_HISTORY
+            ).cov(y),
+            "cov_nonlinear_y": nonlinear_x.rolling(
+                MLOFI_IMPACT_WINDOW, min_periods=MLOFI_IMPACT_MIN_HISTORY
+            ).cov(y),
+        }
+        determinant = (
+            rolling["var_x"] * rolling["var_nonlinear"]
+            - rolling["cov_x_nonlinear"].pow(2)
+        )
+        determinant_scale = (
+            rolling["var_x"] * rolling["var_nonlinear"]
+        ).abs()
+        numerator = (
+            rolling["cov_nonlinear_y"] * rolling["var_x"]
+            - rolling["cov_x_y"] * rolling["cov_x_nonlinear"]
+        )
+        stable = determinant > determinant_scale * 1e-8
+        coefficient = (numerator / determinant.where(stable)).replace(
+            [np.inf, -np.inf], np.nan
+        )
+        result[positions] = coefficient.to_numpy(dtype=float)
+    return result
 
 
 def _weighted_average(prices: np.ndarray, quantities: np.ndarray) -> np.ndarray:
@@ -690,6 +788,9 @@ def calculate_snapshot_factors(
     ofi_level_entropy_l5 = _calculate_ofi_level_entropy(
         bid_prices, bid_qty, ask_prices, ask_qty, quotes.index
     )
+    depth_level_ofi_slope = _calculate_depth_level_ofi_slope(
+        bid_prices, bid_qty, ask_prices, ask_qty, quotes.index
+    )
     (
         mlofi_event_50_l5,
         mlofi_deep_divergence_l5,
@@ -702,6 +803,9 @@ def calculate_snapshot_factors(
         mid_price,
         normalized_mlofi_l5_60s,
         quotes.index,
+    )
+    ofi_impact_nonlinearity = _calculate_ofi_impact_nonlinearity(
+        normalized_ofi_l1_60s, mid_price, quotes.index
     )
     pressure_denominator = np.maximum(spread_bps, PRESSURE_SPREAD_FLOOR_BPS)
 
@@ -729,6 +833,8 @@ def calculate_snapshot_factors(
     result["ofi_spread_scaled_impact"] = (
         normalized_ofi_l1_60s * spread_bps / 2.0
     )
+    result["depth_level_ofi_slope"] = depth_level_ofi_slope
+    result["ofi_impact_nonlinearity"] = ofi_impact_nonlinearity
     result["ofi_level_entropy_l5"] = ofi_level_entropy_l5
     result["normalized_mlofi_l5"] = normalized_mlofi_l5
     result["normalized_mlofi_l5_60s"] = normalized_mlofi_l5_60s
@@ -1258,6 +1364,75 @@ def calculate_vpin_factor(
     return result
 
 
+def calculate_amihud_illiquidity_factor(
+    trades: pd.DataFrame,
+    quote_index: pd.DatetimeIndex,
+    window: str = AMIHUD_WINDOW,
+    min_returns: int = AMIHUD_MIN_RETURNS,
+) -> pd.Series:
+    """Mean absolute trade return per traded notional over a causal window."""
+    result = pd.Series(
+        np.nan, index=quote_index, name="amihud_illiquidity_5m", dtype=float
+    )
+    if trades.empty:
+        return result
+    if min_returns <= 0:
+        raise ValueError("min_returns must be positive")
+
+    ordered = trades.sort_values("event_time", kind="stable")
+    event_times = pd.DatetimeIndex(pd.to_datetime(ordered["event_time"]))
+    trading_times = _trading_time_index(event_times)
+    sessions = _trading_session_labels(event_times)
+    prices = ordered["price"].to_numpy(dtype=float, copy=False)
+    notionals = ordered["notional"].to_numpy(dtype=float, copy=False)
+    previous_prices = np.full(len(ordered), np.nan, dtype=float)
+    previous_times = np.full(
+        len(ordered), np.datetime64("NaT"), dtype="datetime64[ns]"
+    )
+    for session in pd.unique(sessions):
+        positions = np.flatnonzero(sessions == session)
+        if len(positions) > 1:
+            previous_prices[positions[1:]] = prices[positions[:-1]]
+            previous_times[positions[1:]] = trading_times[positions[:-1]].to_numpy(
+                dtype="datetime64[ns]", copy=False
+            )
+
+    event_time_values = trading_times.to_numpy(dtype="datetime64[ns]", copy=False)
+    within_window = (
+        event_time_values - previous_times
+        <= pd.Timedelta(window).to_timedelta64()
+    )
+    valid = (
+        np.isfinite(prices)
+        & (prices > 0)
+        & np.isfinite(previous_prices)
+        & (previous_prices > 0)
+        & np.isfinite(notionals)
+        & (notionals > 0)
+        & within_window
+    )
+    components = np.zeros(len(ordered), dtype=float)
+    components[valid] = (
+        np.abs(prices[valid] / previous_prices[valid] - 1.0) / notionals[valid]
+    )
+    metrics = pd.DataFrame(
+        {
+            "event_time": event_times,
+            "amihud_sum": components,
+            "amihud_count": valid.astype(float),
+        }
+    )
+    rolling = _rolling_event_sums_at_quotes(
+        metrics, quote_index, ["amihud_sum", "amihud_count"], window
+    )
+    enough_history = rolling["amihud_count"] >= min_returns
+    result.loc[enough_history] = (
+        rolling.loc[enough_history, "amihud_sum"]
+        / rolling.loc[enough_history, "amihud_count"]
+    )
+    return result
+
+
 def _calculate_trade_report_factors(
     trades: pd.DataFrame,
     quotes: pd.DataFrame,
@@ -1502,6 +1677,7 @@ def calculate_trade_flow_factors(
         "trade_direction_persistence_60s",
         "liquidity_shock_60s",
         "market_impact_60s",
+        "amihud_illiquidity_5m",
         "orderflow_significance_60s",
         "volatility_adj_volume_60s",
         "price_velocity_60s",
@@ -1578,6 +1754,9 @@ def calculate_trade_flow_factors(
     advanced = _calculate_trade_impact_factors(trades, quotes.index, window)
     result = pd.concat([result, advanced], axis=1)
     result["vpin_50bucket"] = calculate_vpin_factor(trades, quotes.index)
+    result["amihud_illiquidity_5m"] = calculate_amihud_illiquidity_factor(
+        trades, quotes.index
+    )
     result["adverse_selection_markout_30s"] = _calculate_adverse_selection_markout(
         trades, quotes
     )

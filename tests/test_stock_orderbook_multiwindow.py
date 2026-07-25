@@ -64,7 +64,7 @@ def test_multi_profile_has_unique_schema_and_all_expected_columns() -> None:
     )
     columns = factor_columns_for_profile("multi")
 
-    assert len(columns) == 150
+    assert len(columns) == 153
     assert len(columns) == len(set(columns))
     assert set(columns) <= set(frame.columns)
     assert output_columns_for_profile("multi")[-len(columns) :] == columns
