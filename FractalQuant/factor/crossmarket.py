@@ -6,8 +6,31 @@ import numpy as np
 from typing import List, Dict, Optional
 from scipy import stats
 from scipy.stats import pearsonr, spearmanr
-from scipy.signal import coherence
+from scipy.signal import coherence as scipy_coherence
 from .base import BaseFactor
+
+
+def _aligned_price_windows(
+    current_window: pd.Series,
+    reference_close: pd.Series,
+    length: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    current = pd.to_numeric(
+        current_window.iloc[-length:], errors="coerce"
+    )
+    reference = pd.to_numeric(
+        reference_close.reindex(current.index), errors="coerce"
+    )
+    current_values = current.to_numpy(dtype=float, copy=False)
+    reference_values = reference.to_numpy(dtype=float, copy=False)
+    valid = (
+        np.isfinite(current_values)
+        & np.isfinite(reference_values)
+        & (current_values > 0)
+        & (reference_values > 0)
+    )
+    return current_values[valid], reference_values[valid]
+
 
 class CrossMarketCorrelationFactor(BaseFactor):
     """跨市场相关性因子"""
@@ -29,20 +52,16 @@ class CrossMarketCorrelationFactor(BaseFactor):
             if len(x) < self.correlation_window:
                 return 0
             
-            current_window = x[-self.correlation_window:]
-            ref_window = ref_close[-self.correlation_window:]
-            
-            if len(current_window) != len(ref_window):
-                min_len = min(len(current_window), len(ref_window))
-                current_window = current_window[-min_len:]
-                ref_window = ref_window[-min_len:]
+            current_window, ref_window = _aligned_price_windows(
+                x, ref_close, self.correlation_window
+            )
             
             if len(current_window) < 10:
                 return 0
             
             try:
                 correlation, _ = pearsonr(current_window, ref_window)
-                return correlation
+                return correlation if np.isfinite(correlation) else 0
             except:
                 return 0
         
@@ -69,13 +88,11 @@ class ArbitrageOpportunityFactor(BaseFactor):
             if len(x) < 20:
                 return 0
             
-            current_window = x[-20:]
-            ref_window = ref_close[-20:]
-            
-            if len(current_window) != len(ref_window):
-                min_len = min(len(current_window), len(ref_window))
-                current_window = current_window[-min_len:]
-                ref_window = ref_window[-min_len:]
+            current_window, ref_window = _aligned_price_windows(
+                x, ref_close, 20
+            )
+            if len(current_window) < 20:
+                return 0
             
             price_spread = current_window - ref_window
             
@@ -111,21 +128,18 @@ class MarketLinkageFactor(BaseFactor):
             if len(x) < 50:
                 return 0
             
-            current_series = x[-50:]
-            ref_series = ref_close[-50:]
-            
-            if len(current_series) != len(ref_series):
-                min_len = min(len(current_series), len(ref_series))
-                current_series = current_series[-min_len:]
-                ref_series = ref_series[-min_len:]
+            current_series, ref_series = _aligned_price_windows(
+                x, ref_close, 50
+            )
+            if len(current_series) < 50:
+                return 0
             
             try:
                 returns_current = np.diff(np.log(current_series))
                 returns_ref = np.diff(np.log(ref_series))
                 
                 correlation, _ = pearsonr(returns_current, returns_ref)
-                
-                return abs(correlation)
+                return abs(correlation) if np.isfinite(correlation) else 0
             except:
                 return 0
         
@@ -151,8 +165,11 @@ class RelativeStrengthFactor(BaseFactor):
             if len(x) < 20:
                 return 0
             
-            current_window = x[-20:]
-            ref_window = ref_close[-20:]
+            current_window, ref_window = _aligned_price_windows(
+                x, ref_close, 20
+            )
+            if len(current_window) < 20:
+                return 0
             
             current_return = (current_window[-1] - current_window[0]) / (current_window[0] + 1e-8)
             ref_return = (ref_window[-1] - ref_window[0]) / (ref_window[0] + 1e-8)
@@ -184,13 +201,11 @@ class CointegrationFactor(BaseFactor):
             if len(x) < self.min_window:
                 return 0
             
-            current_series = x[-self.min_window:]
-            ref_series = ref_close[-self.min_window:]
-            
-            if len(current_series) != len(ref_series):
-                min_len = min(len(current_series), len(ref_series))
-                current_series = current_series[-min_len:]
-                ref_series = ref_series[-min_len:]
+            current_series, ref_series = _aligned_price_windows(
+                x, ref_close, self.min_window
+            )
+            if len(current_series) < self.min_window:
+                return 0
             
             try:
                 y = np.log(current_series)
@@ -201,13 +216,13 @@ class CointegrationFactor(BaseFactor):
                 
                 residuals = y - X @ beta
                 
-                adf_stat = self._adf_test(residuals)
+                adf_stat = _adf_test(residuals)
                 
                 return -adf_stat
             except:
                 return 0
         
-        def _adf_test(self, series):
+        def _adf_test(series):
             if len(series) < 20:
                 return 0
             
@@ -215,7 +230,7 @@ class CointegrationFactor(BaseFactor):
             lagged_series = series[:-1]
             
             X = np.column_stack([np.ones(len(lagged_series)), lagged_series])
-            y = diff_series[1:]
+            y = diff_series
             
             try:
                 beta = np.linalg.lstsq(X, y, rcond=None)[0]
@@ -264,13 +279,13 @@ class CrossMarketVolatilityFactor(BaseFactor):
             if len(x) < 30:
                 return 0
             
-            current_returns = np.diff(np.log(x[-30:]))
-            ref_returns = np.diff(np.log(ref_close[-30:]))
-            
-            if len(current_returns) != len(ref_returns):
-                min_len = min(len(current_returns), len(ref_returns))
-                current_returns = current_returns[-min_len:]
-                ref_returns = ref_returns[-min_len:]
+            current_window, ref_window = _aligned_price_windows(
+                x, ref_close, 30
+            )
+            if len(current_window) < 30:
+                return 0
+            current_returns = np.diff(np.log(current_window))
+            ref_returns = np.diff(np.log(ref_window))
             
             current_vol = np.std(current_returns)
             ref_vol = np.std(ref_returns)
@@ -303,8 +318,11 @@ class MarketRegimeSwitchFactor(BaseFactor):
             if len(x) < 50:
                 return 0
             
-            current_window = x[-50:]
-            ref_window = ref_close[-50:]
+            current_window, ref_window = _aligned_price_windows(
+                x, ref_close, 50
+            )
+            if len(current_window) < 50:
+                return 0
             
             current_returns = np.diff(np.log(current_window))
             ref_returns = np.diff(np.log(ref_window))
@@ -312,7 +330,11 @@ class MarketRegimeSwitchFactor(BaseFactor):
             current_vol = np.std(current_returns[-20:])
             ref_vol = np.std(ref_returns[-20:])
             
-            current_corr, _ = pearsonr(current_returns[-20:], ref_returns[-20:])
+            current_corr, _ = pearsonr(
+                current_returns[-20:], ref_returns[-20:]
+            )
+            if not np.isfinite(current_corr):
+                return 0
             
             regime_strength = abs(current_corr) * (current_vol / (ref_vol + 1e-8))
             
@@ -340,8 +362,11 @@ class CrossMarketEntropyFactor(BaseFactor):
             if len(x) < 50:
                 return 0
             
-            current_window = x[-50:]
-            ref_window = ref_close[-50:]
+            current_window, ref_window = _aligned_price_windows(
+                x, ref_close, 50
+            )
+            if len(current_window) < 50:
+                return 0
             
             current_returns = np.diff(np.log(current_window))
             ref_returns = np.diff(np.log(ref_window))
@@ -384,8 +409,11 @@ class CrossMarketCoherenceFactor(BaseFactor):
             if len(x) < 50:
                 return 0
             
-            current_window = x[-50:]
-            ref_window = ref_close[-50:]
+            current_window, ref_window = _aligned_price_windows(
+                x, ref_close, 50
+            )
+            if len(current_window) < 50:
+                return 0
             
             current_returns = np.diff(np.log(current_window))
             ref_returns = np.diff(np.log(ref_window))
@@ -396,7 +424,9 @@ class CrossMarketCoherenceFactor(BaseFactor):
                 ref_returns = ref_returns[-min_len:]
             
             try:
-                f, coh = coherence(current_returns, ref_returns, nperseg=10)
+                _, coh = scipy_coherence(
+                    current_returns, ref_returns, nperseg=10
+                )
                 
                 if len(coh) > 0:
                     mean_coh = np.mean(coh)
@@ -429,8 +459,11 @@ class CrossMarketGrangerFactor(BaseFactor):
             if len(x) < 50:
                 return 0
             
-            current_window = x[-50:]
-            ref_window = ref_close[-50:]
+            current_window, ref_window = _aligned_price_windows(
+                x, ref_close, 50
+            )
+            if len(current_window) < 50:
+                return 0
             
             current_returns = np.diff(np.log(current_window))
             ref_returns = np.diff(np.log(ref_window))
@@ -489,8 +522,11 @@ class CrossMarketJointDistributionFactor(BaseFactor):
             if len(x) < 50:
                 return 0
             
-            current_window = x[-50:]
-            ref_window = ref_close[-50:]
+            current_window, ref_window = _aligned_price_windows(
+                x, ref_close, 50
+            )
+            if len(current_window) < 50:
+                return 0
             
             current_returns = np.diff(np.log(current_window))
             ref_returns = np.diff(np.log(ref_window))
@@ -534,8 +570,11 @@ class CrossMarketCopulaFactor(BaseFactor):
             if len(x) < 50:
                 return 0
             
-            current_window = x[-50:]
-            ref_window = ref_close[-50:]
+            current_window, ref_window = _aligned_price_windows(
+                x, ref_close, 50
+            )
+            if len(current_window) < 50:
+                return 0
             
             current_returns = np.diff(np.log(current_window))
             ref_returns = np.diff(np.log(ref_window))
@@ -550,8 +589,7 @@ class CrossMarketCopulaFactor(BaseFactor):
                 ref_cdf = stats.rankdata(ref_returns) / (len(ref_returns) + 1)
                 
                 correlation, _ = pearsonr(current_cdf, ref_cdf)
-                
-                return abs(correlation)
+                return abs(correlation) if np.isfinite(correlation) else 0
             except:
                 return 0
         
@@ -577,8 +615,11 @@ class CrossMarketPhaseSynchronizationFactor(BaseFactor):
             if len(x) < 50:
                 return 0
             
-            current_window = x[-50:]
-            ref_window = ref_close[-50:]
+            current_window, ref_window = _aligned_price_windows(
+                x, ref_close, 50
+            )
+            if len(current_window) < 50:
+                return 0
             
             current_returns = np.diff(np.log(current_window))
             ref_returns = np.diff(np.log(ref_window))
@@ -621,8 +662,11 @@ class CrossMarketInformationFlowFactor(BaseFactor):
             if len(x) < 50:
                 return 0
             
-            current_window = x[-50:]
-            ref_window = ref_close[-50:]
+            current_window, ref_window = _aligned_price_windows(
+                x, ref_close, 50
+            )
+            if len(current_window) < 50:
+                return 0
             
             current_returns = np.diff(np.log(current_window))
             ref_returns = np.diff(np.log(ref_window))
@@ -633,10 +677,24 @@ class CrossMarketInformationFlowFactor(BaseFactor):
                 ref_returns = ref_returns[-min_len:]
             
             try:
-                current_discrete = np.digitize(current_returns, np.linspace(-0.05, 0.05, 10))
-                ref_discrete = np.digitize(ref_returns, np.linspace(-0.05, 0.05, 10))
+                bin_count = min(10, max(2, len(current_returns) // 5))
+                current_discrete = np.floor(
+                    stats.rankdata(current_returns)
+                    / (len(current_returns) + 1)
+                    * bin_count
+                )
+                ref_discrete = np.floor(
+                    stats.rankdata(ref_returns)
+                    / (len(ref_returns) + 1)
+                    * bin_count
+                )
                 
-                joint_hist, _, _ = np.histogram2d(current_discrete, ref_discrete, bins=10)
+                joint_hist, _, _ = np.histogram2d(
+                    current_discrete,
+                    ref_discrete,
+                    bins=bin_count,
+                    range=((0, bin_count), (0, bin_count)),
+                )
                 joint_prob = joint_hist / joint_hist.sum() + 1e-10
                 
                 current_marginal = joint_prob.sum(axis=1)
@@ -671,8 +729,11 @@ class CrossMarketMultiscaleCorrelationFactor(BaseFactor):
             if len(x) < 50:
                 return 0
             
-            current_window = x[-50:]
-            ref_window = ref_close[-50:]
+            current_window, ref_window = _aligned_price_windows(
+                x, ref_close, 50
+            )
+            if len(current_window) < 50:
+                return 0
             
             current_returns = np.diff(np.log(current_window))
             ref_returns = np.diff(np.log(ref_window))
@@ -699,8 +760,11 @@ class CrossMarketMultiscaleCorrelationFactor(BaseFactor):
                         continue
                     
                     try:
+                        if np.std(current_seg) == 0 or np.std(ref_seg) == 0:
+                            continue
                         corr, _ = pearsonr(current_seg, ref_seg)
-                        segment_correlations.append(abs(corr))
+                        if np.isfinite(corr):
+                            segment_correlations.append(abs(corr))
                     except:
                         continue
                 
@@ -734,16 +798,14 @@ class CrossMarketDynamicCorrelationFactor(BaseFactor):
             if len(x) < 30:
                 return 0
             
-            current_window = x[-30:]
-            ref_window = ref_close[-30:]
+            current_window, ref_window = _aligned_price_windows(
+                x, ref_close, 30
+            )
+            if len(current_window) < 30:
+                return 0
             
             current_returns = np.diff(np.log(current_window))
             ref_returns = np.diff(np.log(ref_window))
-            
-            if len(current_returns) != len(ref_returns):
-                min_len = min(len(current_returns), len(ref_returns))
-                current_returns = current_returns[-min_len:]
-                ref_returns = ref_returns[-min_len:]
             
             weighted_sum = 0
             weight_sum = 0
