@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from factor.stock_orderbook import calculate_snapshot_factors
+from factor.stock_orderbook import build_stock_orderbook_factor_frame, calculate_snapshot_factors
 
 
 def _quotes(
@@ -39,6 +39,33 @@ def test_l1_ofi_uses_previous_queue_for_price_worsening() -> None:
     assert np.isclose(factors["normalized_ofi_l1"].iloc[2], -13.0 / 20.0)
     assert np.isclose(factors["normalized_ofi_l1"].iloc[3], 8.0 / 19.5)
     assert np.isclose(factors["normalized_ofi_l1_60s"].iloc[3], 0.0)
+
+
+def test_orderbook_frame_handles_unordered_quotes_with_lunch_timestamps() -> None:
+    index = pd.DatetimeIndex(
+        [
+            "2026-01-05 13:00:00",
+            "2026-01-05 09:30:00",
+            "2026-01-05 12:59:00",
+            "2026-01-05 09:30:01",
+        ]
+    )
+    quotes = _quotes(
+        index,
+        [100.0] * 4,
+        [[10.0] * 5, [10.0] * 5, [12.0] + [10.0] * 4, [10.0] * 5],
+        [101.0] * 4,
+        [[10.0] * 5] * 4,
+    )
+
+    factors = build_stock_orderbook_factor_frame(
+        quotes,
+        pd.DataFrame(columns=["event_time", "side", "price", "qty", "notional"]),
+        pd.DataFrame(columns=["event_time", "side", "price", "qty", "notional"]),
+    )
+
+    assert factors.index.is_monotonic_increasing
+    assert np.isclose(factors["normalized_ofi_l1"].iloc[2], 2.0 / 21.0)
 
 
 def test_mlofi_captures_deeper_queue_change() -> None:

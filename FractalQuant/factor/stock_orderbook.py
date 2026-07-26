@@ -313,10 +313,16 @@ def _trading_session_labels(index: pd.DatetimeIndex) -> np.ndarray:
 
 
 def _trading_time_index(index: pd.DatetimeIndex) -> pd.DatetimeIndex:
-    """Compress the non-trading lunch break while preserving original dates."""
-    afternoon = np.asarray(index.hour >= 13, dtype=bool)
-    offsets = pd.to_timedelta(afternoon.astype(np.int64) * LUNCH_BREAK.value, unit="ns")
-    return pd.DatetimeIndex(index - offsets)
+    """Compress lunch while clamping any non-trading snapshots to 11:30."""
+    day_start = index.normalize()
+    lunch_start = day_start + pd.Timedelta(hours=11, minutes=30)
+    lunch_end = day_start + pd.Timedelta(hours=13)
+    during_lunch = (index >= lunch_start) & (index < lunch_end)
+    after_lunch = index >= lunch_end
+    compressed = index - pd.to_timedelta(
+        after_lunch.astype(np.int64) * LUNCH_BREAK.value, unit="ns"
+    )
+    return pd.DatetimeIndex(compressed.where(~during_lunch, lunch_start))
 
 
 def _calculate_ofi_level_entropy(
@@ -728,6 +734,7 @@ def calculate_snapshot_factors(
     window_profile: str = WINDOW_PROFILE_BASE,
 ) -> pd.DataFrame:
     _validate_window_profile(window_profile)
+    quotes = quotes.sort_index(kind="stable")
     ask_price_cols = [f"ask_price{i}" for i in range(1, 6)]
     ask_qty_cols = [f"ask_qty{i}" for i in range(1, 6)]
     bid_price_cols = [f"bid_price{i}" for i in range(1, 6)]
@@ -1845,6 +1852,7 @@ def build_stock_orderbook_factor_frame(
     window_profile: str = WINDOW_PROFILE_BASE,
 ) -> pd.DataFrame:
     _validate_window_profile(window_profile)
+    quotes = quotes.sort_index(kind="stable")
     quote_factors = calculate_snapshot_factors(quotes, window_profile)
     elapsed_seconds = _trading_time_index(quote_factors.index).to_series().diff(5).dt.total_seconds()
     quote_factors["orderbook_velocity_l5"] = _safe_divide(
