@@ -13,10 +13,15 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from factor.crossmarket import CrossMarketCorrelationFactor
 from scripts.generate_etf_crossmarket_factors import (
+    ALL_FACTOR_COLUMNS,
+    ETF_INDEX_RELATIVE_VALUE_COLUMNS,
     FACTOR_COLUMNS,
+    RELATED_ETF_FACTOR_COLUMNS,
     build_index_file_lookup,
+    calculate_related_etf_factor_frames,
     calculate_crossmarket_factor_frame,
     load_mapping_records,
+    process_mapping_group,
     process_mapping_record,
     resolve_reference_path,
 )
@@ -161,14 +166,103 @@ def test_all_crossmarket_factors_reset_each_trade_day() -> None:
 
     factors = calculate_crossmarket_factor_frame(etf, reference)
 
-    assert tuple(factors.columns) == FACTOR_COLUMNS
+    assert tuple(factors.columns) == ALL_FACTOR_COLUMNS
     for _, day in factors.groupby(factors.index.normalize()):
-        assert day.iloc[:49].isna().all().all()
-        assert day.iloc[49:].notna().all().all()
-    assert (factors.iloc[49:].notna().sum() > 0).all()
+        assert day.loc[:, FACTOR_COLUMNS].iloc[:49].isna().all().all()
+        assert day.loc[:, FACTOR_COLUMNS].iloc[49:].notna().all().all()
+        assert day["etf_fair_value_premium"].notna().all()
+        assert pd.isna(day["etf_index_return_gap_1m"].iloc[0])
+        assert day["etf_index_return_gap_1m"].iloc[1:].notna().all()
+        assert day.loc[:, RELATED_ETF_FACTOR_COLUMNS].isna().all().all()
+    assert (factors.loc[:, FACTOR_COLUMNS].iloc[49:].notna().sum() > 0).all()
     assert not (factors.loc[:, "cointegration"].fillna(0) == 0).all()
     assert factors["cross_market_coherence"].dropna().abs().gt(0).any()
     assert factors["cross_market_info_flow"].dropna().nunique() > 1
+
+
+def test_relative_value_factors_use_same_minute_data_without_future_rows() -> None:
+    etf = _minute_frame(("2026-01-05",))
+    reference = _minute_frame(("2026-01-05",), reference=True)
+    factors = calculate_crossmarket_factor_frame(etf, reference)
+    point = factors.index[40]
+    previous = factors.index[39]
+
+    expected_gap = np.log(etf.loc[point, "close"] / etf.loc[previous, "close"])
+    expected_gap -= np.log(
+        reference.loc[point, "close"] / reference.loc[previous, "close"]
+    )
+    expected_fair_value = etf["open"].iloc[0] * (
+        reference.loc[point, "close"] / reference["open"].iloc[0]
+    )
+    assert np.isclose(factors.loc[point, "etf_index_return_gap_1m"], expected_gap)
+    assert np.isclose(
+        factors.loc[point, "etf_fair_value_premium"],
+        etf.loc[point, "close"] / expected_fair_value - 1.0,
+    )
+    assert factors.loc[point, "etf_index_tracking_error"] >= 0
+    assert factors.loc[point, "etf_index_realized_vol_ratio"] > 0
+
+    missing_same_minute = reference.drop(point)
+    missing_factors = calculate_crossmarket_factor_frame(etf, missing_same_minute)
+    assert pd.isna(missing_factors.loc[point, "etf_index_return_gap_1m"])
+    assert pd.isna(missing_factors.loc[point, "etf_fair_value_premium"])
+
+    changed_future = reference.copy()
+    changed_future.loc[reference.index[60]:, "close"] *= 1.2
+    changed_future.loc[reference.index[60]:, "amount"] *= 5.0
+    changed_factors = calculate_crossmarket_factor_frame(etf, changed_future)
+    pd.testing.assert_frame_equal(
+        factors.loc[: reference.index[59], list(ETF_INDEX_RELATIVE_VALUE_COLUMNS)],
+        changed_factors.loc[
+            : reference.index[59], list(ETF_INDEX_RELATIVE_VALUE_COLUMNS)
+        ],
+    )
+
+
+def test_related_etf_factors_are_leave_one_out_and_lag_weighted() -> None:
+    index = pd.date_range("2026-01-05 09:30:00", periods=70, freq="min")
+    steps = np.arange(len(index), dtype=float)
+    frames: dict[str, pd.DataFrame] = {}
+    for multiplier, code in enumerate(("159001", "159002", "159003"), start=1):
+        frame = _minute_frame(("2026-01-05",))
+        frame["close"] = frame["open"] * (1.0 + multiplier * steps * 0.001)
+        frame["amount"] = 100.0 * multiplier + steps
+        frames[code] = frame
+
+    related = calculate_related_etf_factor_frames(frames)
+    point = index[10]
+    previous = index[9]
+    peer_returns = np.array(
+        [
+            frames["159002"].loc[point, "close"]
+            / frames["159002"]["open"].iloc[0]
+            - 1.0,
+            frames["159003"].loc[point, "close"]
+            / frames["159003"]["open"].iloc[0]
+            - 1.0,
+        ]
+    )
+    peer_weights = np.array(
+        [
+            frames["159002"].loc[previous, "amount"],
+            frames["159003"].loc[previous, "amount"],
+        ]
+    )
+    expected_spread = (
+        frames["159001"].loc[point, "close"] / frames["159001"]["open"].iloc[0]
+        - 1.0
+        - np.average(peer_returns, weights=peer_weights)
+    )
+
+    assert np.isclose(
+        related["159001"].loc[point, "related_etf_price_spread"],
+        expected_spread,
+    )
+    assert related["159001"]["related_etf_liquidity_gap"].iloc[:29].isna().all()
+    assert related["159001"]["related_etf_liquidity_gap"].iloc[29:].notna().all()
+    assert calculate_related_etf_factor_frames(
+        {"159001": frames["159001"]}
+    )["159001"].isna().all().all()
 
 
 def test_process_mapping_record_writes_reference_metadata(
@@ -195,7 +289,39 @@ def test_process_mapping_record_writes_reference_metadata(
 
     assert result["status"] == "written"
     assert result["factor_non_null"] > 0
-    assert set(FACTOR_COLUMNS) <= set(output.columns)
+    assert set(ALL_FACTOR_COLUMNS) <= set(output.columns)
     assert output["reference_index_code"].eq("399975.SZ").all()
     assert output["reference_ts_code"].eq("399975.SZ").all()
     assert output["reference_close"].notna().all()
+
+
+def test_process_mapping_group_writes_related_etf_factors(tmp_path: Path) -> None:
+    reference_path = tmp_path / "399975.SZ.parquet"
+    output_root = tmp_path / "output"
+    _raw_parquet_frame("2026-01-05", reference=True).to_parquet(reference_path)
+    member_paths: dict[str, Path] = {}
+    for multiplier, code in enumerate(("159001", "159002", "159003"), start=1):
+        path = tmp_path / f"{code}.SZ.parquet"
+        frame = _raw_parquet_frame("2026-01-05", reference=False)
+        frame["close"] = frame["open"] * (
+            1.0 + multiplier * np.arange(len(frame), dtype=float) * 0.001
+        )
+        frame["amount"] = 100.0 * multiplier + np.arange(len(frame), dtype=float)
+        frame.to_parquet(path)
+        member_paths[code] = path
+
+    results = process_mapping_group(
+        member_paths,
+        ("159001", "159002", "159003"),
+        reference_path,
+        "399975.SZ",
+        output_root,
+        "20260105",
+        "20260105",
+        False,
+    )
+
+    assert {result["status"] for result in results} == {"written"}
+    output = pd.read_parquet(output_root / "159001.SZ.parquet")
+    assert output["related_etf_price_spread"].iloc[1:].notna().all()
+    assert output["related_etf_liquidity_gap"].iloc[29:].notna().all()

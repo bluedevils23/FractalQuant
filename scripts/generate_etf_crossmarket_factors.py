@@ -6,6 +6,7 @@ import argparse
 import logging
 import os
 import sys
+from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
@@ -92,6 +93,35 @@ def build_crossmarket_factors() -> tuple[object, ...]:
 FACTOR_COLUMNS = tuple(
     factor.name for factor in build_crossmarket_factors()
 )
+ETF_INDEX_RELATIVE_VALUE_COLUMNS = (
+    "etf_index_return_gap_1m",
+    "etf_index_return_gap_5m",
+    "etf_index_return_gap_10m",
+    "etf_index_return_gap_30m",
+    "etf_index_beta_residual_return",
+    "etf_index_leadlag_corr",
+    "etf_index_tracking_error",
+    "etf_index_realized_vol_ratio",
+    "etf_index_volume_shock_gap",
+    "etf_index_momentum_divergence",
+    "etf_fair_value_premium",
+    "etf_fair_value_premium_zscore",
+    "premium_mean_reversion_speed",
+    "premium_change_1m",
+    "premium_change_5m",
+)
+RELATED_ETF_FACTOR_COLUMNS = (
+    "related_etf_price_spread",
+    "related_etf_liquidity_gap",
+)
+ALL_FACTOR_COLUMNS = (
+    FACTOR_COLUMNS
+    + ETF_INDEX_RELATIVE_VALUE_COLUMNS
+    + RELATED_ETF_FACTOR_COLUMNS
+)
+ROLLING_WINDOW = 60
+ROLLING_MIN_PERIODS = 30
+VOLATILITY_WINDOW = 30
 
 
 def normalize_fund_code(value: object) -> str:
@@ -232,7 +262,7 @@ def filter_date_range(
     return frame.loc[mask].copy()
 
 
-def normalize_close_frame(raw_frame: pd.DataFrame) -> pd.DataFrame:
+def normalize_reference_frame(raw_frame: pd.DataFrame) -> pd.DataFrame:
     frame = raw_frame.copy()
     if isinstance(frame.index, pd.MultiIndex) and (
         "trade_time" in frame.index.names
@@ -249,15 +279,22 @@ def normalize_close_frame(raw_frame: pd.DataFrame) -> pd.DataFrame:
             "Cannot locate trade_time/datetime index or column."
         )
 
-    if "close" not in frame.columns:
-        raise ValueError("Reference minute frame is missing close")
+    required = ("open", "close", "volume", "amount")
+    if "vol" in frame.columns and "volume" not in frame.columns:
+        frame = frame.rename(columns={"vol": "volume"})
+    missing = [column for column in required if column not in frame.columns]
+    if missing:
+        raise ValueError(f"Reference minute frame is missing columns: {missing}")
     frame.index.name = "trade_time"
-    frame["close"] = pd.to_numeric(frame["close"], errors="coerce")
+    for column in required:
+        frame[column] = pd.to_numeric(frame[column], errors="coerce")
     frame = frame.sort_index()
-    return frame.loc[~frame.index.duplicated(keep="last"), ["close"]]
+    return frame.loc[
+        ~frame.index.duplicated(keep="last"), list(required)
+    ]
 
 
-def read_reference_close_frame(
+def read_reference_frame(
     reference_path: Path,
     date_from: pd.Timestamp,
     date_to: pd.Timestamp,
@@ -269,12 +306,224 @@ def read_reference_close_frame(
     try:
         raw_frame = pd.read_parquet(
             reference_path,
-            columns=["close"],
+            columns=["open", "close", "vol", "amount"],
             filters=filters,
         )
     except (TypeError, ValueError, NotImplementedError):
-        raw_frame = pd.read_parquet(reference_path, columns=["close"])
-    return normalize_close_frame(raw_frame)
+        raw_frame = pd.read_parquet(
+            reference_path, columns=["open", "close", "vol", "amount"]
+        )
+    return normalize_reference_frame(raw_frame)
+
+
+def _log_return(close: pd.Series, periods: int = 1) -> pd.Series:
+    valid_close = pd.to_numeric(close, errors="coerce").where(
+        lambda values: values.gt(0)
+    )
+    return np.log(valid_close).diff(periods)
+
+
+def _rolling_zscore(values: pd.Series) -> pd.Series:
+    mean = values.rolling(ROLLING_WINDOW, min_periods=ROLLING_MIN_PERIODS).mean()
+    std = values.rolling(ROLLING_WINDOW, min_periods=ROLLING_MIN_PERIODS).std()
+    return values.sub(mean).div(std.where(std.gt(0)))
+
+
+def _mean_reversion_speed(premium: pd.Series) -> pd.Series:
+    lagged = premium.shift(1)
+    covariance = premium.rolling(
+        ROLLING_WINDOW, min_periods=ROLLING_MIN_PERIODS
+    ).cov(lagged)
+    variance = lagged.rolling(
+        ROLLING_WINDOW, min_periods=ROLLING_MIN_PERIODS
+    ).var()
+    phi = covariance.div(variance.where(variance.gt(0)))
+    return -np.log(phi.where(phi.gt(0) & phi.lt(1)))
+
+
+def _calculate_day_relative_value_factors(
+    etf_day: pd.DataFrame,
+    reference_day: pd.DataFrame,
+) -> pd.DataFrame:
+    result = pd.DataFrame(
+        np.nan,
+        index=etf_day.index,
+        columns=ETF_INDEX_RELATIVE_VALUE_COLUMNS,
+        dtype=float,
+    )
+    reference = reference_day.reindex(etf_day.index)
+    etf_close = pd.to_numeric(etf_day["close"], errors="coerce")
+    reference_close = pd.to_numeric(reference["close"], errors="coerce")
+    etf_return = _log_return(etf_close)
+    reference_return = _log_return(reference_close)
+
+    return_gaps: dict[int, pd.Series] = {}
+    for horizon in (1, 5, 10, 30):
+        gap = _log_return(etf_close, horizon).sub(
+            _log_return(reference_close, horizon)
+        )
+        result[f"etf_index_return_gap_{horizon}m"] = gap
+        return_gaps[horizon] = gap
+
+    historical_etf_return = etf_return.shift(1)
+    historical_reference_return = reference_return.shift(1)
+    valid_history = (
+        historical_etf_return.notna() & historical_reference_return.notna()
+    )
+    beta_covariance = historical_etf_return.where(valid_history).rolling(
+        ROLLING_WINDOW, min_periods=ROLLING_MIN_PERIODS
+    ).cov(historical_reference_return.where(valid_history))
+    beta_variance = historical_reference_return.where(valid_history).rolling(
+        ROLLING_WINDOW, min_periods=ROLLING_MIN_PERIODS
+    ).var()
+    beta = beta_covariance.div(beta_variance.where(beta_variance.gt(0)))
+    result["etf_index_beta_residual_return"] = etf_return.sub(
+        beta.mul(reference_return)
+    )
+    result["etf_index_leadlag_corr"] = etf_return.rolling(
+        ROLLING_WINDOW, min_periods=ROLLING_MIN_PERIODS
+    ).corr(reference_return.shift(1))
+
+    active_return = etf_return.sub(reference_return)
+    result["etf_index_tracking_error"] = active_return.rolling(
+        VOLATILITY_WINDOW, min_periods=VOLATILITY_WINDOW
+    ).std()
+    etf_volatility = etf_return.rolling(
+        VOLATILITY_WINDOW, min_periods=VOLATILITY_WINDOW
+    ).std()
+    reference_volatility = reference_return.rolling(
+        VOLATILITY_WINDOW, min_periods=VOLATILITY_WINDOW
+    ).std()
+    result["etf_index_realized_vol_ratio"] = etf_volatility.div(
+        reference_volatility.where(reference_volatility.gt(0))
+    )
+
+    etf_amount = np.log1p(pd.to_numeric(etf_day["amount"], errors="coerce"))
+    reference_amount = np.log1p(
+        pd.to_numeric(reference["amount"], errors="coerce")
+    )
+    result["etf_index_volume_shock_gap"] = _rolling_zscore(etf_amount).sub(
+        _rolling_zscore(reference_amount)
+    )
+    result["etf_index_momentum_divergence"] = return_gaps[5].sub(
+        return_gaps[30]
+    )
+
+    etf_open = pd.to_numeric(etf_day["open"], errors="coerce").where(
+        lambda values: values.gt(0)
+    )
+    reference_open = pd.to_numeric(reference["open"], errors="coerce").where(
+        lambda values: values.gt(0)
+    )
+    if etf_open.notna().any() and reference_open.notna().any():
+        fair_value = etf_open.dropna().iloc[0] * reference_close.div(
+            reference_open.dropna().iloc[0]
+        )
+        premium = etf_close.div(fair_value.where(fair_value.gt(0))).sub(1.0)
+        result["etf_fair_value_premium"] = premium
+        result["etf_fair_value_premium_zscore"] = _rolling_zscore(premium)
+        result["premium_mean_reversion_speed"] = _mean_reversion_speed(
+            premium
+        )
+        result["premium_change_1m"] = premium.diff(1)
+        result["premium_change_5m"] = premium.diff(5)
+    return result.replace([np.inf, -np.inf], np.nan)
+
+
+def calculate_related_etf_factor_frames(
+    member_frames: dict[str, pd.DataFrame],
+) -> dict[str, pd.DataFrame]:
+    results = {
+        code: pd.DataFrame(
+            np.nan,
+            index=frame.index,
+            columns=RELATED_ETF_FACTOR_COLUMNS,
+            dtype=float,
+        )
+        for code, frame in member_frames.items()
+    }
+    if len(member_frames) < 2:
+        return results
+
+    for day_frames in _group_frames_by_trade_day(member_frames).values():
+        cumulative_returns = pd.concat(
+            {
+                code: _day_cumulative_return(frame)
+                for code, frame in day_frames.items()
+            },
+            axis=1,
+        ).sort_index()
+        amount_panel = pd.concat(
+            {
+                code: pd.to_numeric(frame["amount"], errors="coerce")
+                for code, frame in day_frames.items()
+            },
+            axis=1,
+        ).reindex(cumulative_returns.index)
+        liquidity_shocks = pd.concat(
+            {
+                code: _rolling_zscore(
+                    np.log1p(pd.to_numeric(frame["amount"], errors="coerce"))
+                )
+                for code, frame in day_frames.items()
+            },
+            axis=1,
+        ).reindex(cumulative_returns.index)
+        weights = amount_panel.shift(1).where(lambda values: values.gt(0))
+
+        for fund_code, frame in day_frames.items():
+            peer_weights = weights.drop(columns=fund_code)
+            peer_returns = cumulative_returns.drop(columns=fund_code)
+            peer_liquidity_shocks = liquidity_shocks.drop(columns=fund_code)
+            return_weights = peer_weights.where(peer_returns.notna())
+            liquidity_weights = peer_weights.where(
+                peer_liquidity_shocks.notna()
+            )
+            peer_return = peer_returns.mul(return_weights).sum(
+                axis=1, min_count=1
+            ).div(return_weights.sum(axis=1, min_count=1).where(
+                lambda values: values.gt(0)
+            ))
+            peer_liquidity = peer_liquidity_shocks.mul(liquidity_weights).sum(
+                axis=1, min_count=1
+            ).div(liquidity_weights.sum(axis=1, min_count=1).where(
+                lambda values: values.gt(0)
+            ))
+            related = pd.DataFrame(
+                {
+                    "related_etf_price_spread": cumulative_returns[fund_code].sub(
+                        peer_return
+                    ),
+                    "related_etf_liquidity_gap": liquidity_shocks[fund_code].sub(
+                        peer_liquidity
+                    ),
+                },
+                index=cumulative_returns.index,
+            )
+            results[fund_code].loc[frame.index, RELATED_ETF_FACTOR_COLUMNS] = (
+                related.reindex(frame.index)
+            )
+    return results
+
+
+def _group_frames_by_trade_day(
+    member_frames: dict[str, pd.DataFrame],
+) -> dict[pd.Timestamp, dict[str, pd.DataFrame]]:
+    grouped: dict[pd.Timestamp, dict[str, pd.DataFrame]] = defaultdict(dict)
+    for fund_code, frame in member_frames.items():
+        for trade_day, day_frame in frame.groupby(frame.index.normalize(), sort=False):
+            grouped[trade_day][fund_code] = day_frame
+    return grouped
+
+
+def _day_cumulative_return(frame: pd.DataFrame) -> pd.Series:
+    close = pd.to_numeric(frame["close"], errors="coerce")
+    open_price = pd.to_numeric(frame["open"], errors="coerce").where(
+        lambda values: values.gt(0)
+    )
+    if not open_price.notna().any():
+        return pd.Series(np.nan, index=frame.index, dtype=float)
+    return close.div(open_price.dropna().iloc[0]).sub(1.0)
 
 
 def _calculate_day_factors(
@@ -284,10 +533,13 @@ def _calculate_day_factors(
     result = pd.DataFrame(
         np.nan,
         index=etf_day.index,
-        columns=FACTOR_COLUMNS,
+        columns=ALL_FACTOR_COLUMNS,
         dtype=float,
     )
     aligned_reference = reference_day.reindex(etf_day.index)
+    result.loc[:, ETF_INDEX_RELATIVE_VALUE_COLUMNS] = (
+        _calculate_day_relative_value_factors(etf_day, reference_day)
+    )
     current_close = pd.to_numeric(etf_day["close"], errors="coerce")
     reference_close = pd.to_numeric(
         aligned_reference["close"], errors="coerce"
@@ -325,7 +577,7 @@ def calculate_crossmarket_factor_frame(
     result = pd.DataFrame(
         np.nan,
         index=etf_frame.index,
-        columns=FACTOR_COLUMNS,
+        columns=ALL_FACTOR_COLUMNS,
         dtype=float,
     )
     for trade_day, etf_day in etf_frame.groupby(
@@ -339,7 +591,7 @@ def calculate_crossmarket_factor_frame(
         result.loc[etf_day.index] = _calculate_day_factors(
             etf_day, reference_day
         )
-    return result
+    return result.replace([np.inf, -np.inf], np.nan)
 
 
 def build_output_frame(
@@ -391,7 +643,7 @@ def process_mapping_record(
             "etf_code": etf_path.stem,
             "output_path": output_path,
         }
-    reference_frame = read_reference_close_frame(
+    reference_frame = read_reference_frame(
         reference_path,
         etf_frame.index.min(),
         etf_frame.index.max(),
@@ -410,7 +662,7 @@ def process_mapping_record(
 
     output_root.mkdir(parents=True, exist_ok=True)
     result.to_parquet(output_path)
-    factor_values = result.loc[:, FACTOR_COLUMNS]
+    factor_values = result.loc[:, ALL_FACTOR_COLUMNS]
     return {
         "status": "written",
         "etf_code": etf_path.stem,
@@ -420,6 +672,103 @@ def process_mapping_record(
         "cols": len(result.columns),
         "factor_non_null": int(factor_values.notna().sum().sum()),
     }
+
+
+def process_mapping_group(
+    member_paths: dict[str, Path],
+    target_codes: tuple[str, ...],
+    reference_path: Path,
+    mapping_reference_code: str,
+    output_root: Path,
+    date_from: str | None,
+    date_to: str | None,
+    overwrite: bool,
+) -> list[dict[str, object]]:
+    writable_targets: list[str] = []
+    results: list[dict[str, object]] = []
+    for fund_code in target_codes:
+        output_path = output_root / member_paths[fund_code].name
+        if output_path.exists() and not overwrite:
+            results.append(
+                {
+                    "status": "skipped",
+                    "etf_code": member_paths[fund_code].stem,
+                    "output_path": output_path,
+                }
+            )
+        else:
+            writable_targets.append(fund_code)
+    if not writable_targets:
+        return results
+
+    member_frames = {
+        fund_code: filter_date_range(
+            normalize_minute_frame(pd.read_parquet(path)), date_from, date_to
+        )
+        for fund_code, path in member_paths.items()
+    }
+    member_frames = {
+        fund_code: frame
+        for fund_code, frame in member_frames.items()
+        if not frame.empty
+    }
+    if not member_frames:
+        return results + [
+            {
+                "status": "empty",
+                "etf_code": member_paths[fund_code].stem,
+                "output_path": output_root / member_paths[fund_code].name,
+            }
+            for fund_code in writable_targets
+        ]
+
+    reference_frame = read_reference_frame(
+        reference_path,
+        min(frame.index.min() for frame in member_frames.values()),
+        max(frame.index.max() for frame in member_frames.values()),
+    )
+    related_frames = calculate_related_etf_factor_frames(member_frames)
+    output_root.mkdir(parents=True, exist_ok=True)
+    for fund_code in writable_targets:
+        etf_frame = member_frames.get(fund_code)
+        output_path = output_root / member_paths[fund_code].name
+        if etf_frame is None:
+            results.append(
+                {
+                    "status": "empty",
+                    "etf_code": member_paths[fund_code].stem,
+                    "output_path": output_path,
+                }
+            )
+            continue
+        factor_frame = calculate_crossmarket_factor_frame(
+            etf_frame, reference_frame
+        )
+        factor_frame.loc[:, RELATED_ETF_FACTOR_COLUMNS] = related_frames[
+            fund_code
+        ].reindex(factor_frame.index)
+        result = build_output_frame(
+            etf_frame,
+            reference_frame,
+            mapping_reference_code,
+            reference_path.stem,
+            factor_frame,
+        )
+        result.to_parquet(output_path)
+        results.append(
+            {
+                "status": "written",
+                "etf_code": member_paths[fund_code].stem,
+                "reference_code": reference_path.stem,
+                "output_path": output_path,
+                "rows": len(result),
+                "cols": len(result.columns),
+                "factor_non_null": int(
+                    result.loc[:, ALL_FACTOR_COLUMNS].notna().sum().sum()
+                ),
+            }
+        )
+    return results
 
 
 def parse_args() -> argparse.Namespace:
@@ -502,7 +851,7 @@ def main() -> int:
                 "ETF minute files missing: " + ", ".join(missing_etf)
             )
 
-    jobs: list[tuple[Path, Path, str]] = []
+    selected_records: list[tuple[str, Path, MappingRecord, Path]] = []
     missing_references: list[tuple[str, str]] = []
     alias_count = 0
     for fund_code in selected_codes:
@@ -521,15 +870,53 @@ def main() -> int:
             )
             continue
         alias_count += int(match_type == "stem")
-        jobs.append(
-            (etf_path, reference_path, mapping.reference_index_code)
-        )
+        selected_records.append((fund_code, etf_path, mapping, reference_path))
 
     if args.limit is not None:
-        jobs = jobs[: args.limit]
+        selected_records = selected_records[: args.limit]
+
+    selected_by_reference: dict[
+        str, list[tuple[str, Path, MappingRecord, Path]]
+    ] = defaultdict(list)
+    for record in selected_records:
+        selected_by_reference[record[2].reference_index_code].append(record)
+
+    jobs: list[
+        tuple[
+            dict[str, Path],
+            tuple[str, ...],
+            Path,
+            str,
+            Path,
+            str | None,
+            str | None,
+            bool,
+        ]
+    ] = []
+    for reference_code, targets in selected_by_reference.items():
+        member_paths = {
+            fund_code: etf_path
+            for fund_code, mapping in mappings.items()
+            if mapping.reference_index_code == reference_code
+            and (etf_path := etf_files.get(fund_code)) is not None
+        }
+        if not member_paths:
+            continue
+        jobs.append(
+            (
+                member_paths,
+                tuple(fund_code for fund_code, _, _, _ in targets),
+                targets[0][3],
+                reference_code,
+                args.output_root,
+                date_from,
+                date_to,
+                args.overwrite,
+            )
+        )
 
     LOGGER.info(
-        "Prepared %s ETF/reference jobs; %s use code-stem aliases",
+        "Prepared %s ETF/reference groups; %s selected ETFs use code-stem aliases",
         len(jobs),
         alias_count,
     )
@@ -552,45 +939,28 @@ def main() -> int:
     worker_count = max(1, int(args.workers))
     if worker_count == 1:
         results = []
-        for etf_path, reference_path, mapping_code in jobs:
+        for job in jobs:
             try:
-                results.append(
-                    process_mapping_record(
-                        etf_path,
-                        reference_path,
-                        mapping_code,
-                        args.output_root,
-                        date_from,
-                        date_to,
-                        args.overwrite,
-                    )
-                )
+                results.extend(process_mapping_group(*job))
             except Exception as exc:  # noqa: BLE001
-                failures.append((etf_path.stem, str(exc)))
-                LOGGER.exception("Failed to process %s", etf_path)
+                failures.append((job[3], str(exc)))
+                LOGGER.exception("Failed to process reference %s", job[3])
     else:
         results = []
         with ProcessPoolExecutor(max_workers=worker_count) as executor:
             future_map = {
-                executor.submit(
-                    process_mapping_record,
-                    etf_path,
-                    reference_path,
-                    mapping_code,
-                    args.output_root,
-                    date_from,
-                    date_to,
-                    args.overwrite,
-                ): etf_path
-                for etf_path, reference_path, mapping_code in jobs
+                executor.submit(process_mapping_group, *job): job[3]
+                for job in jobs
             }
             for future in as_completed(future_map):
-                etf_path = future_map[future]
+                reference_code = future_map[future]
                 try:
-                    results.append(future.result())
+                    results.extend(future.result())
                 except Exception as exc:  # noqa: BLE001
-                    failures.append((etf_path.stem, str(exc)))
-                    LOGGER.exception("Failed to process %s", etf_path)
+                    failures.append((reference_code, str(exc)))
+                    LOGGER.exception(
+                        "Failed to process reference %s", reference_code
+                    )
 
     for result in results:
         if result["status"] == "written":
