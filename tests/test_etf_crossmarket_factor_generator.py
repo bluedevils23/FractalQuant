@@ -14,12 +14,15 @@ if str(PROJECT_ROOT) not in sys.path:
 from factor.crossmarket import CrossMarketCorrelationFactor
 from scripts.generate_etf_crossmarket_factors import (
     ALL_FACTOR_COLUMNS,
+    DAILY_STATE_COLUMNS,
     ETF_INDEX_RELATIVE_VALUE_COLUMNS,
     FACTOR_COLUMNS,
     RELATED_ETF_FACTOR_COLUMNS,
+    align_previous_daily_state,
     build_index_file_lookup,
     calculate_related_etf_factor_frames,
     calculate_crossmarket_factor_frame,
+    load_etf_daily_histories,
     load_mapping_records,
     process_mapping_group,
     process_mapping_record,
@@ -78,7 +81,15 @@ def _raw_parquet_frame(
     *,
     reference: bool,
 ) -> pd.DataFrame:
-    frame = _minute_frame((trade_day,), reference=reference).rename(
+    return _raw_parquet_days((trade_day,), reference=reference)
+
+
+def _raw_parquet_days(
+    trade_days: tuple[str, ...],
+    *,
+    reference: bool,
+) -> pd.DataFrame:
+    frame = _minute_frame(trade_days, reference=reference).rename(
         columns={"volume": "vol"}
     )
     trade_dates = frame.index.strftime("%Y-%m-%d")
@@ -86,6 +97,52 @@ def _raw_parquet_frame(
         trade_date=trade_dates,
         trade_time=frame.index,
     ).set_index(["trade_date", "trade_time"])
+
+
+def _daily_state_frame(
+    index: pd.DatetimeIndex,
+    *,
+    nav: float,
+    total_size: float,
+    total_share: float,
+) -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "prev_nav": nav,
+            "prev_total_size": total_size,
+            "prev_total_share": total_share,
+        },
+        index=index,
+    )
+
+
+def _write_daily_file(
+    path: Path,
+    codes: tuple[str, ...],
+    *,
+    previous_nav: float = 1.0,
+) -> None:
+    rows = []
+    for number, code in enumerate(codes, start=1):
+        rows.extend(
+            [
+                {
+                    "trade_date": pd.Timestamp("2026-01-02"),
+                    "ts_code": f"{code}.SZ",
+                    "nav": previous_nav * number,
+                    "total_size": 1_000.0 * number,
+                    "total_share": 900.0 * number,
+                },
+                {
+                    "trade_date": pd.Timestamp("2026-01-05"),
+                    "ts_code": f"{code}.SZ",
+                    "nav": 100.0 * number,
+                    "total_size": 100_000.0 * number,
+                    "total_share": 90_000.0 * number,
+                },
+            ]
+        )
+    pd.DataFrame(rows).set_index(["trade_date", "ts_code"]).to_parquet(path)
 
 
 def test_mapping_and_reference_resolution_support_code_stem_alias(
@@ -164,15 +221,24 @@ def test_all_crossmarket_factors_reset_each_trade_day() -> None:
         ("2026-01-05", "2026-01-06"), reference=True
     )
 
-    factors = calculate_crossmarket_factor_frame(etf, reference)
+    daily_state = _daily_state_frame(
+        etf.index, nav=1.0, total_size=1_000.0, total_share=900.0
+    )
+    factors = calculate_crossmarket_factor_frame(
+        etf, reference, daily_state
+    )
 
     assert tuple(factors.columns) == ALL_FACTOR_COLUMNS
-    for _, day in factors.groupby(factors.index.normalize()):
+    for trade_day, day in factors.groupby(factors.index.normalize()):
         assert day.loc[:, FACTOR_COLUMNS].iloc[:49].isna().all().all()
         assert day.loc[:, FACTOR_COLUMNS].iloc[49:].notna().all().all()
-        assert day["etf_fair_value_premium"].notna().all()
-        assert pd.isna(day["etf_index_return_gap_1m"].iloc[0])
-        assert day["etf_index_return_gap_1m"].iloc[1:].notna().all()
+        assert day["etf_index_intraday_price_gap"].notna().all()
+        assert pd.isna(day["etf_index_basis_1m"].iloc[0])
+        assert day["etf_index_basis_1m"].iloc[1:].notna().all()
+        if trade_day == pd.Timestamp("2026-01-05"):
+            assert day["etf_fair_value_gap_proxy_1m"].isna().all()
+        else:
+            assert day["etf_fair_value_gap_proxy_1m"].notna().all()
         assert day.loc[:, RELATED_ETF_FACTOR_COLUMNS].isna().all().all()
     assert (factors.loc[:, FACTOR_COLUMNS].iloc[49:].notna().sum() > 0).all()
     assert not (factors.loc[:, "cointegration"].fillna(0) == 0).all()
@@ -182,44 +248,85 @@ def test_all_crossmarket_factors_reset_each_trade_day() -> None:
 
 def test_relative_value_factors_use_same_minute_data_without_future_rows() -> None:
     etf = _minute_frame(("2026-01-05",))
-    reference = _minute_frame(("2026-01-05",), reference=True)
-    factors = calculate_crossmarket_factor_frame(etf, reference)
+    current_reference = _minute_frame(("2026-01-05",), reference=True)
+    previous_reference = pd.DataFrame(
+        {
+            "open": 2_990.0,
+            "high": 2_990.0,
+            "low": 2_990.0,
+            "close": 2_990.0,
+            "volume": 1_000.0,
+            "amount": 3_000_000.0,
+        },
+        index=pd.DatetimeIndex(
+            [pd.Timestamp("2026-01-02 15:00:00")], name="trade_time"
+        ),
+    )
+    reference = pd.concat([previous_reference, current_reference])
+    daily_state = _daily_state_frame(
+        etf.index, nav=1.02, total_size=1_000.0, total_share=900.0
+    )
+    factors = calculate_crossmarket_factor_frame(
+        etf, reference, daily_state
+    )
     point = factors.index[40]
     previous = factors.index[39]
 
-    expected_gap = np.log(etf.loc[point, "close"] / etf.loc[previous, "close"])
-    expected_gap -= np.log(
-        reference.loc[point, "close"] / reference.loc[previous, "close"]
+    expected_basis = etf.loc[point, "close"] / etf.loc[previous, "close"] - 1.0
+    expected_basis -= (
+        reference.loc[point, "close"] / reference.loc[previous, "close"] - 1.0
     )
-    expected_fair_value = etf["open"].iloc[0] * (
-        reference.loc[point, "close"] / reference["open"].iloc[0]
+    expected_fair_value = 1.02 * (
+        reference.loc[point, "close"] / previous_reference["close"].iloc[-1]
     )
-    assert np.isclose(factors.loc[point, "etf_index_return_gap_1m"], expected_gap)
+    assert np.isclose(factors.loc[point, "etf_index_basis_1m"], expected_basis)
     assert np.isclose(
-        factors.loc[point, "etf_fair_value_premium"],
+        factors.loc[point, "etf_fair_value_gap_proxy_1m"],
         etf.loc[point, "close"] / expected_fair_value - 1.0,
     )
+    fair_gap = factors["etf_fair_value_gap_proxy_1m"]
+    assert np.isclose(
+        factors.loc[point, "basis_reversion_signal_5m"],
+        -(fair_gap.loc[point] - fair_gap.iloc[35]),
+    )
+    assert factors["etf_basis_zscore_20m"].iloc[:20].isna().all()
+    assert factors["etf_basis_zscore_20m"].iloc[20:].notna().all()
     assert factors.loc[point, "etf_index_tracking_error"] >= 0
     assert factors.loc[point, "etf_index_realized_vol_ratio"] > 0
 
+    missing_nav_state = daily_state.copy()
+    missing_nav_state["prev_nav"] = np.nan
+    missing_nav_factors = calculate_crossmarket_factor_frame(
+        etf, reference, missing_nav_state
+    )
+    assert missing_nav_factors["etf_fair_value_gap_proxy_1m"].isna().all()
+    assert missing_nav_factors["basis_reversion_signal_5m"].isna().all()
+    assert missing_nav_factors["etf_index_basis_1m"].iloc[1:].notna().all()
+
     missing_same_minute = reference.drop(point)
-    missing_factors = calculate_crossmarket_factor_frame(etf, missing_same_minute)
-    assert pd.isna(missing_factors.loc[point, "etf_index_return_gap_1m"])
-    assert pd.isna(missing_factors.loc[point, "etf_fair_value_premium"])
+    missing_factors = calculate_crossmarket_factor_frame(
+        etf, missing_same_minute, daily_state
+    )
+    assert pd.isna(missing_factors.loc[point, "etf_index_basis_1m"])
+    assert pd.isna(
+        missing_factors.loc[point, "etf_fair_value_gap_proxy_1m"]
+    )
 
     changed_future = reference.copy()
-    changed_future.loc[reference.index[60]:, "close"] *= 1.2
-    changed_future.loc[reference.index[60]:, "amount"] *= 5.0
-    changed_factors = calculate_crossmarket_factor_frame(etf, changed_future)
+    changed_future.loc[etf.index[60]:, "close"] *= 1.2
+    changed_future.loc[etf.index[60]:, "amount"] *= 5.0
+    changed_factors = calculate_crossmarket_factor_frame(
+        etf, changed_future, daily_state
+    )
     pd.testing.assert_frame_equal(
-        factors.loc[: reference.index[59], list(ETF_INDEX_RELATIVE_VALUE_COLUMNS)],
+        factors.loc[: etf.index[59], list(ETF_INDEX_RELATIVE_VALUE_COLUMNS)],
         changed_factors.loc[
-            : reference.index[59], list(ETF_INDEX_RELATIVE_VALUE_COLUMNS)
+            : etf.index[59], list(ETF_INDEX_RELATIVE_VALUE_COLUMNS)
         ],
     )
 
 
-def test_related_etf_factors_are_leave_one_out_and_lag_weighted() -> None:
+def test_related_etf_factors_use_p1_and_renamed_legacy_definitions() -> None:
     index = pd.date_range("2026-01-05 09:30:00", periods=70, freq="min")
     steps = np.arange(len(index), dtype=float)
     frames: dict[str, pd.DataFrame] = {}
@@ -229,39 +336,74 @@ def test_related_etf_factors_are_leave_one_out_and_lag_weighted() -> None:
         frame["amount"] = 100.0 * multiplier + steps
         frames[code] = frame
 
-    related = calculate_related_etf_factor_frames(frames)
+    daily_states = {
+        code: _daily_state_frame(
+            frame.index,
+            nav=float(multiplier),
+            total_size=1_000.0 * multiplier,
+            total_share=900.0 * multiplier,
+        )
+        for multiplier, (code, frame) in enumerate(frames.items(), start=1)
+    }
+    related = calculate_related_etf_factor_frames(frames, daily_states)
     point = index[10]
     previous = index[9]
     peer_returns = np.array(
         [
             frames["159002"].loc[point, "close"]
-            / frames["159002"]["open"].iloc[0]
+            / frames["159002"].loc[previous, "close"]
             - 1.0,
             frames["159003"].loc[point, "close"]
-            / frames["159003"]["open"].iloc[0]
+            / frames["159003"].loc[previous, "close"]
             - 1.0,
         ]
     )
-    peer_weights = np.array(
+    own_return = (
+        frames["159001"].loc[point, "close"]
+        / frames["159001"].loc[previous, "close"]
+        - 1.0
+    )
+    expected_relative_return = own_return - peer_returns.mean()
+    peer_liquidity = np.array(
         [
-            frames["159002"].loc[previous, "amount"],
-            frames["159003"].loc[previous, "amount"],
+            frames["159002"].loc[point, "amount"] / (2_000.0 * 10_000.0),
+            frames["159003"].loc[point, "amount"] / (3_000.0 * 10_000.0),
         ]
     )
-    expected_spread = (
-        frames["159001"].loc[point, "close"] / frames["159001"]["open"].iloc[0]
-        - 1.0
-        - np.average(peer_returns, weights=peer_weights)
+    expected_relative_liquidity = (
+        frames["159001"].loc[point, "amount"] / (1_000.0 * 10_000.0)
+        - peer_liquidity.mean()
     )
 
     assert np.isclose(
-        related["159001"].loc[point, "related_etf_price_spread"],
-        expected_spread,
+        related["159001"].loc[point, "same_index_relative_return_1m"],
+        expected_relative_return,
     )
-    assert related["159001"]["related_etf_liquidity_gap"].iloc[:29].isna().all()
-    assert related["159001"]["related_etf_liquidity_gap"].iloc[29:].notna().all()
+    assert np.isclose(
+        related["159001"].loc[point, "same_index_relative_liquidity_1m"],
+        expected_relative_liquidity,
+    )
+    assert related["159001"][
+        "same_index_intraday_cumulative_return_gap"
+    ].iloc[1:].notna().all()
+    assert related["159001"][
+        "same_index_relative_amount_shock_60m"
+    ].iloc[:29].isna().all()
+    assert related["159001"][
+        "same_index_relative_amount_shock_60m"
+    ].iloc[29:].notna().all()
+    missing_aum_states = {
+        code: state.copy() for code, state in daily_states.items()
+    }
+    missing_aum_states["159001"]["prev_total_size"] = np.nan
+    missing_aum = calculate_related_etf_factor_frames(
+        frames, missing_aum_states
+    )["159001"]
+    assert missing_aum["same_index_relative_liquidity_1m"].isna().all()
+    assert missing_aum["same_index_relative_return_1m"].iloc[1:].notna().all()
     assert calculate_related_etf_factor_frames(
-        {"159001": frames["159001"]}
+        {"159001": frames["159001"]},
+        {"159001": daily_states["159001"]},
     )["159001"].isna().all().all()
 
 
@@ -293,12 +435,42 @@ def test_process_mapping_record_writes_reference_metadata(
     assert output["reference_index_code"].eq("399975.SZ").all()
     assert output["reference_ts_code"].eq("399975.SZ").all()
     assert output["reference_close"].notna().all()
+    assert set(DAILY_STATE_COLUMNS) <= set(output.columns)
+
+
+def test_daily_state_uses_only_immediately_previous_record(
+    tmp_path: Path,
+) -> None:
+    daily_path = tmp_path / "etf_daily.parquet"
+    minute_path = tmp_path / "159008.SZ.parquet"
+    minute_path.touch()
+    _write_daily_file(daily_path, ("159008",), previous_nav=1.03)
+
+    history = load_etf_daily_histories(
+        daily_path, {"159008": minute_path}
+    )["159008"]
+    minute_index = pd.date_range(
+        "2026-01-05 09:30:00", periods=3, freq="min"
+    )
+    state = align_previous_daily_state(minute_index, history)
+
+    assert state["prev_nav"].eq(1.03).all()
+    assert state["prev_total_size"].eq(1_000.0).all()
+    assert state["prev_total_share"].eq(900.0).all()
+
+    history.loc[pd.Timestamp("2026-01-02"), "nav"] = np.nan
+    missing = align_previous_daily_state(minute_index, history)
+    assert missing["prev_nav"].isna().all()
+    assert missing["prev_total_size"].eq(1_000.0).all()
 
 
 def test_process_mapping_group_writes_related_etf_factors(tmp_path: Path) -> None:
     reference_path = tmp_path / "399975.SZ.parquet"
+    daily_path = tmp_path / "etf_daily.parquet"
     output_root = tmp_path / "output"
-    _raw_parquet_frame("2026-01-05", reference=True).to_parquet(reference_path)
+    _raw_parquet_days(
+        ("2026-01-02", "2026-01-05"), reference=True
+    ).to_parquet(reference_path)
     member_paths: dict[str, Path] = {}
     for multiplier, code in enumerate(("159001", "159002", "159003"), start=1):
         path = tmp_path / f"{code}.SZ.parquet"
@@ -309,12 +481,16 @@ def test_process_mapping_group_writes_related_etf_factors(tmp_path: Path) -> Non
         frame["amount"] = 100.0 * multiplier + np.arange(len(frame), dtype=float)
         frame.to_parquet(path)
         member_paths[code] = path
+    _write_daily_file(
+        daily_path, ("159001", "159002", "159003"), previous_nav=1.0
+    )
 
     results = process_mapping_group(
         member_paths,
         ("159001", "159002", "159003"),
         reference_path,
         "399975.SZ",
+        daily_path,
         output_root,
         "20260105",
         "20260105",
@@ -323,5 +499,25 @@ def test_process_mapping_group_writes_related_etf_factors(tmp_path: Path) -> Non
 
     assert {result["status"] for result in results} == {"written"}
     output = pd.read_parquet(output_root / "159001.SZ.parquet")
-    assert output["related_etf_price_spread"].iloc[1:].notna().all()
-    assert output["related_etf_liquidity_gap"].iloc[29:].notna().all()
+    assert output["same_index_relative_return_1m"].iloc[1:].notna().all()
+    assert output["same_index_relative_liquidity_1m"].notna().all()
+    assert output[
+        "same_index_intraday_cumulative_return_gap"
+    ].iloc[1:].notna().all()
+    assert output[
+        "same_index_relative_amount_shock_60m"
+    ].iloc[29:].notna().all()
+    assert output["prev_nav"].eq(1.0).all()
+    assert output["prev_total_size"].eq(1_000.0).all()
+    replaced_columns = {
+        "etf_index_return_gap_1m",
+        "etf_index_return_gap_5m",
+        "etf_fair_value_premium",
+        "etf_fair_value_premium_zscore",
+        "premium_mean_reversion_speed",
+        "premium_change_1m",
+        "premium_change_5m",
+        "related_etf_price_spread",
+        "related_etf_liquidity_gap",
+    }
+    assert replaced_columns.isdisjoint(output.columns)

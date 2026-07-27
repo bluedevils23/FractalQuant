@@ -56,6 +56,9 @@ DEFAULT_MAPPING_PATH = Path(
     r"D:\workspace\stockdata\etf-data\exchange_fund_index_mapping.csv"
 )
 DEFAULT_ETF_ROOT = Path(r"D:\workspace\stockdata\etf-data\etf_1min")
+DEFAULT_ETF_DAILY_PATH = Path(
+    r"D:\workspace\stockdata\etf-data\etf_daily.parquet"
+)
 DEFAULT_INDEX_ROOT = Path(r"D:\workspace\stockdata\index-data\index_1min")
 DEFAULT_OUTPUT_ROOT = Path(
     r"D:\workspace\stockdata\etf-data\etf_1min_crossmarket_factors"
@@ -94,8 +97,13 @@ FACTOR_COLUMNS = tuple(
     factor.name for factor in build_crossmarket_factors()
 )
 ETF_INDEX_RELATIVE_VALUE_COLUMNS = (
-    "etf_index_return_gap_1m",
-    "etf_index_return_gap_5m",
+    "etf_index_basis_1m",
+    "etf_basis_zscore_20m",
+    "etf_fair_value_gap_proxy_1m",
+    "basis_reversion_signal_5m",
+    "basis_reversion_signal_20m",
+    "etf_index_intraday_price_gap",
+    "etf_index_intraday_price_gap_zscore_60m",
     "etf_index_return_gap_10m",
     "etf_index_return_gap_30m",
     "etf_index_beta_residual_return",
@@ -104,16 +112,14 @@ ETF_INDEX_RELATIVE_VALUE_COLUMNS = (
     "etf_index_realized_vol_ratio",
     "etf_index_volume_shock_gap",
     "etf_index_momentum_divergence",
-    "etf_fair_value_premium",
-    "etf_fair_value_premium_zscore",
-    "premium_mean_reversion_speed",
-    "premium_change_1m",
-    "premium_change_5m",
 )
 RELATED_ETF_FACTOR_COLUMNS = (
-    "related_etf_price_spread",
-    "related_etf_liquidity_gap",
+    "same_index_relative_return_1m",
+    "same_index_relative_liquidity_1m",
+    "same_index_intraday_cumulative_return_gap",
+    "same_index_relative_amount_shock_60m",
 )
+DAILY_STATE_COLUMNS = ("prev_nav", "prev_total_size", "prev_total_share")
 ALL_FACTOR_COLUMNS = (
     FACTOR_COLUMNS
     + ETF_INDEX_RELATIVE_VALUE_COLUMNS
@@ -122,6 +128,9 @@ ALL_FACTOR_COLUMNS = (
 ROLLING_WINDOW = 60
 ROLLING_MIN_PERIODS = 30
 VOLATILITY_WINDOW = 30
+BASIS_ZSCORE_WINDOW = 20
+TOTAL_SIZE_AMOUNT_MULTIPLIER = 10_000.0
+REFERENCE_HISTORY_DAYS = 45
 
 
 def normalize_fund_code(value: object) -> str:
@@ -299,8 +308,11 @@ def read_reference_frame(
     date_from: pd.Timestamp,
     date_to: pd.Timestamp,
 ) -> pd.DataFrame:
+    history_start = date_from.normalize() - pd.Timedelta(
+        days=REFERENCE_HISTORY_DAYS
+    )
     filters = [
-        ("trade_date", ">=", date_from.normalize()),
+        ("trade_date", ">=", history_start),
         ("trade_date", "<=", date_to.normalize()),
     ]
     try:
@@ -316,11 +328,80 @@ def read_reference_frame(
     return normalize_reference_frame(raw_frame)
 
 
+def load_etf_daily_histories(
+    etf_daily_path: Path,
+    member_paths: dict[str, Path],
+) -> dict[str, pd.DataFrame]:
+    if not etf_daily_path.exists():
+        raise FileNotFoundError(
+            f"ETF daily parquet does not exist: {etf_daily_path}"
+        )
+    symbols = sorted({path.stem.upper() for path in member_paths.values()})
+    raw = pd.read_parquet(
+        etf_daily_path,
+        columns=["nav", "total_size", "total_share"],
+        filters=[("ts_code", "in", symbols)],
+    ).reset_index()
+    required = ("trade_date", "ts_code", "nav", "total_size", "total_share")
+    missing = [column for column in required if column not in raw.columns]
+    if missing:
+        raise ValueError(f"ETF daily frame is missing columns: {missing}")
+    raw["trade_date"] = pd.to_datetime(raw["trade_date"], errors="coerce")
+    raw["_fund_code"] = raw["ts_code"].map(normalize_fund_code)
+    for column in ("nav", "total_size", "total_share"):
+        raw[column] = pd.to_numeric(raw[column], errors="coerce")
+
+    histories: dict[str, pd.DataFrame] = {}
+    for fund_code in member_paths:
+        history = raw.loc[
+            raw["_fund_code"].eq(fund_code),
+            ["trade_date", "nav", "total_size", "total_share"],
+        ].dropna(subset=["trade_date"])
+        history = history.sort_values("trade_date", kind="mergesort")
+        history = history.drop_duplicates("trade_date", keep="last")
+        histories[fund_code] = history.set_index("trade_date")
+    return histories
+
+
+def align_previous_daily_state(
+    minute_index: pd.DatetimeIndex,
+    daily_history: pd.DataFrame | None,
+) -> pd.DataFrame:
+    result = pd.DataFrame(
+        np.nan,
+        index=minute_index,
+        columns=DAILY_STATE_COLUMNS,
+        dtype=float,
+    )
+    if daily_history is None or daily_history.empty:
+        return result
+
+    history = daily_history.sort_index()
+    history_dates = pd.DatetimeIndex(history.index).normalize()
+    for trade_day in minute_index.normalize().unique():
+        position = history_dates.searchsorted(trade_day, side="left") - 1
+        if position < 0:
+            continue
+        source = history.iloc[position]
+        day_mask = minute_index.normalize() == trade_day
+        result.loc[day_mask, "prev_nav"] = source["nav"]
+        result.loc[day_mask, "prev_total_size"] = source["total_size"]
+        result.loc[day_mask, "prev_total_share"] = source["total_share"]
+    return result
+
+
 def _log_return(close: pd.Series, periods: int = 1) -> pd.Series:
     valid_close = pd.to_numeric(close, errors="coerce").where(
         lambda values: values.gt(0)
     )
     return np.log(valid_close).diff(periods)
+
+
+def _simple_return(close: pd.Series, periods: int = 1) -> pd.Series:
+    valid_close = pd.to_numeric(close, errors="coerce").where(
+        lambda values: values.gt(0)
+    )
+    return valid_close.pct_change(periods, fill_method=None)
 
 
 def _rolling_zscore(values: pd.Series) -> pd.Series:
@@ -329,21 +410,36 @@ def _rolling_zscore(values: pd.Series) -> pd.Series:
     return values.sub(mean).div(std.where(std.gt(0)))
 
 
-def _mean_reversion_speed(premium: pd.Series) -> pd.Series:
-    lagged = premium.shift(1)
-    covariance = premium.rolling(
-        ROLLING_WINDOW, min_periods=ROLLING_MIN_PERIODS
-    ).cov(lagged)
-    variance = lagged.rolling(
-        ROLLING_WINDOW, min_periods=ROLLING_MIN_PERIODS
-    ).var()
-    phi = covariance.div(variance.where(variance.gt(0)))
-    return -np.log(phi.where(phi.gt(0) & phi.lt(1)))
+def _basis_zscore_20m(basis: pd.Series) -> pd.Series:
+    mean = basis.rolling(
+        BASIS_ZSCORE_WINDOW, min_periods=BASIS_ZSCORE_WINDOW
+    ).mean()
+    std = basis.rolling(
+        BASIS_ZSCORE_WINDOW, min_periods=BASIS_ZSCORE_WINDOW
+    ).std()
+    return basis.sub(mean).div(std.where(std.gt(0)))
+
+
+def _previous_reference_close(
+    reference_frame: pd.DataFrame,
+    trade_day: pd.Timestamp,
+) -> float:
+    prior_close = pd.to_numeric(
+        reference_frame.loc[
+            reference_frame.index.normalize() < trade_day, "close"
+        ],
+        errors="coerce",
+    ).where(lambda values: values.gt(0)).dropna()
+    if prior_close.empty:
+        return np.nan
+    return float(prior_close.iloc[-1])
 
 
 def _calculate_day_relative_value_factors(
     etf_day: pd.DataFrame,
     reference_day: pd.DataFrame,
+    daily_state_day: pd.DataFrame,
+    reference_previous_close: float,
 ) -> pd.DataFrame:
     result = pd.DataFrame(
         np.nan,
@@ -357,12 +453,19 @@ def _calculate_day_relative_value_factors(
     etf_return = _log_return(etf_close)
     reference_return = _log_return(reference_close)
 
+    basis_1m = _simple_return(etf_close).sub(
+        _simple_return(reference_close)
+    )
+    result["etf_index_basis_1m"] = basis_1m
+    result["etf_basis_zscore_20m"] = _basis_zscore_20m(basis_1m)
+
     return_gaps: dict[int, pd.Series] = {}
-    for horizon in (1, 5, 10, 30):
+    for horizon in (5, 10, 30):
         gap = _log_return(etf_close, horizon).sub(
             _log_return(reference_close, horizon)
         )
-        result[f"etf_index_return_gap_{horizon}m"] = gap
+        if horizon != 5:
+            result[f"etf_index_return_gap_{horizon}m"] = gap
         return_gaps[horizon] = gap
 
     historical_etf_return = etf_return.shift(1)
@@ -416,23 +519,44 @@ def _calculate_day_relative_value_factors(
         lambda values: values.gt(0)
     )
     if etf_open.notna().any() and reference_open.notna().any():
-        fair_value = etf_open.dropna().iloc[0] * reference_close.div(
+        intraday_proxy = etf_open.dropna().iloc[0] * reference_close.div(
             reference_open.dropna().iloc[0]
         )
-        premium = etf_close.div(fair_value.where(fair_value.gt(0))).sub(1.0)
-        result["etf_fair_value_premium"] = premium
-        result["etf_fair_value_premium_zscore"] = _rolling_zscore(premium)
-        result["premium_mean_reversion_speed"] = _mean_reversion_speed(
-            premium
+        intraday_gap = etf_close.div(
+            intraday_proxy.where(intraday_proxy.gt(0))
+        ).sub(1.0)
+        result["etf_index_intraday_price_gap"] = intraday_gap
+        result["etf_index_intraday_price_gap_zscore_60m"] = (
+            _rolling_zscore(intraday_gap)
         )
-        result["premium_change_1m"] = premium.diff(1)
-        result["premium_change_5m"] = premium.diff(5)
+
+    previous_nav = pd.to_numeric(
+        daily_state_day["prev_nav"], errors="coerce"
+    ).where(lambda values: values.gt(0)).dropna()
+    if previous_nav.size and np.isfinite(reference_previous_close):
+        fair_value = previous_nav.iloc[0] * reference_close.div(
+            reference_previous_close
+        )
+        fair_value_gap = etf_close.div(
+            fair_value.where(fair_value.gt(0))
+        ).sub(1.0)
+        result["etf_fair_value_gap_proxy_1m"] = fair_value_gap
+        result["basis_reversion_signal_5m"] = -fair_value_gap.diff(5)
+        result["basis_reversion_signal_20m"] = -fair_value_gap.diff(20)
     return result.replace([np.inf, -np.inf], np.nan)
 
 
 def calculate_related_etf_factor_frames(
     member_frames: dict[str, pd.DataFrame],
+    daily_state_frames: dict[str, pd.DataFrame] | None = None,
 ) -> dict[str, pd.DataFrame]:
+    if daily_state_frames is None:
+        daily_state_frames = {
+            code: pd.DataFrame(
+                np.nan, index=frame.index, columns=DAILY_STATE_COLUMNS
+            )
+            for code, frame in member_frames.items()
+        }
     results = {
         code: pd.DataFrame(
             np.nan,
@@ -446,64 +570,114 @@ def calculate_related_etf_factor_frames(
         return results
 
     for day_frames in _group_frames_by_trade_day(member_frames).values():
-        cumulative_returns = pd.concat(
+        return_panel = pd.concat(
+            {
+                code: _simple_return(frame["close"])
+                for code, frame in day_frames.items()
+            },
+            axis=1,
+        ).sort_index()
+        cumulative_return_panel = pd.concat(
             {
                 code: _day_cumulative_return(frame)
                 for code, frame in day_frames.items()
             },
             axis=1,
-        ).sort_index()
+        ).reindex(return_panel.index)
         amount_panel = pd.concat(
             {
                 code: pd.to_numeric(frame["amount"], errors="coerce")
                 for code, frame in day_frames.items()
             },
             axis=1,
-        ).reindex(cumulative_returns.index)
-        liquidity_shocks = pd.concat(
+        ).reindex(return_panel.index)
+        liquidity_panel = pd.concat(
             {
-                code: _rolling_zscore(
-                    np.log1p(pd.to_numeric(frame["amount"], errors="coerce"))
+                code: pd.to_numeric(frame["amount"], errors="coerce").div(
+                    pd.to_numeric(
+                        daily_state_frames[code]["prev_total_size"],
+                        errors="coerce",
+                    ).mul(TOTAL_SIZE_AMOUNT_MULTIPLIER)
                 )
                 for code, frame in day_frames.items()
             },
             axis=1,
-        ).reindex(cumulative_returns.index)
-        weights = amount_panel.shift(1).where(lambda values: values.gt(0))
+        ).reindex(return_panel.index)
+        amount_shock_panel = pd.concat(
+            {
+                code: _rolling_zscore(
+                    np.log1p(
+                        pd.to_numeric(frame["amount"], errors="coerce")
+                    )
+                )
+                for code, frame in day_frames.items()
+            },
+            axis=1,
+        ).reindex(return_panel.index)
+        lagged_amount_weights = amount_panel.shift(1).where(
+            lambda values: values.gt(0)
+        )
 
         for fund_code, frame in day_frames.items():
-            peer_weights = weights.drop(columns=fund_code)
-            peer_returns = cumulative_returns.drop(columns=fund_code)
-            peer_liquidity_shocks = liquidity_shocks.drop(columns=fund_code)
-            return_weights = peer_weights.where(peer_returns.notna())
-            liquidity_weights = peer_weights.where(
-                peer_liquidity_shocks.notna()
+            peer_return = return_panel.drop(columns=fund_code).mean(
+                axis=1, skipna=True
             )
-            peer_return = peer_returns.mul(return_weights).sum(
+            peer_liquidity = liquidity_panel.drop(columns=fund_code).mean(
+                axis=1, skipna=True
+            )
+            peer_weights = lagged_amount_weights.drop(columns=fund_code)
+            peer_cumulative_returns = cumulative_return_panel.drop(
+                columns=fund_code
+            )
+            cumulative_weights = peer_weights.where(
+                peer_cumulative_returns.notna()
+            )
+            peer_cumulative_return = peer_cumulative_returns.mul(
+                cumulative_weights
+            ).sum(axis=1, min_count=1).div(
+                cumulative_weights.sum(axis=1, min_count=1).where(
+                    lambda values: values.gt(0)
+                )
+            )
+            peer_amount_shocks = amount_shock_panel.drop(columns=fund_code)
+            shock_weights = peer_weights.where(peer_amount_shocks.notna())
+            peer_amount_shock = peer_amount_shocks.mul(shock_weights).sum(
                 axis=1, min_count=1
-            ).div(return_weights.sum(axis=1, min_count=1).where(
-                lambda values: values.gt(0)
-            ))
-            peer_liquidity = peer_liquidity_shocks.mul(liquidity_weights).sum(
-                axis=1, min_count=1
-            ).div(liquidity_weights.sum(axis=1, min_count=1).where(
-                lambda values: values.gt(0)
-            ))
+            ).div(
+                shock_weights.sum(axis=1, min_count=1).where(
+                    lambda values: values.gt(0)
+                )
+            )
             related = pd.DataFrame(
                 {
-                    "related_etf_price_spread": cumulative_returns[fund_code].sub(
+                    "same_index_relative_return_1m": return_panel[fund_code].sub(
                         peer_return
                     ),
-                    "related_etf_liquidity_gap": liquidity_shocks[fund_code].sub(
+                    "same_index_relative_liquidity_1m": liquidity_panel[
+                        fund_code
+                    ].sub(
                         peer_liquidity
                     ),
+                    "same_index_intraday_cumulative_return_gap": (
+                        cumulative_return_panel[fund_code].sub(
+                            peer_cumulative_return
+                        )
+                    ),
+                    "same_index_relative_amount_shock_60m": (
+                        amount_shock_panel[fund_code].sub(
+                            peer_amount_shock
+                        )
+                    ),
                 },
-                index=cumulative_returns.index,
+                index=return_panel.index,
             )
             results[fund_code].loc[frame.index, RELATED_ETF_FACTOR_COLUMNS] = (
                 related.reindex(frame.index)
             )
-    return results
+    return {
+        code: frame.replace([np.inf, -np.inf], np.nan)
+        for code, frame in results.items()
+    }
 
 
 def _group_frames_by_trade_day(
@@ -529,6 +703,8 @@ def _day_cumulative_return(frame: pd.DataFrame) -> pd.Series:
 def _calculate_day_factors(
     etf_day: pd.DataFrame,
     reference_day: pd.DataFrame,
+    daily_state_day: pd.DataFrame,
+    reference_previous_close: float,
 ) -> pd.DataFrame:
     result = pd.DataFrame(
         np.nan,
@@ -538,7 +714,12 @@ def _calculate_day_factors(
     )
     aligned_reference = reference_day.reindex(etf_day.index)
     result.loc[:, ETF_INDEX_RELATIVE_VALUE_COLUMNS] = (
-        _calculate_day_relative_value_factors(etf_day, reference_day)
+        _calculate_day_relative_value_factors(
+            etf_day,
+            reference_day,
+            daily_state_day,
+            reference_previous_close,
+        )
     )
     current_close = pd.to_numeric(etf_day["close"], errors="coerce")
     reference_close = pd.to_numeric(
@@ -568,6 +749,7 @@ def _calculate_day_factors(
 def calculate_crossmarket_factor_frame(
     etf_frame: pd.DataFrame,
     reference_frame: pd.DataFrame,
+    daily_state_frame: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     if "close" not in etf_frame.columns:
         raise ValueError("ETF minute frame is missing close")
@@ -580,6 +762,13 @@ def calculate_crossmarket_factor_frame(
         columns=ALL_FACTOR_COLUMNS,
         dtype=float,
     )
+    if daily_state_frame is None:
+        daily_state_frame = pd.DataFrame(
+            np.nan,
+            index=etf_frame.index,
+            columns=DAILY_STATE_COLUMNS,
+            dtype=float,
+        )
     for trade_day, etf_day in etf_frame.groupby(
         etf_frame.index.normalize(), sort=False
     ):
@@ -589,7 +778,10 @@ def calculate_crossmarket_factor_frame(
         if reference_day.empty:
             continue
         result.loc[etf_day.index] = _calculate_day_factors(
-            etf_day, reference_day
+            etf_day,
+            reference_day,
+            daily_state_frame.reindex(etf_day.index),
+            _previous_reference_close(reference_frame, trade_day),
         )
     return result.replace([np.inf, -np.inf], np.nan)
 
@@ -600,6 +792,7 @@ def build_output_frame(
     mapping_reference_code: str,
     reference_ts_code: str,
     factor_frame: pd.DataFrame,
+    daily_state_frame: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     metadata = pd.DataFrame(
         {
@@ -611,7 +804,22 @@ def build_output_frame(
         },
         index=etf_frame.index,
     )
-    result = pd.concat([etf_frame, metadata, factor_frame], axis=1)
+    if daily_state_frame is None:
+        daily_state_frame = pd.DataFrame(
+            np.nan,
+            index=etf_frame.index,
+            columns=DAILY_STATE_COLUMNS,
+            dtype=float,
+        )
+    result = pd.concat(
+        [
+            etf_frame,
+            metadata,
+            daily_state_frame.reindex(etf_frame.index),
+            factor_frame,
+        ],
+        axis=1,
+    )
     return result.replace([np.inf, -np.inf], np.nan)
 
 
@@ -623,6 +831,7 @@ def process_mapping_record(
     date_from: str | None,
     date_to: str | None,
     overwrite: bool,
+    etf_daily_path: Path | None = None,
 ) -> dict[str, object]:
     output_path = output_root / etf_path.name
     if output_path.exists() and not overwrite:
@@ -648,9 +857,18 @@ def process_mapping_record(
         etf_frame.index.min(),
         etf_frame.index.max(),
     )
+    fund_code = normalize_fund_code(etf_path.name)
+    daily_history = None
+    if etf_daily_path is not None:
+        daily_history = load_etf_daily_histories(
+            etf_daily_path, {fund_code: etf_path}
+        )[fund_code]
+    daily_state_frame = align_previous_daily_state(
+        etf_frame.index, daily_history
+    )
 
     factor_frame = calculate_crossmarket_factor_frame(
-        etf_frame, reference_frame
+        etf_frame, reference_frame, daily_state_frame
     )
     result = build_output_frame(
         etf_frame,
@@ -658,6 +876,7 @@ def process_mapping_record(
         mapping_reference_code,
         reference_path.stem,
         factor_frame,
+        daily_state_frame,
     )
 
     output_root.mkdir(parents=True, exist_ok=True)
@@ -679,6 +898,7 @@ def process_mapping_group(
     target_codes: tuple[str, ...],
     reference_path: Path,
     mapping_reference_code: str,
+    etf_daily_path: Path,
     output_root: Path,
     date_from: str | None,
     date_to: str | None,
@@ -727,7 +947,22 @@ def process_mapping_group(
         min(frame.index.min() for frame in member_frames.values()),
         max(frame.index.max() for frame in member_frames.values()),
     )
-    related_frames = calculate_related_etf_factor_frames(member_frames)
+    daily_histories = load_etf_daily_histories(
+        etf_daily_path,
+        {
+            fund_code: member_paths[fund_code]
+            for fund_code in member_frames
+        },
+    )
+    daily_state_frames = {
+        fund_code: align_previous_daily_state(
+            frame.index, daily_histories.get(fund_code)
+        )
+        for fund_code, frame in member_frames.items()
+    }
+    related_frames = calculate_related_etf_factor_frames(
+        member_frames, daily_state_frames
+    )
     output_root.mkdir(parents=True, exist_ok=True)
     for fund_code in writable_targets:
         etf_frame = member_frames.get(fund_code)
@@ -742,7 +977,9 @@ def process_mapping_group(
             )
             continue
         factor_frame = calculate_crossmarket_factor_frame(
-            etf_frame, reference_frame
+            etf_frame,
+            reference_frame,
+            daily_state_frames[fund_code],
         )
         factor_frame.loc[:, RELATED_ETF_FACTOR_COLUMNS] = related_frames[
             fund_code
@@ -753,6 +990,7 @@ def process_mapping_group(
             mapping_reference_code,
             reference_path.stem,
             factor_frame,
+            daily_state_frames[fund_code],
         )
         result.to_parquet(output_path)
         results.append(
@@ -780,6 +1018,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--mapping", type=Path, default=DEFAULT_MAPPING_PATH)
     parser.add_argument("--etf-root", type=Path, default=DEFAULT_ETF_ROOT)
+    parser.add_argument(
+        "--etf-daily", type=Path, default=DEFAULT_ETF_DAILY_PATH
+    )
     parser.add_argument("--index-root", type=Path, default=DEFAULT_INDEX_ROOT)
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
     parser.add_argument(
@@ -888,6 +1129,7 @@ def main() -> int:
             Path,
             str,
             Path,
+            Path,
             str | None,
             str | None,
             bool,
@@ -908,6 +1150,7 @@ def main() -> int:
                 tuple(fund_code for fund_code, _, _, _ in targets),
                 targets[0][3],
                 reference_code,
+                args.etf_daily,
                 args.output_root,
                 date_from,
                 date_to,
