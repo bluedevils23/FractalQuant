@@ -659,6 +659,18 @@ def _safe_correlation(x: np.ndarray, y: np.ndarray) -> float | None:
     return float(correlation) if np.isfinite(correlation) else None
 
 
+def _window_sums(
+    values: np.ndarray,
+    starts: np.ndarray,
+    ends: np.ndarray,
+) -> np.ndarray:
+    """Return sums over half-open event windows using one cumulative pass."""
+    cumulative = np.empty(len(values) + 1, dtype=float)
+    cumulative[0] = 0.0
+    np.cumsum(values, dtype=float, out=cumulative[1:])
+    return cumulative[ends] - cumulative[starts]
+
+
 def _causal_rolling_zscore(
     values: np.ndarray | pd.Series,
     index: pd.DatetimeIndex,
@@ -1038,178 +1050,306 @@ def _calculate_trade_impact_factors(
         1.0,
         -1.0,
     )
+    trade_count = end_idx - start_idx
+    valid = trade_count >= 10
 
-    for idx, (start, end) in enumerate(zip(start_idx, end_idx, strict=False)):
-        if end - start < 10:
-            continue
+    qty_sum = _window_sums(quantities, start_idx, end_idx)
+    notional_sum = _window_sums(notionals, start_idx, end_idx)
+    signed_qty_sum = _window_sums(quantities * directions, start_idx, end_idx)
+    signed_notional_sum = _window_sums(notionals * directions, start_idx, end_idx)
+    buy_count = _window_sums(directions > 0, start_idx, end_idx)
 
+    valid_qty = valid & (qty_sum > 0)
+    result_array[valid_qty, 14] = signed_qty_sum[valid_qty] / qty_sum[valid_qty]
+    valid_notional = valid & (notional_sum > 0)
+    result_array[valid_notional, 17] = (
+        signed_notional_sum[valid_notional] / notional_sum[valid_notional]
+    )
+    p_hat = np.zeros(len(quote_index), dtype=float)
+    p_hat[valid] = buy_count[valid] / trade_count[valid]
+    result_array[valid, 4] = (
+        (p_hat[valid] - 0.5) / np.sqrt(0.25 / trade_count[valid])
+    )
+
+    returns = np.diff(prices)
+    pair_end = np.clip(end_idx - 1, 0, len(returns))
+    pair_start = np.minimum(np.clip(start_idx, 0, len(returns)), pair_end)
+    pair_count = pair_end - pair_start
+    returns_sum = _window_sums(returns, pair_start, pair_end)
+    returns_square_sum = _window_sums(np.square(returns), pair_start, pair_end)
+    returns_mean = np.zeros(len(quote_index), dtype=float)
+    returns_variance = np.zeros(len(quote_index), dtype=float)
+    has_returns = pair_count > 0
+    returns_mean[has_returns] = returns_sum[has_returns] / pair_count[has_returns]
+    returns_variance[has_returns] = np.maximum(
+        returns_square_sum[has_returns] / pair_count[has_returns]
+        - np.square(returns_mean[has_returns]),
+        0.0,
+    )
+    for idx in np.flatnonzero(has_returns & (returns_variance == 0)):
+        window_returns = returns[pair_start[idx] : pair_end[idx]]
+        returns_mean[idx] = window_returns.mean()
+        returns_variance[idx] = window_returns.var()
+    returns_std = np.sqrt(returns_variance)
+
+    persistence_sum = _window_sums(
+        (directions[1:] == directions[:-1]).astype(float),
+        pair_start,
+        pair_end,
+    )
+    result_array[valid, 1] = (
+        persistence_sum[valid] / pair_count[valid] * 2.0 - 1.0
+    )
+
+    price_impacts = np.abs(returns) * quantities[1:]
+    impact_history_end = np.clip(end_idx - 2, 0, len(price_impacts))
+    impact_history_start = np.minimum(pair_start, impact_history_end)
+    impact_history_count = impact_history_end - impact_history_start
+    impact_history_sum = _window_sums(
+        price_impacts, impact_history_start, impact_history_end
+    )
+    impact_history_square_sum = _window_sums(
+        np.square(price_impacts), impact_history_start, impact_history_end
+    )
+    impact_history_mean = np.zeros(len(quote_index), dtype=float)
+    impact_history_variance = np.zeros(len(quote_index), dtype=float)
+    has_impact_history = valid & (impact_history_count > 0)
+    impact_history_mean[has_impact_history] = (
+        impact_history_sum[has_impact_history]
+        / impact_history_count[has_impact_history]
+    )
+    impact_history_variance[has_impact_history] = np.maximum(
+        impact_history_square_sum[has_impact_history]
+        / impact_history_count[has_impact_history]
+        - np.square(impact_history_mean[has_impact_history]),
+        0.0,
+    )
+    for idx in np.flatnonzero(
+        has_impact_history & (impact_history_variance == 0)
+    ):
+        history_impacts = price_impacts[
+            impact_history_start[idx] : impact_history_end[idx]
+        ]
+        impact_history_mean[idx] = history_impacts.mean()
+        impact_history_variance[idx] = history_impacts.var()
+    latest_impact = np.zeros(len(quote_index), dtype=float)
+    latest_impact[valid] = price_impacts[end_idx[valid] - 2]
+    positive_impact_std = has_impact_history & (impact_history_variance > 0)
+    result_array[positive_impact_std, 2] = (
+        latest_impact[positive_impact_std]
+        - impact_history_mean[positive_impact_std]
+    ) / np.sqrt(impact_history_variance[positive_impact_std])
+    constant_impact = (
+        has_impact_history
+        & (impact_history_variance == 0)
+        & (latest_impact == impact_history_mean)
+    )
+    result_array[constant_impact, 2] = 0.0
+
+    first_prices = prices[np.minimum(start_idx, len(prices) - 1)]
+
+    enough_returns = valid & (pair_count >= 19)
+    positive_returns_std = enough_returns & (returns_std > 0)
+    result_array[positive_returns_std, 6] = (
+        returns_mean[positive_returns_std] / returns_std[positive_returns_std]
+    )
+    qty_after_first_sum = _window_sums(
+        quantities, np.minimum(start_idx + 1, len(quantities)), end_idx
+    )
+    result_array[positive_returns_std, 15] = (
+        qty_after_first_sum[positive_returns_std]
+        / pair_count[positive_returns_std]
+        / (returns_std[positive_returns_std] * 100.0)
+    )
+    last_prices = prices[np.maximum(end_idx - 1, 0)]
+    valid_vwap = (
+        enough_returns
+        & (qty_sum > 0)
+        & np.isfinite(last_prices)
+        & (last_prices > 0)
+    )
+    window_vwap = np.zeros(len(quote_index), dtype=float)
+    window_vwap[valid_vwap] = notional_sum[valid_vwap] / qty_sum[valid_vwap]
+    result_array[valid_vwap, 16] = (
+        window_vwap[valid_vwap] - last_prices[valid_vwap]
+    ) / last_prices[valid_vwap]
+
+    enough_volume = valid & (trade_count >= 20)
+    prior_qty_sum = _window_sums(
+        quantities, start_idx, np.maximum(end_idx - 1, 0)
+    )
+    prior_qty_mean = np.zeros(len(quote_index), dtype=float)
+    prior_qty_mean[enough_volume] = (
+        prior_qty_sum[enough_volume] / (trade_count[enough_volume] - 1)
+    )
+    valid_volume_spike = enough_volume & (prior_qty_mean > 0)
+    result_array[valid_volume_spike, 8] = np.maximum(
+        0.0,
+        quantities[end_idx[valid_volume_spike] - 1]
+        / prior_qty_mean[valid_volume_spike]
+        - 2.0,
+    )
+
+    momentum = np.diff(returns)
+    momentum_end = np.clip(end_idx - 2, 0, len(momentum))
+    momentum_start = np.minimum(np.clip(start_idx, 0, len(momentum)), momentum_end)
+    momentum_count = momentum_end - momentum_start
+    momentum_sum = _window_sums(momentum, momentum_start, momentum_end)
+    momentum_square_sum = _window_sums(
+        np.square(momentum), momentum_start, momentum_end
+    )
+    enough_momentum = valid & (momentum_count >= 10)
+    momentum_mean = np.zeros(len(quote_index), dtype=float)
+    momentum_mean[enough_momentum] = (
+        momentum_sum[enough_momentum] / momentum_count[enough_momentum]
+    )
+    momentum_variance = np.zeros(len(quote_index), dtype=float)
+    momentum_variance[enough_momentum] = np.maximum(
+        momentum_square_sum[enough_momentum] / momentum_count[enough_momentum]
+        - np.square(momentum_mean[enough_momentum]),
+        0.0,
+    )
+    for idx in np.flatnonzero(enough_momentum & (momentum_variance == 0)):
+        window_momentum = momentum[momentum_start[idx] : momentum_end[idx]]
+        momentum_mean[idx] = window_momentum.mean()
+        momentum_variance[idx] = window_momentum.var()
+    positive_momentum_std = enough_momentum & (momentum_variance > 0)
+    result_array[positive_momentum_std, 7] = (
+        momentum_mean[positive_momentum_std]
+        / np.sqrt(momentum_variance[positive_momentum_std])
+    )
+
+    enough_structure = valid & (pair_count >= 10)
+    price_change_bps = np.abs(returns) / prices[:-1] * 10000.0
+    price_change_bps_sum = _window_sums(
+        price_change_bps, pair_start, pair_end
+    )
+    mean_price_change_bps = np.zeros(len(quote_index), dtype=float)
+    mean_price_change_bps[enough_structure] = (
+        price_change_bps_sum[enough_structure]
+        / pair_count[enough_structure]
+    )
+    valid_liquidity_depth = enough_structure & (mean_price_change_bps > 0)
+    result_array[valid_liquidity_depth, 10] = (
+        qty_after_first_sum[valid_liquidity_depth]
+        / pair_count[valid_liquidity_depth]
+        / mean_price_change_bps[valid_liquidity_depth]
+    )
+
+    log_qty_returns = np.diff(np.log(quantities + 1.0))
+    log_qty_sum = _window_sums(log_qty_returns, pair_start, pair_end)
+    log_qty_square_sum = _window_sums(
+        np.square(log_qty_returns), pair_start, pair_end
+    )
+    returns_log_qty_sum = _window_sums(
+        returns * log_qty_returns, pair_start, pair_end
+    )
+    log_qty_mean = np.zeros(len(quote_index), dtype=float)
+    log_qty_mean[enough_structure] = (
+        log_qty_sum[enough_structure] / pair_count[enough_structure]
+    )
+    log_qty_variance = np.zeros(len(quote_index), dtype=float)
+    log_qty_variance[enough_structure] = np.maximum(
+        log_qty_square_sum[enough_structure] / pair_count[enough_structure]
+        - np.square(log_qty_mean[enough_structure]),
+        0.0,
+    )
+    returns_log_qty_covariance = np.zeros(len(quote_index), dtype=float)
+    returns_log_qty_covariance[enough_structure] = (
+        returns_log_qty_sum[enough_structure] / pair_count[enough_structure]
+        - returns_mean[enough_structure] * log_qty_mean[enough_structure]
+    )
+    valid_decoupling = (
+        enough_structure & (returns_variance > 0) & (log_qty_variance > 0)
+    )
+    correlation = np.zeros(len(quote_index), dtype=float)
+    correlation[valid_decoupling] = (
+        returns_log_qty_covariance[valid_decoupling]
+        / np.sqrt(
+            returns_variance[valid_decoupling]
+            * log_qty_variance[valid_decoupling]
+        )
+    )
+    finite_correlation = valid_decoupling & np.isfinite(correlation)
+    result_array[finite_correlation, 11] = 1.0 - np.abs(
+        correlation[finite_correlation]
+    )
+
+    path_length = _window_sums(np.abs(returns), pair_start, pair_end)
+    valid_efficiency = enough_structure & (path_length > 0)
+    result_array[valid_efficiency, 12] = (
+        np.abs(last_prices[valid_efficiency] - first_prices[valid_efficiency])
+        / path_length[valid_efficiency]
+    )
+
+    half = trade_count // 2
+    midpoint = start_idx + half
+    first_half_sum = _window_sums(quantities, start_idx, midpoint)
+    second_half_sum = _window_sums(quantities, midpoint, end_idx)
+    first_half_mean = np.zeros(len(quote_index), dtype=float)
+    second_half_mean = np.zeros(len(quote_index), dtype=float)
+    first_half_mean[valid] = first_half_sum[valid] / half[valid]
+    second_half_mean[valid] = (
+        second_half_sum[valid] / (trade_count[valid] - half[valid])
+    )
+    valid_migration = valid & (first_half_mean > 0)
+    result_array[valid_migration, 13] = (
+        second_half_mean[valid_migration] - first_half_mean[valid_migration]
+    ) / first_half_mean[valid_migration]
+
+    for idx in np.flatnonzero(valid):
+        start = start_idx[idx]
+        end = end_idx[idx]
         window_prices = prices[start:end]
-        window_qty = quantities[start:end]
         window_notionals = notionals[start:end]
-        window_directions = directions[start:end]
+        result_array[idx, 0] = _size_distribution_score(window_notionals)
 
-        size_distribution = _size_distribution_score(window_notionals)
-
-        persistence_pairs = window_directions[1:] == window_directions[:-1]
-        if len(persistence_pairs) > 0:
-            persistence = float(persistence_pairs.mean() * 2.0 - 1.0)
-        else:
-            persistence = np.nan
-
-        liquidity_shock = np.nan
-        price_impacts = np.abs(np.diff(window_prices)) * window_qty[1:]
-        if len(price_impacts) >= 2:
-            history_impacts = price_impacts[:-1]
-            history_std = history_impacts.std()
-            if history_std > 0:
-                liquidity_shock = float(
-                    (price_impacts[-1] - history_impacts.mean()) / history_std
-                )
-            elif len(history_impacts) > 0:
-                liquidity_shock = float(0.0 if price_impacts[-1] == history_impacts.mean() else np.nan)
-
-        market_impact = np.nan
         cumulative_signed_millions = np.cumsum(
-            window_notionals * window_directions
+            window_notionals * directions[start:end]
         ) / 1_000_000.0
-        relative_price_bps = (window_prices / window_prices[0] - 1.0) * 10000.0
-        x = cumulative_signed_millions
-        x_centered = x - x.mean()
-        x_var = np.mean(np.square(x_centered))
-        if x_var > 0:
-            y = relative_price_bps
-            slope = np.mean(x_centered * (y - y.mean())) / x_var
+        x_centered = cumulative_signed_millions - cumulative_signed_millions.mean()
+        x_variance = np.mean(np.square(x_centered))
+        if x_variance > 0:
+            relative_price_bps = (
+                window_prices / window_prices[0] - 1.0
+            ) * 10000.0
+            slope = np.mean(
+                x_centered * (relative_price_bps - relative_price_bps.mean())
+            ) / x_variance
             if np.isfinite(slope):
-                market_impact = float(slope)
+                result_array[idx, 3] = slope
 
-        buy_count = float((window_directions > 0).sum())
-        trade_count = len(window_directions)
-        p_hat = buy_count / trade_count
-        significance = float((p_hat - 0.5) / np.sqrt(0.25 / trade_count))
-
-        volatility_adj_volume = np.nan
-        price_velocity = np.nan
-        momentum_acceleration = np.nan
-        volume_spike = np.nan
-        volume_clustering = np.nan
-        liquidity_depth = np.nan
-        price_volume_decoupling = np.nan
-        market_efficiency = np.nan
-        liquidity_migration = np.nan
-        order_flow_imbalance = np.nan
-        liquidity_ratio = np.nan
-        volume_weighted_price = np.nan
-        orderbook_pressure = np.nan
-
-        signed_qty = window_qty * window_directions
-        total_qty = window_qty.sum()
-        if total_qty > 0:
-            order_flow_imbalance = float(signed_qty.sum() / total_qty)
-        total_notional = window_notionals.sum()
-        if total_notional > 0:
-            orderbook_pressure = float(
-                np.sum(window_notionals * window_directions) / total_notional
-            )
-
-        returns = np.diff(window_prices)
-        if len(returns) >= 19:
-            returns_std = returns.std()
-            if returns_std > 0:
-                price_velocity = float(returns.mean() / returns_std)
-                liquidity_ratio = float(window_qty[1:].mean() / (returns_std * 100.0))
-
+        if pair_count[idx] >= 19:
             chunk_size = 5
-            chunk_count = len(returns) // chunk_size
+            chunk_count = pair_count[idx] // chunk_size
             if chunk_count > 0:
-                trimmed_returns = returns[-chunk_count * chunk_size :]
+                trimmed_returns = returns[
+                    pair_end[idx] - chunk_count * chunk_size : pair_end[idx]
+                ]
                 avg_vol = np.mean(
-                    np.std(trimmed_returns.reshape(chunk_count, chunk_size), axis=1)
+                    np.std(
+                        trimmed_returns.reshape(chunk_count, chunk_size),
+                        axis=1,
+                    )
                 )
-                current_volume = window_qty[-1]
-                mean_volume = window_qty.mean()
-                current_vol = returns.std()
+                mean_volume = qty_sum[idx] / trade_count[idx]
                 if avg_vol > 0 and mean_volume > 0:
-                    volatility_adj_volume = float(
-                        current_volume * (current_vol / avg_vol) / mean_volume
+                    result_array[idx, 5] = (
+                        quantities[end - 1]
+                        * (returns_std[idx] / avg_vol)
+                        / mean_volume
                     )
 
-            last_trade_price = window_prices[-1]
-            if total_qty > 0 and np.isfinite(last_trade_price) and last_trade_price > 0:
-                window_vwap = window_notionals.sum() / total_qty
-                volume_weighted_price = float((window_vwap - last_trade_price) / last_trade_price)
-
-        if len(window_qty) >= 20:
-            avg_prior_volume = window_qty[:-1].mean()
-            if avg_prior_volume > 0:
-                volume_spike = float(max(0.0, window_qty[-1] / avg_prior_volume - 2.0))
-
-        momentum = np.diff(returns)
-        if len(momentum) >= 10:
-            momentum_std = momentum.std()
-            if momentum_std > 0:
-                momentum_acceleration = float(momentum.mean() / momentum_std)
-
-        if len(window_qty) >= 30:
-            avg_volume = window_qty.mean()
+        if trade_count[idx] >= 30:
+            window_qty = quantities[start:end]
+            avg_volume = qty_sum[idx] / trade_count[idx]
             high_volume = window_qty > avg_volume
             high_count = int(high_volume[:-1].sum())
             if high_count > 0:
-                high_to_high = int(np.logical_and(high_volume[:-1], high_volume[1:]).sum())
-                volume_clustering = float(high_to_high / high_count * 2.0 - 1.0)
-
-        if len(returns) >= 10:
-            price_changes = np.abs(returns)
-            trade_vols = window_qty[1:]
-
-            price_changes_bps = price_changes / window_prices[:-1] * 10000.0
-            mean_price_change_bps = price_changes_bps.mean()
-            if mean_price_change_bps > 0:
-                liquidity_depth = float(trade_vols.mean() / mean_price_change_bps)
-
-            vol_returns = np.diff(np.log(window_qty + 1.0))
-            if (
-                len(vol_returns) == len(returns)
-                and np.std(returns) > 0
-                and np.std(vol_returns) > 0
-            ):
-                correlation = _safe_correlation(returns, vol_returns)
-                if correlation is not None:
-                    price_volume_decoupling = float(1.0 - abs(correlation))
-
-            path_length = np.abs(returns).sum()
-            if path_length > 0:
-                market_efficiency = float(
-                    abs(window_prices[-1] - window_prices[0]) / path_length
+                high_to_high = int(
+                    np.logical_and(high_volume[:-1], high_volume[1:]).sum()
                 )
-
-        if len(window_qty) >= 10:
-            half = len(window_qty) // 2
-            if half > 0 and half < len(window_qty):
-                first_half = window_qty[:half].mean()
-                second_half = window_qty[half:].mean()
-                if first_half > 0:
-                    liquidity_migration = float((second_half - first_half) / first_half)
-
-        result_array[idx] = [
-            size_distribution,
-            persistence,
-            liquidity_shock,
-            market_impact,
-            significance,
-            volatility_adj_volume,
-            price_velocity,
-            momentum_acceleration,
-            volume_spike,
-            volume_clustering,
-            liquidity_depth,
-            price_volume_decoupling,
-            market_efficiency,
-            liquidity_migration,
-            order_flow_imbalance,
-            liquidity_ratio,
-            volume_weighted_price,
-            orderbook_pressure,
-        ]
+                result_array[idx, 9] = high_to_high / high_count * 2.0 - 1.0
 
     return pd.DataFrame(result_array, index=quote_index, columns=factor_columns)
 
@@ -1454,9 +1594,9 @@ def _calculate_trade_report_factors(
         "price_band_high_trade_size_rel_60s",
         "price_band_low_trade_size_rel_60s",
     ]
-    result = pd.DataFrame(np.nan, index=quotes.index, columns=columns)
+    result_array = np.full((len(quotes), len(columns)), np.nan, dtype=float)
     if trades.empty:
-        return result
+        return pd.DataFrame(result_array, index=quotes.index, columns=columns)
 
     trade_frame = trades.sort_values("event_time", kind="stable").copy()
     trade_times = pd.DatetimeIndex(pd.to_datetime(trade_frame["event_time"]))
@@ -1519,43 +1659,60 @@ def _calculate_trade_report_factors(
     start_idx = np.searchsorted(trade_times_array, quote_times - window_delta, side="left")
     end_idx = np.searchsorted(trade_times_array, quote_times, side="right")
 
-    for idx, (start, end) in enumerate(zip(start_idx, end_idx, strict=False)):
-        if start == end:
-            continue
-        window_notional = notionals[start:end]
-        aggressive = aggressive_buy_qty[start:end].sum()
-        cautious = cautious_buy_qty[start:end].sum()
-        if aggressive > 0:
-            result.iloc[idx, 0] = cautious / aggressive
+    aggressive = _window_sums(aggressive_buy_qty, start_idx, end_idx)
+    cautious = _window_sums(cautious_buy_qty, start_idx, end_idx)
+    valid_aggressive = aggressive > 0
+    result_array[valid_aggressive, 0] = (
+        cautious[valid_aggressive] / aggressive[valid_aggressive]
+    )
 
+    valid_bands = np.isfinite(low_band) & np.isfinite(high_band)
+    high_mask = valid_bands & (prices >= high_band)
+    low_mask = valid_bands & (prices <= low_band)
+    valid_count = _window_sums(valid_bands, start_idx, end_idx)
+    high_count = _window_sums(high_mask, start_idx, end_idx)
+    low_count = _window_sums(low_mask, start_idx, end_idx)
+    has_valid_bands = valid_count > 0
+    result_array[has_valid_bands, 2] = (
+        high_count[has_valid_bands] / valid_count[has_valid_bands]
+    )
+    result_array[has_valid_bands, 3] = (
+        low_count[has_valid_bands] / valid_count[has_valid_bands]
+    )
+
+    valid_qty = _window_sums(
+        np.where(valid_bands, quantities, 0.0), start_idx, end_idx
+    )
+    high_qty = _window_sums(
+        np.where(high_mask, quantities, 0.0), start_idx, end_idx
+    )
+    low_qty = _window_sums(
+        np.where(low_mask, quantities, 0.0), start_idx, end_idx
+    )
+    valid_high_size = has_valid_bands & (valid_qty > 0) & (high_count > 0)
+    valid_low_size = has_valid_bands & (valid_qty > 0) & (low_count > 0)
+    result_array[valid_high_size, 4] = (
+        high_qty[valid_high_size]
+        * valid_count[valid_high_size]
+        / (high_count[valid_high_size] * valid_qty[valid_high_size])
+    )
+    result_array[valid_low_size, 5] = (
+        low_qty[valid_low_size]
+        * valid_count[valid_low_size]
+        / (low_count[valid_low_size] * valid_qty[valid_low_size])
+    )
+
+    for idx, (start, end) in enumerate(zip(start_idx, end_idx, strict=False)):
         if end - start > 10:
-            trimmed_notional = np.sort(window_notional)[:-10]
+            trimmed_notional = np.sort(notionals[start:end])[:-10]
             lower = trimmed_notional.min()
             upper = trimmed_notional.max()
             if upper > lower:
-                result.iloc[idx, 1] = (np.quantile(trimmed_notional, 0.1) - lower) / (
+                result_array[idx, 1] = (np.quantile(trimmed_notional, 0.1) - lower) / (
                     upper - lower
                 )
 
-        window_low = low_band[start:end]
-        window_high = high_band[start:end]
-        valid_bands = np.isfinite(window_low) & np.isfinite(window_high)
-        if not np.any(valid_bands):
-            continue
-        window_prices = prices[start:end]
-        window_qty = quantities[start:end]
-        high_mask = valid_bands & (window_prices >= window_high)
-        low_mask = valid_bands & (window_prices <= window_low)
-        valid_count = valid_bands.sum()
-        result.iloc[idx, 2] = high_mask.sum() / valid_count
-        result.iloc[idx, 3] = low_mask.sum() / valid_count
-        baseline_size = window_qty[valid_bands].mean()
-        if baseline_size > 0 and np.any(high_mask):
-            result.iloc[idx, 4] = window_qty[high_mask].mean() / baseline_size
-        if baseline_size > 0 and np.any(low_mask):
-            result.iloc[idx, 5] = window_qty[low_mask].mean() / baseline_size
-
-    return result
+    return pd.DataFrame(result_array, index=quotes.index, columns=columns)
 
 
 def _calculate_adverse_selection_markout(
