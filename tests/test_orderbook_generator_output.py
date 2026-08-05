@@ -4,6 +4,7 @@ import pandas as pd
 
 from scripts.generate_etf_orderbook_factors import build_tasks as build_etf_tasks
 from scripts.generate_etf_orderbook_factors import discover_minute_symbols
+from scripts.generate_etf_orderbook_factors import process_symbol_tasks
 from scripts.generate_stock_orderbook_factors import (
     BASE_OUTPUT_COLUMNS,
     FACTOR_COLUMNS,
@@ -173,6 +174,31 @@ def test_etf_task_builder_keeps_universe_suffix_when_tick_dir_suffix_is_wrong(tm
 
     assert tasks == [(wrong_suffix_dir, "511360.SH")]
     assert missing_count == 0
+
+
+def test_etf_generator_skips_empty_quote_snapshots(tmp_path, monkeypatch) -> None:
+    symbol_dir = tmp_path / "20260701" / "520890.SH"
+    symbol_dir.mkdir(parents=True)
+    monkeypatch.setitem(
+        process_symbol_tasks.__globals__,
+        "normalize_quote_frame",
+        lambda _: pd.DataFrame(),
+    )
+
+    status, output_path, row_count, column_count = process_symbol_tasks(
+        [symbol_dir],
+        "520890.SH",
+        tmp_path / "minute",
+        tmp_path / "output",
+        overwrite=False,
+        window_profile="base",
+        factor_columns=FACTOR_COLUMNS,
+    )
+
+    assert status == "skipped"
+    assert output_path == tmp_path / "output" / "520890.SH.parquet"
+    assert row_count is None
+    assert column_count is None
 
 
 def test_minute_frame_is_cached_per_symbol(tmp_path, monkeypatch) -> None:

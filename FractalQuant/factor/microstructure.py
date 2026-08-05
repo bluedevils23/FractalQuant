@@ -574,6 +574,9 @@ class MarketEfficiencyFactor(BaseFactor):
         close = df['close']
         
         valid = _valid_close_window(df, self.window)
+        if len(close) < self.window:
+            return pd.Series(np.nan, index=close.index).where(valid)
+
         abs_returns = close.diff().abs()
         m = self.window - 1
         x = np.arange(m, dtype=float)
@@ -581,6 +584,8 @@ class MarketEfficiencyFactor(BaseFactor):
         denom = np.sum((x - mean_x) ** 2)
         weights = x[::-1]
         abs_values = abs_returns.iloc[1:].to_numpy(dtype=float, copy=False)
+        if len(abs_values) < m:
+            return pd.Series(np.nan, index=close.index).where(valid)
         sum_xy = np.convolve(abs_values, weights, mode="valid")
         mean_y = abs_returns.iloc[1:].rolling(m, min_periods=m).mean().to_numpy(
             dtype=float, copy=False

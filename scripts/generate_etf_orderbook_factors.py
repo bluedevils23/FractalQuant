@@ -342,6 +342,9 @@ def process_symbol_tasks(
         if normalized_date in existing_dates:
             continue
         quotes = normalize_quote_frame(symbol_dir)
+        if quotes.empty:
+            LOGGER.warning("Skipping %s: no valid quote snapshots", symbol_dir)
+            continue
         quotes["ts_code"] = output_symbol
         orders = normalize_order_frame(symbol_dir)
         trades = normalize_trade_frame(symbol_dir)
