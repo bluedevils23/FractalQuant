@@ -38,6 +38,8 @@ dependencies = [
     "nltk>=3.6.3",
     "textblob>=0.15.3",
     "vaderSentiment>=3.3.2",
+    "openpyxl>=3.1.5",
+    "rqdatac>=3.6.1",
 ]
 
 [tool.setuptools]
@@ -45,4 +47,3 @@ package-dir = {"" = "FractalQuant"}
 
 [tool.setuptools.packages.find]
 where = ["FractalQuant"]
-
