@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import sys
 from pathlib import Path
 
@@ -24,6 +25,7 @@ from scripts.generate_etf_crossmarket_factors import (
     calculate_crossmarket_factor_frame,
     load_etf_daily_histories,
     load_mapping_records,
+    main,
     process_mapping_group,
     process_mapping_record,
     resolve_reference_path,
@@ -152,16 +154,20 @@ def test_mapping_and_reference_resolution_support_code_stem_alias(
     mapping_path.write_text(
         "fund_code,reference_index_code\n"
         "159008,399975.SZ\n"
-        "510300,000300.CSI\n",
+        "510300,000300.CSI\n"
+        "159269,931573CNY00.CSI\n",
         encoding="utf-8",
     )
     records = load_mapping_records(mapping_path)
     assert records["159008"].reference_index_code == "399975.SZ"
+    assert records["159269"].reference_index_code == "931573.CSI"
+    assert records["159269"].uses_data_alias
 
     index_root = tmp_path / "indices"
     index_root.mkdir()
     (index_root / "399975.SZ.parquet").touch()
     (index_root / "000300.SH.parquet").touch()
+    (index_root / "931573.CSI.parquet").touch()
     (index_root / "AU99.99.SH.parquet").touch()
     by_full, by_stem = build_index_file_lookup(index_root)
 
@@ -177,6 +183,9 @@ def test_mapping_and_reference_resolution_support_code_stem_alias(
     multi_dot_alias, multi_dot_type = resolve_reference_path(
         "Au99.99.SGE", by_full, by_stem
     )
+    data_alias, data_alias_type = resolve_reference_path(
+        "931573CNY00.CSI", by_full, by_stem
+    )
 
     assert exact == index_root / "399975.SZ.parquet"
     assert exact_type == "exact"
@@ -186,6 +195,8 @@ def test_mapping_and_reference_resolution_support_code_stem_alias(
     assert missing_type == "missing"
     assert multi_dot_alias == index_root / "AU99.99.SH.parquet"
     assert multi_dot_type == "stem"
+    assert data_alias == index_root / "931573.CSI.parquet"
+    assert data_alias_type == "data_alias"
 
 
 def test_crossmarket_reference_windows_do_not_use_future_rows() -> None:
@@ -413,18 +424,20 @@ def test_process_mapping_record_writes_reference_metadata(
     etf_path = tmp_path / "159008.SZ.parquet"
     reference_path = tmp_path / "399975.SZ.parquet"
     output_root = tmp_path / "output"
-    _raw_parquet_frame("2026-01-05", reference=False).to_parquet(etf_path)
-    _raw_parquet_frame("2026-01-05", reference=True).to_parquet(
-        reference_path
-    )
+    _raw_parquet_days(
+        ("2026-01-02", "2026-01-05"), reference=False
+    ).to_parquet(etf_path)
+    reference = _raw_parquet_frame("2026-01-05", reference=True)
+    missing_time = reference.index.get_level_values("trade_time")[10]
+    reference.drop(reference.index[10]).to_parquet(reference_path)
 
     result = process_mapping_record(
         etf_path,
         reference_path,
         "399975.SZ",
         output_root,
-        "20260105",
-        "20260105",
+        None,
+        None,
         False,
     )
     output = pd.read_parquet(output_root / etf_path.name)
@@ -435,7 +448,40 @@ def test_process_mapping_record_writes_reference_metadata(
     assert output["reference_index_code"].eq("399975.SZ").all()
     assert output["reference_ts_code"].eq("399975.SZ").all()
     assert output["reference_close"].notna().all()
+    assert output.index.normalize().unique().tolist() == [
+        pd.Timestamp("2026-01-05")
+    ]
+    assert missing_time not in output.index
+    assert len(output) == len(reference) - 1
     assert set(DAILY_STATE_COLUMNS) <= set(output.columns)
+
+
+def test_process_mapping_record_removes_stale_output_without_overlap(
+    tmp_path: Path,
+) -> None:
+    etf_path = tmp_path / "159008.SZ.parquet"
+    reference_path = tmp_path / "399975.SZ.parquet"
+    output_root = tmp_path / "output"
+    output_root.mkdir()
+    output_path = output_root / etf_path.name
+    _raw_parquet_frame("2026-01-02", reference=False).to_parquet(etf_path)
+    _raw_parquet_frame("2026-01-05", reference=True).to_parquet(
+        reference_path
+    )
+    output_path.write_text("stale", encoding="utf-8")
+
+    result = process_mapping_record(
+        etf_path,
+        reference_path,
+        "399975.SZ",
+        output_root,
+        None,
+        None,
+        True,
+    )
+
+    assert result["status"] == "no_overlap"
+    assert not output_path.exists()
 
 
 def test_daily_state_uses_only_immediately_previous_record(
@@ -449,32 +495,50 @@ def test_daily_state_uses_only_immediately_previous_record(
     history = load_etf_daily_histories(
         daily_path, {"159008": minute_path}
     )["159008"]
-    minute_index = pd.date_range(
-        "2026-01-05 09:30:00", periods=3, freq="min"
+    full_minute_index = pd.DatetimeIndex(
+        [
+            pd.Timestamp("2026-01-02 09:30:00"),
+            pd.Timestamp("2026-01-05 09:30:00"),
+            pd.Timestamp("2026-01-06 09:30:00"),
+        ]
     )
-    state = align_previous_daily_state(minute_index, history)
+    state = align_previous_daily_state(full_minute_index, history)
 
-    assert state["prev_nav"].eq(1.03).all()
-    assert state["prev_total_size"].eq(1_000.0).all()
-    assert state["prev_total_share"].eq(900.0).all()
+    assert pd.isna(state.loc[full_minute_index[0], "prev_nav"])
+    assert state.loc[full_minute_index[1], "prev_nav"] == 1.03
+    assert state.loc[full_minute_index[1], "prev_total_size"] == 1_000.0
+    assert state.loc[full_minute_index[2], "prev_nav"] == 100.0
+
+    filtered = align_previous_daily_state(
+        full_minute_index[2:], history, full_minute_index
+    )
+    assert filtered["prev_nav"].eq(100.0).all()
 
     history.loc[pd.Timestamp("2026-01-02"), "nav"] = np.nan
-    missing = align_previous_daily_state(minute_index, history)
-    assert missing["prev_nav"].isna().all()
-    assert missing["prev_total_size"].eq(1_000.0).all()
+    missing = align_previous_daily_state(full_minute_index, history)
+    assert pd.isna(missing.loc[full_minute_index[1], "prev_nav"])
+    assert missing.loc[full_minute_index[1], "prev_total_size"] == 1_000.0
+
+    missing_trade_day = align_previous_daily_state(
+        full_minute_index,
+        history.drop(pd.Timestamp("2026-01-05")),
+    )
+    assert missing_trade_day.loc[full_minute_index[2]].isna().all()
 
 
 def test_process_mapping_group_writes_related_etf_factors(tmp_path: Path) -> None:
     reference_path = tmp_path / "399975.SZ.parquet"
     daily_path = tmp_path / "etf_daily.parquet"
     output_root = tmp_path / "output"
-    _raw_parquet_days(
-        ("2026-01-02", "2026-01-05"), reference=True
-    ).to_parquet(reference_path)
+    _raw_parquet_frame("2026-01-05", reference=True).to_parquet(
+        reference_path
+    )
     member_paths: dict[str, Path] = {}
     for multiplier, code in enumerate(("159001", "159002", "159003"), start=1):
         path = tmp_path / f"{code}.SZ.parquet"
-        frame = _raw_parquet_frame("2026-01-05", reference=False)
+        frame = _raw_parquet_days(
+            ("2026-01-02", "2026-01-05"), reference=False
+        )
         frame["close"] = frame["open"] * (
             1.0 + multiplier * np.arange(len(frame), dtype=float) * 0.001
         )
@@ -492,8 +556,8 @@ def test_process_mapping_group_writes_related_etf_factors(tmp_path: Path) -> Non
         "399975.SZ",
         daily_path,
         output_root,
-        "20260105",
-        "20260105",
+        None,
+        None,
         False,
     )
 
@@ -509,6 +573,9 @@ def test_process_mapping_group_writes_related_etf_factors(tmp_path: Path) -> Non
     ].iloc[29:].notna().all()
     assert output["prev_nav"].eq(1.0).all()
     assert output["prev_total_size"].eq(1_000.0).all()
+    assert output.index.normalize().unique().tolist() == [
+        pd.Timestamp("2026-01-05")
+    ]
     replaced_columns = {
         "etf_index_return_gap_1m",
         "etf_index_return_gap_5m",
@@ -521,3 +588,66 @@ def test_process_mapping_group_writes_related_etf_factors(tmp_path: Path) -> Non
         "related_etf_liquidity_gap",
     }
     assert replaced_columns.isdisjoint(output.columns)
+
+
+def test_main_groups_data_aliases_and_excludes_missing_references(
+    tmp_path: Path,
+    monkeypatch,
+    caplog,
+) -> None:
+    mapping_path = tmp_path / "mapping.csv"
+    etf_root = tmp_path / "etf"
+    index_root = tmp_path / "index"
+    output_root = tmp_path / "output"
+    daily_path = tmp_path / "etf_daily.parquet"
+    etf_root.mkdir()
+    index_root.mkdir()
+    mapping_path.write_text(
+        "fund_code,reference_index_code\n"
+        "159001,931573CNY00.CSI\n"
+        "159002,931573.CSI\n"
+        "159003,MISSING.CSI\n",
+        encoding="utf-8",
+    )
+    _raw_parquet_days(
+        ("2026-01-02", "2026-01-05"), reference=True
+    ).to_parquet(index_root / "931573.CSI.parquet")
+    for code in ("159001", "159002", "159003"):
+        _raw_parquet_days(
+            ("2026-01-02", "2026-01-05"), reference=False
+        ).to_parquet(etf_root / f"{code}.SZ.parquet")
+    _write_daily_file(daily_path, ("159001", "159002"))
+    caplog.set_level(
+        logging.INFO, logger="generate_etf_crossmarket_factors"
+    )
+
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "generate_etf_crossmarket_factors.py",
+            "--mapping",
+            str(mapping_path),
+            "--etf-root",
+            str(etf_root),
+            "--etf-daily",
+            str(daily_path),
+            "--index-root",
+            str(index_root),
+            "--output-root",
+            str(output_root),
+            "--date-from",
+            "20260105",
+            "--date-to",
+            "20260105",
+            "--workers",
+            "1",
+        ],
+    )
+
+    assert main() == 0
+    output = pd.read_parquet(output_root / "159001.SZ.parquet")
+    assert output["reference_index_code"].eq("931573.CSI").all()
+    assert output["same_index_relative_return_1m"].iloc[1:].notna().all()
+    assert "1 selected ETFs use reference code aliases" in caplog.text
+    assert "Excluding 1 ETF(s) across 1 reference group(s)" in caplog.text

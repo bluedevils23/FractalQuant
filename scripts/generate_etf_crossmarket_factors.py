@@ -8,7 +8,7 @@ import os
 import sys
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
@@ -59,17 +59,21 @@ DEFAULT_ETF_ROOT = Path(r"D:\workspace\stockdata\etf-data\etf_1min")
 DEFAULT_ETF_DAILY_PATH = Path(
     r"D:\workspace\stockdata\etf-data\etf_daily.parquet"
 )
-DEFAULT_INDEX_ROOT = Path(r"D:\workspace\stockdata\index-data\index_1min")
+DEFAULT_INDEX_ROOT = Path(r"D:\workspace\stockdata\指数数据\index_1min")
 DEFAULT_OUTPUT_ROOT = Path(
     r"D:\workspace\stockdata\etf-data\etf_1min_crossmarket_factors"
 )
 REQUIRED_MAPPING_COLUMNS = ("fund_code", "reference_index_code")
+REFERENCE_DATA_ALIASES = {
+    "931573CNY00.CSI": "931573.CSI",
+}
 
 
 @dataclass(frozen=True)
 class MappingRecord:
     fund_code: str
     reference_index_code: str
+    uses_data_alias: bool = field(default=False, compare=False)
 
 
 def build_crossmarket_factors() -> tuple[object, ...]:
@@ -150,6 +154,11 @@ def normalize_reference_code(value: object) -> str:
     return code
 
 
+def canonical_reference_code(value: object) -> str:
+    reference_code = normalize_reference_code(value)
+    return REFERENCE_DATA_ALIASES.get(reference_code, reference_code)
+
+
 def load_mapping_records(mapping_path: Path) -> dict[str, MappingRecord]:
     if not mapping_path.exists():
         raise FileNotFoundError(f"Mapping file does not exist: {mapping_path}")
@@ -169,13 +178,19 @@ def load_mapping_records(mapping_path: Path) -> dict[str, MappingRecord]:
     ):
         try:
             fund_code = normalize_fund_code(row.fund_code)
-            reference_code = normalize_reference_code(
+            source_reference_code = normalize_reference_code(
                 row.reference_index_code
             )
         except ValueError:
             continue
 
-        record = MappingRecord(fund_code, reference_code)
+        reference_code = canonical_reference_code(source_reference_code)
+
+        record = MappingRecord(
+            fund_code,
+            reference_code,
+            uses_data_alias=source_reference_code != reference_code,
+        )
         existing = records.get(fund_code)
         if existing is not None and existing != record:
             raise ValueError(
@@ -247,10 +262,19 @@ def resolve_reference_path(
     if exact is not None:
         return exact, "exact"
 
-    code_stem = normalized.rsplit(".", 1)[0]
-    candidates = paths_by_stem.get(code_stem, ())
-    if len(candidates) == 1:
-        return candidates[0], "stem"
+    for candidate_code, match_type in (
+        (normalized, "stem"),
+        (REFERENCE_DATA_ALIASES.get(normalized), "data_alias"),
+    ):
+        if candidate_code is None:
+            continue
+        candidate_exact = by_full_code.get(candidate_code)
+        if candidate_exact is not None:
+            return candidate_exact, match_type
+        code_stem = candidate_code.rsplit(".", 1)[0]
+        candidates = paths_by_stem.get(code_stem, ())
+        if len(candidates) == 1:
+            return candidates[0], match_type
     return None, "missing"
 
 
@@ -366,6 +390,7 @@ def load_etf_daily_histories(
 def align_previous_daily_state(
     minute_index: pd.DatetimeIndex,
     daily_history: pd.DataFrame | None,
+    trade_calendar: pd.DatetimeIndex | None = None,
 ) -> pd.DataFrame:
     result = pd.DataFrame(
         np.nan,
@@ -377,12 +402,16 @@ def align_previous_daily_state(
         return result
 
     history = daily_history.sort_index()
-    history_dates = pd.DatetimeIndex(history.index).normalize()
+    history_dates = pd.DatetimeIndex(history.index).normalize().unique()
+    calendar = pd.DatetimeIndex(
+        minute_index if trade_calendar is None else trade_calendar
+    ).normalize().unique().sort_values()
+    previous_trade_days = dict(zip(calendar[1:], calendar[:-1]))
     for trade_day in minute_index.normalize().unique():
-        position = history_dates.searchsorted(trade_day, side="left") - 1
-        if position < 0:
+        previous_trade_day = previous_trade_days.get(trade_day)
+        if previous_trade_day is None or previous_trade_day not in history_dates:
             continue
-        source = history.iloc[position]
+        source = history.loc[previous_trade_day]
         day_mask = minute_index.normalize() == trade_day
         result.loc[day_mask, "prev_nav"] = source["nav"]
         result.loc[day_mask, "prev_total_size"] = source["total_size"]
@@ -823,6 +852,27 @@ def build_output_frame(
     return result.replace([np.inf, -np.inf], np.nan)
 
 
+def restrict_to_reference_minutes(
+    etf_frame: pd.DataFrame,
+    reference_frame: pd.DataFrame,
+) -> pd.DataFrame:
+    return etf_frame.loc[etf_frame.index.intersection(reference_frame.index)]
+
+
+def no_overlap_result(
+    etf_path: Path,
+    output_path: Path,
+    overwrite: bool,
+) -> dict[str, object]:
+    if overwrite and output_path.exists():
+        output_path.unlink()
+    return {
+        "status": "no_overlap",
+        "etf_code": etf_path.stem,
+        "output_path": output_path,
+    }
+
+
 def process_mapping_record(
     etf_path: Path,
     reference_path: Path,
@@ -841,11 +891,8 @@ def process_mapping_record(
             "output_path": output_path,
         }
 
-    etf_frame = filter_date_range(
-        normalize_minute_frame(pd.read_parquet(etf_path)),
-        date_from,
-        date_to,
-    )
+    raw_etf_frame = normalize_minute_frame(pd.read_parquet(etf_path))
+    etf_frame = filter_date_range(raw_etf_frame, date_from, date_to)
     if etf_frame.empty:
         return {
             "status": "empty",
@@ -857,6 +904,9 @@ def process_mapping_record(
         etf_frame.index.min(),
         etf_frame.index.max(),
     )
+    etf_frame = restrict_to_reference_minutes(etf_frame, reference_frame)
+    if etf_frame.empty:
+        return no_overlap_result(etf_path, output_path, overwrite)
     fund_code = normalize_fund_code(etf_path.name)
     daily_history = None
     if etf_daily_path is not None:
@@ -864,7 +914,7 @@ def process_mapping_record(
             etf_daily_path, {fund_code: etf_path}
         )[fund_code]
     daily_state_frame = align_previous_daily_state(
-        etf_frame.index, daily_history
+        etf_frame.index, daily_history, raw_etf_frame.index
     )
 
     factor_frame = calculate_crossmarket_factor_frame(
@@ -921,11 +971,13 @@ def process_mapping_group(
     if not writable_targets:
         return results
 
-    member_frames = {
-        fund_code: filter_date_range(
-            normalize_minute_frame(pd.read_parquet(path)), date_from, date_to
-        )
+    raw_member_frames = {
+        fund_code: normalize_minute_frame(pd.read_parquet(path))
         for fund_code, path in member_paths.items()
+    }
+    member_frames = {
+        fund_code: filter_date_range(frame, date_from, date_to)
+        for fund_code, frame in raw_member_frames.items()
     }
     member_frames = {
         fund_code: frame
@@ -947,6 +999,24 @@ def process_mapping_group(
         min(frame.index.min() for frame in member_frames.values()),
         max(frame.index.max() for frame in member_frames.values()),
     )
+    member_frames = {
+        fund_code: restrict_to_reference_minutes(frame, reference_frame)
+        for fund_code, frame in member_frames.items()
+    }
+    member_frames = {
+        fund_code: frame
+        for fund_code, frame in member_frames.items()
+        if not frame.empty
+    }
+    if not member_frames:
+        return results + [
+            no_overlap_result(
+                member_paths[fund_code],
+                output_root / member_paths[fund_code].name,
+                overwrite,
+            )
+            for fund_code in writable_targets
+        ]
     daily_histories = load_etf_daily_histories(
         etf_daily_path,
         {
@@ -956,7 +1026,9 @@ def process_mapping_group(
     )
     daily_state_frames = {
         fund_code: align_previous_daily_state(
-            frame.index, daily_histories.get(fund_code)
+            frame.index,
+            daily_histories.get(fund_code),
+            raw_member_frames[fund_code].index,
         )
         for fund_code, frame in member_frames.items()
     }
@@ -969,11 +1041,9 @@ def process_mapping_group(
         output_path = output_root / member_paths[fund_code].name
         if etf_frame is None:
             results.append(
-                {
-                    "status": "empty",
-                    "etf_code": member_paths[fund_code].stem,
-                    "output_path": output_path,
-                }
+                no_overlap_result(
+                    member_paths[fund_code], output_path, overwrite
+                )
             )
             continue
         factor_frame = calculate_crossmarket_factor_frame(
@@ -1110,7 +1180,9 @@ def main() -> int:
                 (fund_code, mapping.reference_index_code)
             )
             continue
-        alias_count += int(match_type == "stem")
+        alias_count += int(
+            match_type == "stem" or mapping.uses_data_alias
+        )
         selected_records.append((fund_code, etf_path, mapping, reference_path))
 
     if args.limit is not None:
@@ -1159,7 +1231,8 @@ def main() -> int:
         )
 
     LOGGER.info(
-        "Prepared %s ETF/reference groups; %s selected ETFs use code-stem aliases",
+        "Prepared %s ETF/reference groups; %s selected ETFs use reference "
+        "code aliases",
         len(jobs),
         alias_count,
     )
@@ -1169,9 +1242,11 @@ def main() -> int:
             for fund, reference in missing_references[:10]
         )
         LOGGER.warning(
-            "Skipping %s mappings without local index minute files; "
+            "Excluding %s ETF(s) across %s reference group(s) without local "
+            "index minute files; "
             "examples: %s",
             len(missing_references),
+            len({reference for _, reference in missing_references}),
             examples,
         )
     if not jobs:
