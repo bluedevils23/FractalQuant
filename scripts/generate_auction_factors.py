@@ -263,6 +263,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Also write causal minute-level session path companion parquets.",
     )
+    parser.add_argument(
+        "--session-path-only",
+        action="store_true",
+        help="Generate only causal minute-level session path factors; skip auction factors.",
+    )
     return parser.parse_args()
 
 
@@ -1603,6 +1608,31 @@ def merge_session_path_output(
     )[SESSION_PATH_OUTPUT_COLUMNS]
 
 
+def process_session_path_only(
+    ts_code: str,
+    minute_path: Path,
+    output_root: Path,
+    date_from: str | None,
+    date_to: str | None,
+    overwrite: bool,
+) -> tuple[Path, int]:
+    requested = build_session_path_factor_frame(minute_path, ts_code)
+    if date_from is not None:
+        requested = requested.loc[
+            requested["trade_date"].ge(pd.Timestamp(date_from).strftime("%Y-%m-%d"))
+        ]
+    if date_to is not None:
+        requested = requested.loc[
+            requested["trade_date"].le(pd.Timestamp(date_to).strftime("%Y-%m-%d"))
+        ]
+
+    output_path = output_root / f"{ts_code}.parquet"
+    combined = merge_session_path_output(output_path, requested, overwrite)
+    output_root.mkdir(parents=True, exist_ok=True)
+    combined.to_parquet(output_path, index=False)
+    return output_path, len(requested)
+
+
 def apply_historical_ratios(
     frame: pd.DataFrame,
     event_frames: dict[str, pd.DataFrame] | None = None,
@@ -1895,6 +1925,78 @@ def main() -> int:
         assets = assets[: args.limit]
     if not assets:
         LOGGER.warning("No symbols matched the requested asset universe.")
+        return 0
+
+    if args.session_path_only:
+        session_path_output_roots = {
+            "stock": args.stock_session_path_output_root,
+            "etf": args.etf_session_path_output_root,
+        }
+        LOGGER.info("Generating session path factors for %s symbols", len(assets))
+        failures: list[tuple[str, str]] = []
+        written = 0
+        worker_count = max(1, args.workers)
+        if worker_count == 1:
+            for kind, _, symbol in assets:
+                try:
+                    output_path, row_count = process_session_path_only(
+                        symbol,
+                        {
+                            "stock": args.stock_minute_root,
+                            "etf": args.etf_minute_root,
+                        }[kind]
+                        / f"{symbol}.parquet",
+                        session_path_output_roots[kind],
+                        date_from,
+                        date_to,
+                        args.overwrite,
+                    )
+                    written += int(row_count > 0)
+                    LOGGER.info("Wrote %s session path rows to %s", row_count, output_path)
+                except Exception as exc:  # noqa: BLE001
+                    failures.append((symbol, str(exc)))
+                    LOGGER.exception("Failed to process session path factors for %s", symbol)
+        else:
+            with ProcessPoolExecutor(max_workers=worker_count) as executor:
+                futures = {
+                    executor.submit(
+                        process_session_path_only,
+                        symbol,
+                        {
+                            "stock": args.stock_minute_root,
+                            "etf": args.etf_minute_root,
+                        }[kind]
+                        / f"{symbol}.parquet",
+                        session_path_output_roots[kind],
+                        date_from,
+                        date_to,
+                        args.overwrite,
+                    ): symbol
+                    for kind, _, symbol in assets
+                }
+                for future in as_completed(futures):
+                    symbol = futures[future]
+                    try:
+                        output_path, row_count = future.result()
+                        written += int(row_count > 0)
+                        LOGGER.info(
+                            "Wrote %s session path rows to %s", row_count, output_path
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        failures.append((symbol, str(exc)))
+                        LOGGER.exception(
+                            "Failed to process session path factors for %s", symbol
+                        )
+
+        LOGGER.info(
+            "Completed session path factors: %s symbol files written, %s failures",
+            written,
+            len(failures),
+        )
+        if failures:
+            for symbol, error in failures[:20]:
+                LOGGER.error("%s: %s", symbol, error)
+            return 1
         return 0
 
     date_dirs = discover_trade_date_dirs(args.tick_root, date_to)

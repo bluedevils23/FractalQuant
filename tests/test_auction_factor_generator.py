@@ -21,6 +21,7 @@ from scripts.generate_auction_factors import (
     load_auction_event_frame,
     load_daily_amount_history,
     merge_symbol_output,
+    process_session_path_only,
 )
 
 
@@ -742,6 +743,37 @@ def test_session_path_infinite_value_error_identifies_location(tmp_path) -> None
     assert "2026-01-02" in message
     assert "09:30:00" in message
     assert "intraday_drawdown_from_session_high" in message
+
+
+def test_session_path_only_writes_requested_dates_without_auction_output(tmp_path) -> None:
+    index = pd.MultiIndex.from_arrays(
+        [
+            pd.to_datetime(["2026-01-02", "2026-01-05"]),
+            pd.to_datetime(["2026-01-02 09:30", "2026-01-05 09:30"]),
+        ],
+        names=["trade_date", "trade_time"],
+    )
+    minute_path = tmp_path / "000001.SZ.parquet"
+    pd.DataFrame(
+        {"high": [10.0, 11.0], "low": [9.0, 10.0], "close": [9.5, 10.5]},
+        index=index,
+    ).to_parquet(minute_path)
+
+    output_root = tmp_path / "session_path"
+    output_path, row_count = process_session_path_only(
+        "000001.SZ",
+        minute_path,
+        output_root,
+        "20260105",
+        "20260105",
+        overwrite=False,
+    )
+
+    assert output_path == output_root / "000001.SZ.parquet"
+    assert row_count == 1
+    result = pd.read_parquet(output_path)
+    assert result["trade_date"].tolist() == ["2026-01-05"]
+    assert not any(column.startswith("auction_") for column in result.columns)
 
 
 def _dated_event(
