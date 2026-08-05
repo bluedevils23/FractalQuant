@@ -547,9 +547,11 @@ def _calculate_day_relative_value_factors(
     reference_open = pd.to_numeric(reference["open"], errors="coerce").where(
         lambda values: values.gt(0)
     )
-    if etf_open.notna().any() and reference_open.notna().any():
-        intraday_proxy = etf_open.dropna().iloc[0] * reference_close.div(
-            reference_open.dropna().iloc[0]
+    common_open = etf_open.notna() & reference_open.notna()
+    if common_open.any():
+        base_time = common_open[common_open].index[0]
+        intraday_proxy = etf_open.loc[base_time] * reference_close.div(
+            reference_open.loc[base_time]
         )
         intraday_gap = etf_close.div(
             intraday_proxy.where(intraday_proxy.gt(0))

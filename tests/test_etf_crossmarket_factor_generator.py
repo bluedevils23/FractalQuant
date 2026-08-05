@@ -305,6 +305,22 @@ def test_relative_value_factors_use_same_minute_data_without_future_rows() -> No
     assert factors.loc[point, "etf_index_tracking_error"] >= 0
     assert factors.loc[point, "etf_index_realized_vol_ratio"] > 0
 
+    delayed_etf_open = etf.copy()
+    delayed_etf_open.loc[delayed_etf_open.index[0], "open"] = np.nan
+    delayed_open_factors = calculate_crossmarket_factor_frame(
+        delayed_etf_open, reference, daily_state
+    )
+    shared_open_time = delayed_etf_open.index[1]
+    expected_intraday_gap = delayed_etf_open.loc[point, "close"] / (
+        delayed_etf_open.loc[shared_open_time, "open"]
+        * reference.loc[point, "close"]
+        / reference.loc[shared_open_time, "open"]
+    ) - 1.0
+    assert np.isclose(
+        delayed_open_factors.loc[point, "etf_index_intraday_price_gap"],
+        expected_intraday_gap,
+    )
+
     missing_nav_state = daily_state.copy()
     missing_nav_state["prev_nav"] = np.nan
     missing_nav_factors = calculate_crossmarket_factor_frame(
