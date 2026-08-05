@@ -14,7 +14,7 @@
 | 管线 | 入口脚本 | 资产 | 因子数量 | 默认输出 |
 | --- | --- | --- | ---: | --- |
 | 标准分钟因子 | `generate_etf_minute_factors.py` | ETF | base 52 / multi 156 | `D:\workspace\stockdata\etf-data\etf_1min_factors*` |
-| FZ 分钟因子 | `generate_etf_fz_minute_factors.py` | ETF | 34 | `D:\workspace\stockdata\etf-data\etf_1min_fz_factors` |
+| FZ 日频因子 | `generate_etf_fz_daily_factors.py` | ETF | 34 | `D:\workspace\stockdata\etf-data\etf_daily_fz_factors` |
 | CICC 分钟因子 | `generate_etf_cicc_minute_factors.py` | ETF | 58 | `D:\workspace\stockdata\etf-data\etf_1min_cicc_factors` |
 | Advanced 因子 | `generate_stock_advanced_factor.py` / `generate_etf_advanced_factor.py` | 股票 / ETF | 46 | `stock_advanced_factors` / `etf_1min_advanced_factors` |
 | Orderbook 因子 | `generate_stock_orderbook_factors.py` | 股票 + ETF | base 63 / multi 135 | `stock_1min_orderbook_factors*` / `etf_1min_orderbook_factors*` |
@@ -75,18 +75,24 @@ uv run python scripts/generate_etf_minute_factors.py --window-profile base --wor
 uv run python scripts/generate_etf_minute_factors.py --window-profile multi --workers 5
 ```
 
-### 3.2 FZ 分钟因子
+### 3.2 FZ 日频因子
 
-入口：`scripts/generate_etf_fz_minute_factors.py`  
+入口：`scripts/generate_etf_fz_daily_factors.py`
 实现来源：项目同级 `Replication-of-Minute-Frequency-Factor-refer-FZ`
 
 脚本先把分钟行情拆成交易日面板，计算原始 FZ 因子，再计算组合因子，最后按
-`code/date` 合并回分钟数据并输出每个 ETF 一个 parquet。`GaoDiECha` 等因子还需要 ETF 日线数据。
+`code/factor_date` 输出每个 ETF 一份日频 parquet。输入必须是 orderbook 同口径的
+241 根分钟：`09:30–11:30`、`13:01–15:00`；缺行、重复或异常时间网格的
+`code/date` 会跳过且记录告警。`GaoDiECha` 等因子还需要 ETF 日线数据。
+
+`factor_date=d` 的暴露包含 d 日完整分钟信息，只能在 d+1 或之后用于回测和交易；
+不再回填到 d 日的分钟线。旧 `generate_etf_fz_minute_factors.py` 仅保留兼容入口，
+运行时会输出弃用提示并生成同样的日频文件。
 
 常用命令：
 
 ```powershell
-uv run python scripts/generate_etf_fz_minute_factors.py --workers 5
+uv run python scripts/generate_etf_fz_daily_factors.py --workers 5
 ```
 
 该入口是文件级跳过：只要目标 parquet 已存在且未传 `--overwrite`，整个标的都会跳过。
@@ -292,7 +298,7 @@ uv run python scripts/generate_etf_advanced_factor.py --symbols 510300.SH --work
 
 ```powershell
 uv run python scripts/generate_etf_minute_factors.py --workers 5
-uv run python scripts/generate_etf_fz_minute_factors.py --workers 5
+uv run python scripts/generate_etf_fz_daily_factors.py --workers 5
 uv run python scripts/generate_etf_cicc_minute_factors.py --workers 5
 uv run python scripts/generate_etf_advanced_factor.py --workers 5
 uv run python scripts/generate_etf_orderbook_factors.py --workers 5

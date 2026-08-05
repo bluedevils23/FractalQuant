@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from bisect import bisect_right
 import logging
 import os
 import sys
@@ -27,28 +28,22 @@ if str(REPLICATION_ROOT) not in sys.path:
 import MinuteFrequentFactorCalculateMethodsFZ as fz_methods  # noqa: E402
 
 
-LOGGER = logging.getLogger("generate_etf_fz_minute_factors")
+LOGGER = logging.getLogger("generate_etf_fz_daily_factors")
 
 DEFAULT_INPUT_ROOT = Path(r"D:\workspace\stockdata\etf-data\etf_1min")
 DEFAULT_DAILY_ROOT = Path(r"D:\workspace\stockdata\etf-data\etf_daily.parquet")
-DEFAULT_OUTPUT_ROOT = Path(r"D:\workspace\stockdata\etf-data\etf_1min_fz_factors")
+DEFAULT_OUTPUT_ROOT = Path(r"D:\workspace\stockdata\etf-data\etf_daily_fz_factors")
 REQUIRED_COLUMNS = ("open", "high", "low", "close", "volume", "amount")
-BASE_OUTPUT_COLUMNS = (
-    "ts_code",
-    "open",
-    "high",
-    "low",
-    "close",
-    "volume",
-    "amount",
-    "adj_factor",
-)
+MORNING_MINUTES = pd.date_range("09:30", "11:30", freq="min").time
+AFTERNOON_MINUTES = pd.date_range("13:01", "15:00", freq="min").time
+EXPECTED_MINUTE_TIMES = frozenset((*MORNING_MINUTES, *AFTERNOON_MINUTES))
+EXPECTED_MINUTE_ROWS = len(EXPECTED_MINUTE_TIMES)
 
 
 @dataclass(frozen=True)
 class FactorSpec:
     name: str
-    function: Callable[..., pl.DataFrame | None]
+    function: Callable[..., pl.DataFrame | pl.LazyFrame | None]
     needs_daily_pv: bool = False
 
 
@@ -141,7 +136,7 @@ ALL_FACTOR_NAMES = tuple(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Generate ETF FangZheng minute factors from local parquet files."
+        description="Generate ETF FangZheng daily factors from local minute parquet files."
     )
     parser.add_argument(
         "--input-root",
@@ -159,7 +154,7 @@ def parse_args() -> argparse.Namespace:
         "--output-root",
         type=Path,
         default=DEFAULT_OUTPUT_ROOT,
-        help="Directory where factor parquet files will be written.",
+        help="Directory where one daily factor parquet file per ETF will be written.",
     )
     parser.add_argument(
         "--symbols",
@@ -189,6 +184,24 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=os.cpu_count() or 1,
         help="Number of parallel workers to use for file-based stages.",
+    )
+    parser.add_argument(
+        "--date-from",
+        type=pd.Timestamp,
+        default=None,
+        help="First factor_date to write, inclusive (for example 2022-01-01).",
+    )
+    parser.add_argument(
+        "--date-to",
+        type=pd.Timestamp,
+        default=None,
+        help="Last factor_date to write, inclusive (defaults to the latest input date).",
+    )
+    parser.add_argument(
+        "--stage-root",
+        type=Path,
+        default=None,
+        help="Optional directory for temporary day-by-symbol minute partitions.",
     )
     return parser.parse_args()
 
@@ -300,7 +313,6 @@ def normalize_minute_frame(raw_df: pd.DataFrame) -> pd.DataFrame:
         raise ValueError("Missing ts_code column in source minute parquet.")
 
     df = df.sort_index()
-    df = df[~df.index.duplicated(keep="last")]
 
     numeric_columns = [
         column
@@ -349,22 +361,55 @@ def convert_time_to_int(series: pd.Series) -> pd.Series:
     return trade_time.dt.hour * 10000000 + trade_time.dt.minute * 100000
 
 
-def build_trade_day_slice(input_path: Path, stage_root: Path) -> tuple[str, int]:
+def validate_fz_trade_day(day_frame: pd.DataFrame) -> str | None:
+    trade_times = pd.to_datetime(day_frame["trade_time"])
+    if trade_times.duplicated().any():
+        return "duplicate trade_time"
+    if len(trade_times) != EXPECTED_MINUTE_ROWS:
+        return f"expected {EXPECTED_MINUTE_ROWS} rows, found {len(trade_times)}"
+    minute_times = frozenset(trade_times.dt.time)
+    if minute_times != EXPECTED_MINUTE_TIMES:
+        missing = len(EXPECTED_MINUTE_TIMES - minute_times)
+        unexpected = len(minute_times - EXPECTED_MINUTE_TIMES)
+        return f"invalid minute grid (missing={missing}, unexpected={unexpected})"
+    return None
+
+
+def build_trade_day_slice(
+    input_path: Path,
+    stage_root: Path,
+    compute_date_from: pd.Timestamp | None = None,
+    date_to: pd.Timestamp | None = None,
+) -> tuple[str, int, list[tuple[str, str]]]:
     raw_df = pd.read_parquet(input_path)
     minute_df = normalize_minute_frame(raw_df).reset_index()
     minute_df["trade_date"] = pd.to_datetime(minute_df["trade_time"]).dt.normalize()
+    if compute_date_from is not None:
+        minute_df = minute_df.loc[
+            minute_df["trade_date"] >= pd.Timestamp(compute_date_from).normalize()
+        ]
+    if date_to is not None:
+        minute_df = minute_df.loc[
+            minute_df["trade_date"] <= pd.Timestamp(date_to).normalize()
+        ]
     export_columns = [
         column
         for column in ("trade_time", "trade_date", "ts_code", "open", "high", "low", "close", "volume", "amount")
         if column in minute_df.columns
     ]
     exported_days = 0
+    skipped_days: list[tuple[str, str]] = []
     for trade_date, day_frame in minute_df[export_columns].groupby("trade_date", sort=True):
+        reason = validate_fz_trade_day(day_frame)
+        date_text = pd.Timestamp(trade_date).strftime("%Y-%m-%d")
+        if reason is not None:
+            skipped_days.append((date_text, reason))
+            continue
         day_dir = stage_root / pd.Timestamp(trade_date).strftime("%Y%m%d")
         day_dir.mkdir(parents=True, exist_ok=True)
         day_frame.to_parquet(day_dir / input_path.name, index=False)
         exported_days += 1
-    return (input_path.name, exported_days)
+    return (input_path.name, exported_days, skipped_days)
 
 
 def load_day_minute_panel(day_dir: Path) -> pl.DataFrame:
@@ -448,11 +493,27 @@ def build_base_keys(frame: pl.DataFrame) -> pl.DataFrame:
 
 def normalize_factor_output(
     factor_name: str,
-    factor_df: pl.DataFrame | None,
+    factor_df: pl.DataFrame | pl.LazyFrame | None,
     base_keys: pl.DataFrame,
 ) -> pl.DataFrame:
-    if factor_df is None or factor_df.is_empty():
+    if factor_df is None:
         return base_keys.with_columns(pl.lit(None).alias(factor_name))
+
+    if isinstance(factor_df, pl.LazyFrame):
+        factor_df = factor_df.collect()
+    if not isinstance(factor_df, pl.DataFrame):
+        raise TypeError(
+            f"Factor {factor_name} returned {type(factor_df).__name__}, expected Polars DataFrame."
+        )
+    if factor_df.is_empty():
+        return base_keys.with_columns(pl.lit(None).alias(factor_name))
+
+    missing_keys = {"code", "date"} - set(factor_df.columns)
+    if missing_keys:
+        raise ValueError(f"Factor {factor_name} is missing key columns: {sorted(missing_keys)}")
+    duplicate_keys = factor_df.group_by(["code", "date"]).len().filter(pl.col("len") > 1)
+    if duplicate_keys.height:
+        raise ValueError(f"Factor {factor_name} returned duplicate code/date keys.")
 
     value_columns = [
         column for column in factor_df.columns if column not in {"code", "date"}
@@ -473,27 +534,78 @@ def normalize_factor_output(
     )
 
 
+def partition_daily_pv_by_date(
+    daily_pv: pl.DataFrame,
+) -> tuple[list[str], dict[str, pl.DataFrame]]:
+    partitions = daily_pv.partition_by("Trddt", as_dict=True)
+    by_date = {str(key[0]): frame for key, frame in partitions.items()}
+    return sorted(by_date), by_date
+
+
+def select_daily_pv_window(
+    daily_dates: list[str],
+    daily_pv_by_date: dict[str, pl.DataFrame],
+    factor_date: pd.Timestamp,
+    window_size: int = 20,
+) -> pl.DataFrame:
+    date_text = pd.Timestamp(factor_date).strftime("%Y-%m-%d")
+    end = bisect_right(daily_dates, date_text)
+    selected_dates = daily_dates[max(0, end - window_size):end]
+    if not selected_dates:
+        return pl.DataFrame(schema=daily_pv_by_date[daily_dates[0]].schema)
+    return pl.concat([daily_pv_by_date[date] for date in selected_dates], how="vertical")
+
+
+def calculate_raw_daily_exposure(
+    date_dir: Path, daily_pv_window: pl.DataFrame
+) -> pl.DataFrame:
+    minute_panel = load_day_minute_panel(date_dir)
+    base_keys = build_base_keys(minute_panel)
+    day_exposure = base_keys
+    for spec in RAW_FACTOR_SPECS:
+        factor_df = (
+            spec.function(minute_panel, daily_pv_window)
+            if spec.needs_daily_pv
+            else spec.function(minute_panel)
+        )
+        day_exposure = day_exposure.join(
+            normalize_factor_output(spec.name, factor_df, base_keys),
+            on=["code", "date"],
+            how="left",
+        )
+    return day_exposure
+
+
 def calculate_raw_daily_panel(
     stage_root: Path,
     daily_pv: pl.DataFrame,
+    workers: int,
 ) -> pl.DataFrame:
-    daily_frames: list[pl.DataFrame] = []
     date_dirs = sorted(path for path in stage_root.iterdir() if path.is_dir())
-    for date_dir in date_dirs:
-        minute_panel = load_day_minute_panel(date_dir)
-        base_keys = build_base_keys(minute_panel)
-        day_exposure = base_keys
-        for spec in RAW_FACTOR_SPECS:
-            if spec.needs_daily_pv:
-                factor_df = spec.function(minute_panel, daily_pv)
-            else:
-                factor_df = spec.function(minute_panel)
-            day_exposure = day_exposure.join(
-                normalize_factor_output(spec.name, factor_df, base_keys),
-                on=["code", "date"],
-                how="left",
+    daily_dates, daily_pv_by_date = partition_daily_pv_by_date(daily_pv)
+    date_inputs = [
+        (
+            date_dir,
+            select_daily_pv_window(
+                daily_dates, daily_pv_by_date, pd.Timestamp(date_dir.name)
+            ),
+        )
+        for date_dir in date_dirs
+    ]
+    if workers == 1:
+        daily_frames = [
+            calculate_raw_daily_exposure(date_dir, daily_pv_window)
+            for date_dir, daily_pv_window in date_inputs
+        ]
+    else:
+        with ProcessPoolExecutor(max_workers=workers) as executor:
+            daily_frames = list(
+                executor.map(
+                    calculate_raw_daily_exposure,
+                    (date_dir for date_dir, _ in date_inputs),
+                    (daily_pv_window for _, daily_pv_window in date_inputs),
+                )
             )
-        daily_frames.append(day_exposure)
 
     if not daily_frames:
         raise ValueError("No daily minute slices were staged for FZ computation.")
@@ -536,16 +648,50 @@ def calculate_composed_panel(panel: pl.DataFrame) -> pl.DataFrame:
 
 
 def build_final_daily_factor_frame(
-    raw_panel: pl.DataFrame,
     composed_panel: pl.DataFrame,
 ) -> pd.DataFrame:
-    factor_columns = [name for name in ALL_FACTOR_NAMES if name in composed_panel.columns]
-    output = composed_panel.select(["code", "date", *factor_columns]).to_pandas()
+    missing_factor_columns = [
+        name for name in ALL_FACTOR_NAMES if name not in composed_panel.columns
+    ]
+    if missing_factor_columns:
+        composed_panel = composed_panel.with_columns(
+            pl.lit(None).alias(name) for name in missing_factor_columns
+        )
+    output = composed_panel.select(["code", "date", *ALL_FACTOR_NAMES]).to_pandas()
     output["date"] = pd.to_datetime(output["date"])
     return output.sort_values(["code", "date"]).reset_index(drop=True)
 
 
-def merge_factors_for_symbol(
+def resolve_compute_date_from(
+    daily_base: pd.DataFrame,
+    output_date_from: pd.Timestamp | None,
+    warmup_days: int = 20,
+) -> pd.Timestamp | None:
+    if output_date_from is None:
+        return None
+
+    trading_dates = pd.DatetimeIndex(daily_base["trade_date"].drop_duplicates()).sort_values()
+    start = pd.Timestamp(output_date_from).normalize()
+    first_output_index = trading_dates.searchsorted(start, side="left")
+    if first_output_index == len(trading_dates):
+        return start
+    return trading_dates[max(0, first_output_index - warmup_days)]
+
+
+def filter_factor_date_range(
+    factor_frame: pd.DataFrame,
+    date_from: pd.Timestamp | None,
+    date_to: pd.Timestamp | None,
+) -> pd.DataFrame:
+    result = factor_frame
+    if date_from is not None:
+        result = result.loc[result["date"] >= pd.Timestamp(date_from).normalize()]
+    if date_to is not None:
+        result = result.loc[result["date"] <= pd.Timestamp(date_to).normalize()]
+    return result.reset_index(drop=True)
+
+
+def write_daily_factors_for_symbol(
     input_path: Path,
     output_root: Path,
     overwrite: bool,
@@ -555,36 +701,28 @@ def merge_factors_for_symbol(
     if output_path.exists() and not overwrite:
         return ("skipped", output_path, None, None)
 
-    raw_df = pd.read_parquet(input_path)
-    minute_df = normalize_minute_frame(raw_df)
-    minute_df["trade_date"] = pd.to_datetime(minute_df.index).normalize()
     symbol = normalize_symbol_id(input_path.name)
     symbol_factors = factor_frame.loc[factor_frame["code"] == symbol].copy()
-    symbol_factors = symbol_factors.rename(columns={"code": "ts_code", "date": "trade_date"})
-
-    result = minute_df.reset_index().merge(
-        symbol_factors,
-        on=["ts_code", "trade_date"],
-        how="left",
-        validate="many_to_one",
-    )
-    result = result.set_index("trade_time")
-    result.index.name = "trade_time"
-    result = result.drop(columns=["trade_date"])
-
-    ordered_columns = [
-        column for column in BASE_OUTPUT_COLUMNS if column in result.columns
-    ]
-    ordered_columns.extend(
-        column for column in ALL_FACTOR_NAMES if column in result.columns
-    )
-    remaining_columns = [
-        column for column in result.columns if column not in ordered_columns
-    ]
-    result = result[ordered_columns + remaining_columns]
+    result = symbol_factors.rename(
+        columns={"code": "ts_code", "date": "factor_date"}
+    ).sort_values("factor_date")
+    result = result.set_index("factor_date")
+    result.index.name = "factor_date"
+    result = result[["ts_code", *ALL_FACTOR_NAMES]]
 
     output_root.mkdir(parents=True, exist_ok=True)
-    result.to_parquet(output_path)
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            dir=output_root, suffix=".parquet", delete=False
+        ) as temporary_file:
+            temporary_path = Path(temporary_file.name)
+        result.to_parquet(temporary_path)
+        os.replace(temporary_path, output_path)
+    except Exception:
+        if temporary_path is not None and temporary_path.exists():
+            temporary_path.unlink()
+        raise
     return ("written", output_path, len(result), len(result.columns))
 
 
@@ -602,38 +740,84 @@ def main() -> int:
 
     symbols = {normalize_symbol_id(path.name) for path in files}
     daily_base, daily_pv = load_daily_inputs(args.daily_root, symbols)
+    compute_date_from = resolve_compute_date_from(daily_base, args.date_from)
+    if args.date_from is not None and args.date_to is not None and args.date_from > args.date_to:
+        raise ValueError("--date-from must be on or before --date-to")
 
     worker_count = max(1, args.workers)
-    LOGGER.info("Processing %s ETF minute parquet files for FZ factors", len(files))
+    LOGGER.info("Processing %s ETF minute parquet files for FZ daily factors", len(files))
+    if args.date_from is not None or args.date_to is not None:
+        LOGGER.info(
+            "Writing factor dates from %s to %s (compute starts at %s for 20-day warmup)",
+            args.date_from.date() if args.date_from is not None else "first available",
+            args.date_to.date() if args.date_to is not None else "latest available",
+            compute_date_from.date() if compute_date_from is not None else "first available",
+        )
+    if len(files) < 10:
+        LOGGER.warning(
+            "Only %s symbols selected; cross-sectional FZ outputs are suitable for smoke testing only.",
+            len(files),
+        )
 
-    with tempfile.TemporaryDirectory(prefix="etf_fz_stage_") as stage_dir_name:
+    if args.stage_root is not None:
+        args.stage_root.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(
+        prefix="etf_fz_stage_", dir=args.stage_root
+    ) as stage_dir_name:
         stage_root = Path(stage_dir_name)
+        skipped_days: list[tuple[str, str, str]] = []
         if worker_count == 1:
             for input_path in files:
-                _, exported_days = build_trade_day_slice(input_path, stage_root)
+                file_name, exported_days, invalid_days = build_trade_day_slice(
+                    input_path, stage_root, compute_date_from, args.date_to
+                )
+                skipped_days.extend(
+                    (file_name, trade_date, reason)
+                    for trade_date, reason in invalid_days
+                )
                 LOGGER.info("Staged %s trade days for %s", exported_days, input_path.name)
         else:
             LOGGER.info("Using %s workers for staging", worker_count)
             with ProcessPoolExecutor(max_workers=worker_count) as executor:
                 future_map = {
-                    executor.submit(build_trade_day_slice, input_path, stage_root): input_path
+                    executor.submit(
+                        build_trade_day_slice,
+                        input_path,
+                        stage_root,
+                        compute_date_from,
+                        args.date_to,
+                    ): input_path
                     for input_path in files
                 }
                 for future in as_completed(future_map):
                     input_path = future_map[future]
-                    file_name, exported_days = future.result()
+                    file_name, exported_days, invalid_days = future.result()
+                    skipped_days.extend(
+                        (file_name, trade_date, reason)
+                        for trade_date, reason in invalid_days
+                    )
                     LOGGER.info("Staged %s trade days for %s", exported_days, file_name)
 
-        raw_panel = calculate_raw_daily_panel(stage_root, daily_pv)
+        if skipped_days:
+            LOGGER.warning(
+                "Skipped %s incomplete FZ code/date inputs; first entries: %s",
+                len(skipped_days),
+                skipped_days[:10],
+            )
+
+        raw_panel = calculate_raw_daily_panel(stage_root, daily_pv, worker_count)
         panel_with_daily = enrich_with_daily_base(raw_panel, daily_base)
         composed_panel = calculate_composed_panel(panel_with_daily)
-        final_factor_frame = build_final_daily_factor_frame(raw_panel, composed_panel)
+        final_factor_frame = build_final_daily_factor_frame(composed_panel)
+        final_factor_frame = filter_factor_date_range(
+            final_factor_frame, args.date_from, args.date_to
+        )
 
     failures: list[tuple[Path, str]] = []
     if worker_count == 1:
         for input_path in files:
             try:
-                status, output_path, row_count, column_count = merge_factors_for_symbol(
+                status, output_path, row_count, column_count = write_daily_factors_for_symbol(
                     input_path,
                     args.output_root,
                     args.overwrite,
@@ -656,7 +840,7 @@ def main() -> int:
         with ProcessPoolExecutor(max_workers=worker_count) as executor:
             future_map = {
                 executor.submit(
-                    merge_factors_for_symbol,
+                    write_daily_factors_for_symbol,
                     input_path,
                     args.output_root,
                     args.overwrite,
@@ -692,4 +876,9 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    print(
+        "DEPRECATED: generate_etf_fz_minute_factors.py now generates daily FZ exposures. "
+        "Use generate_etf_fz_daily_factors.py instead.",
+        file=sys.stderr,
+    )
     raise SystemExit(main())
