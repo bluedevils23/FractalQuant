@@ -303,6 +303,25 @@ def normalize_reference_frame(raw_frame: pd.DataFrame) -> pd.DataFrame:
         frame.index = pd.to_datetime(
             frame.index.get_level_values("trade_time")
         )
+    elif isinstance(frame.index, pd.MultiIndex):
+        fallback_index = None
+        for level in range(frame.index.nlevels - 1, -1, -1):
+            candidate = pd.to_datetime(
+                frame.index.get_level_values(level), errors="coerce"
+            )
+            if candidate.isna().all():
+                continue
+            fallback_index = candidate
+            if ((candidate.normalize() != candidate) & candidate.notna()).any():
+                frame.index = candidate
+                break
+        else:
+            if fallback_index is not None:
+                frame.index = fallback_index
+            else:
+                raise ValueError(
+                    "Cannot locate trade_time/datetime index or column."
+                )
     elif "trade_time" in frame.columns:
         frame.index = pd.to_datetime(frame.pop("trade_time"))
     elif "datetime" in frame.columns:

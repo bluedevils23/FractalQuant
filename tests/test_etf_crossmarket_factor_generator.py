@@ -26,6 +26,7 @@ from scripts.generate_etf_crossmarket_factors import (
     load_etf_daily_histories,
     load_mapping_records,
     main,
+    normalize_reference_frame,
     process_mapping_group,
     process_mapping_record,
     resolve_reference_path,
@@ -667,3 +668,14 @@ def test_main_groups_data_aliases_and_excludes_missing_references(
     assert output["same_index_relative_return_1m"].iloc[1:].notna().all()
     assert "1 selected ETFs use reference code aliases" in caplog.text
     assert "Excluding 1 ETF(s) across 1 reference group(s)" in caplog.text
+
+
+def test_normalize_reference_frame_accepts_unnamed_multiindex_trade_time() -> None:
+    raw = _raw_parquet_days(("2026-01-05",), reference=True)
+    raw.index = raw.index.set_names([None, None])
+
+    normalized = normalize_reference_frame(raw)
+
+    assert normalized.index.name == "trade_time"
+    assert normalized.index[0] == pd.Timestamp("2026-01-05 09:30:00")
+    assert list(normalized.columns) == ["open", "close", "volume", "amount"]
