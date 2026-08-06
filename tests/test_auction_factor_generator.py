@@ -538,16 +538,26 @@ def test_twenty_day_auction_zscore_and_prior_adv_are_strictly_historical() -> No
     )
 
 
-def test_prev5d_adv_requires_five_consecutive_valid_observations() -> None:
+def test_prev5d_adv_skips_halted_days_using_last_five_valid_observations() -> None:
     frame = _historical_frame([10.0] * 7)
     daily_index = pd.date_range("2026-01-01", periods=7, freq="D")
     daily_amounts = pd.Series([1000, 2000, np.nan, 4000, 5000, 6000, 7000], index=daily_index)
 
     result = apply_historical_ratios(frame, daily_amount_history=daily_amounts)
 
+    # Row 5 (2026-01-06): only four valid prior observations -> still NaN.
     assert np.isnan(result.loc[5, "previous_5d_average_daily_amount"])
     assert np.isnan(result.loc[5, "auction_amount_to_prev5d_adv_240"])
-    assert np.isnan(result.loc[6, "auction_amount_to_prev5d_adv_240"])
+
+    # Row 6 (2026-01-07): five valid prior observations after skipping the halt.
+    expected_5d_adv = np.mean([1000.0, 2000.0, 4000.0, 5000.0, 6000.0])
+    assert np.isclose(
+        result.loc[6, "previous_5d_average_daily_amount"], expected_5d_adv
+    )
+    assert np.isclose(
+        result.loc[6, "auction_amount_to_prev5d_adv_240"],
+        10.0 / (expected_5d_adv / 240.0),
+    )
 
 
 def test_daily_amount_history_sums_minute_bars_by_trade_date(tmp_path) -> None:
@@ -677,7 +687,7 @@ def test_external_context_applies_benchmark_time_and_excess_returns() -> None:
     assert np.isclose(result["auction_stage2_excess_return_benchmark"], 0.006)
 
 
-def test_session_path_companion_is_minute_causal_and_resets_at_lunch(tmp_path) -> None:
+def test_session_path_companion_is_minute_causal_and_cumulative_across_lunch(tmp_path) -> None:
     trade_dates = pd.to_datetime(
         ["2026-01-01", "2026-01-02", "2026-01-02", "2026-01-02"]
     )
@@ -714,10 +724,11 @@ def test_session_path_companion_is_minute_causal_and_resets_at_lunch(tmp_path) -
     assert np.isclose(
         result.loc[1, "intraday_rebound_from_session_low"], 10.3 / 10.0 - 1
     )
+    # Full-day cumulative: 13:00 bar still measured against the morning high/low.
     assert np.isclose(
-        result.loc[2, "intraday_drawdown_from_session_high"], 10.2 / 10.3 - 1
+        result.loc[2, "intraday_drawdown_from_session_high"], 10.2 / 11.0 - 1
     )
-    assert np.isclose(result.loc[2, "intraday_rebound_from_session_low"], 10.2 / 10.1 - 1)
+    assert np.isclose(result.loc[2, "intraday_rebound_from_session_low"], 10.2 / 10.0 - 1)
     assert np.allclose(result["intraday_return_from_prev_close"], [0.04, 0.03, 0.02])
 
 

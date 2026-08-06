@@ -1527,8 +1527,7 @@ def build_session_path_factor_frame(
     daily_close = work.groupby("trade_date", sort=True)["close"].last()
     previous_close = daily_close.shift(1)
     work["_previous_close"] = work["trade_date"].map(previous_close)
-    work["_session"] = np.where(work["bar_time"].dt.hour < 13, "am", "pm")
-    session_groups = work.groupby(["trade_date", "_session"], sort=False)
+    session_groups = work.groupby("trade_date", sort=False)
     session_high = session_groups["high"].cummax()
     session_low = session_groups["low"].cummin()
     valid_close = work["close"].where(work["close"].gt(0))
@@ -1684,13 +1683,10 @@ def apply_historical_ratios(
             prior_daily_amounts = daily_amount_history.loc[
                 daily_amount_history.index < pd.Timestamp(trade_date)
             ]
-            previous_5d = prior_daily_amounts.tail(SHORT_DAILY_AMOUNT_LOOKBACK_DAYS)
-            previous_5d_valid = (
-                len(previous_5d) == SHORT_DAILY_AMOUNT_LOOKBACK_DAYS
-                and np.isfinite(previous_5d).all()
-                and previous_5d.gt(0).all()
-            )
-            if previous_5d_valid:
+            previous_5d = prior_daily_amounts.loc[
+                np.isfinite(prior_daily_amounts) & prior_daily_amounts.gt(0)
+            ].tail(SHORT_DAILY_AMOUNT_LOOKBACK_DAYS)
+            if len(previous_5d) >= SHORT_DAILY_AMOUNT_LOOKBACK_DAYS:
                 average_5d_amount = float(previous_5d.mean())
                 result.at[index, "previous_5d_average_daily_amount"] = average_5d_amount
                 if np.isfinite(row["auction_amount"]):
