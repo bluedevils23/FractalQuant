@@ -32,6 +32,10 @@ MLOFI_LEVEL_DECAY = 0.8
 NEAR_TOUCH_LEVELS = 5
 AMIHUD_WINDOW = "300s"
 AMIHUD_MIN_RETURNS = 2
+ARRIVAL_EXCITATION_WINDOW = pd.Timedelta(seconds=30)
+ARRIVAL_EXCITATION_BASELINE_WINDOW = pd.Timedelta(seconds=300)
+ARRIVAL_EXCITATION_HALF_LIFE = pd.Timedelta(seconds=5)
+ARRIVAL_EXCITATION_MIN_BASELINE_EVENTS = 20
 REFILL_LOOKBACK_SNAPSHOTS = 6
 PRESSURE_SPREAD_FLOOR_BPS = 1.0
 CONTEXT_LOOKBACK_SNAPSHOTS = 20
@@ -1826,6 +1830,153 @@ def _calculate_trade_window_summary(
     return result
 
 
+def calculate_trade_arrival_excitation_factors(
+    trades: pd.DataFrame,
+    quote_index: pd.DatetimeIndex,
+) -> pd.DataFrame:
+    """Calculate causal exponential trade-arrival excitation proxies."""
+    columns = [
+        "trade_arrival_excitation_30s",
+        "trade_arrival_excitation_imbalance_30s",
+        "trade_cross_side_excitation_30s",
+    ]
+    result = pd.DataFrame(np.nan, index=quote_index, columns=columns, dtype=float)
+    if trades.empty or quote_index.empty:
+        return result
+
+    ordered = trades.loc[:, ["event_time", "side"]].copy()
+    ordered["event_time"] = pd.to_datetime(ordered["event_time"], errors="coerce")
+    ordered["side"] = ordered["side"].astype(str).str.upper()
+    ordered = ordered.loc[
+        ordered["event_time"].notna() & ordered["side"].isin(["B", "S"])
+    ].sort_values("event_time", kind="stable")
+    if ordered.empty:
+        return result
+
+    event_times = pd.DatetimeIndex(ordered["event_time"])
+    event_sessions = _trading_session_labels(event_times)
+    event_trading_times = _trading_time_index(event_times)
+    event_side = np.where(ordered["side"].to_numpy(dtype=str) == "B", 0, 1)
+    quote_sessions = _trading_session_labels(quote_index)
+    quote_trading_times = _trading_time_index(quote_index)
+
+    event_window_seconds = ARRIVAL_EXCITATION_WINDOW.total_seconds()
+    baseline_window_seconds = ARRIVAL_EXCITATION_BASELINE_WINDOW.total_seconds()
+    baseline_duration_seconds = baseline_window_seconds - event_window_seconds
+    decay_rate = np.log(2.0) / ARRIVAL_EXCITATION_HALF_LIFE.total_seconds()
+    kernel_duration = (1.0 - np.exp(-decay_rate * event_window_seconds)) / decay_rate
+
+    for session in pd.unique(quote_sessions):
+        quote_positions = np.flatnonzero(quote_sessions == session)
+        event_positions = np.flatnonzero(event_sessions == session)
+        if not len(event_positions):
+            continue
+
+        session_quote_order = np.argsort(
+            quote_trading_times[quote_positions].asi8, kind="stable"
+        )
+        ordered_quote_positions = quote_positions[session_quote_order]
+        session_quote_ns = quote_trading_times[ordered_quote_positions].asi8
+        session_event_ns = event_trading_times[event_positions].asi8
+        origin_ns = min(session_quote_ns[0], session_event_ns[0])
+        quote_seconds = (session_quote_ns - origin_ns) / 1_000_000_000.0
+        event_seconds = (session_event_ns - origin_ns) / 1_000_000_000.0
+        sides = event_side[event_positions]
+
+        decayed_mass = np.zeros(2, dtype=float)
+        active_events: list[tuple[float, int]] = []
+        active_start = 0
+        cross_events: list[tuple[float, float]] = []
+        cross_start = 0
+        cross_sum = 0.0
+        event_cursor = 0
+        baseline_start_cursor = 0
+        baseline_end_cursor = 0
+        last_time: float | None = None
+
+        def advance_state(current_time: float) -> None:
+            nonlocal active_start, last_time
+            if last_time is not None:
+                decayed_mass[:] *= np.exp(-decay_rate * (current_time - last_time))
+            cutoff = current_time - event_window_seconds
+            while active_start < len(active_events):
+                event_time, side_index = active_events[active_start]
+                if event_time > cutoff:
+                    break
+                decayed_mass[side_index] -= np.exp(
+                    -decay_rate * (current_time - event_time)
+                )
+                active_start += 1
+            decayed_mass[:] = np.maximum(decayed_mass, 0.0)
+            last_time = current_time
+
+        for quote_position, quote_time in zip(
+            ordered_quote_positions, quote_seconds
+        ):
+            while (
+                event_cursor < len(event_seconds)
+                and event_seconds[event_cursor] <= quote_time
+            ):
+                event_time = float(event_seconds[event_cursor])
+                side_index = int(sides[event_cursor])
+                advance_state(event_time)
+                prior_mass = float(decayed_mass.sum())
+                if prior_mass > 0.0:
+                    cross_score = decayed_mass[1 - side_index] / prior_mass
+                    cross_events.append((event_time, float(cross_score)))
+                    cross_sum += float(cross_score)
+                decayed_mass[side_index] += 1.0
+                active_events.append((event_time, side_index))
+                event_cursor += 1
+
+            advance_state(float(quote_time))
+            cross_cutoff = quote_time - event_window_seconds
+            while cross_start < len(cross_events):
+                cross_time, cross_score = cross_events[cross_start]
+                if cross_time > cross_cutoff:
+                    break
+                cross_sum -= cross_score
+                cross_start += 1
+
+            if active_start >= len(active_events):
+                continue
+
+            total_mass = float(decayed_mass.sum())
+            if total_mass <= 0.0:
+                continue
+            result.iat[quote_position, 1] = (
+                decayed_mass[0] - decayed_mass[1]
+            ) / total_mass
+
+            active_cross_count = len(cross_events) - cross_start
+            if active_cross_count:
+                result.iat[quote_position, 2] = np.clip(
+                    cross_sum / active_cross_count, 0.0, 1.0
+                )
+
+            baseline_start_cutoff = quote_time - baseline_window_seconds
+            while (
+                baseline_start_cursor < len(event_seconds)
+                and event_seconds[baseline_start_cursor] <= baseline_start_cutoff
+            ):
+                baseline_start_cursor += 1
+            baseline_end_cutoff = quote_time - event_window_seconds
+            while (
+                baseline_end_cursor < len(event_seconds)
+                and event_seconds[baseline_end_cursor] <= baseline_end_cutoff
+            ):
+                baseline_end_cursor += 1
+            baseline_count = baseline_end_cursor - baseline_start_cursor
+            if baseline_count < ARRIVAL_EXCITATION_MIN_BASELINE_EVENTS:
+                continue
+
+            short_rate = total_mass / kernel_duration
+            baseline_rate = baseline_count / baseline_duration_seconds
+            result.iat[quote_position, 0] = np.log(short_rate / baseline_rate)
+
+    return result
+
+
 def calculate_trade_flow_factors(
     trades: pd.DataFrame,
     quotes: pd.DataFrame,
@@ -1856,6 +2007,9 @@ def calculate_trade_flow_factors(
         "liquidity_ratio_60s",
         "volume_weighted_price_60s",
         "orderbook_pressure_60s",
+        "trade_arrival_excitation_30s",
+        "trade_arrival_excitation_imbalance_30s",
+        "trade_cross_side_excitation_30s",
         "vpin_50bucket",
         "adverse_selection_markout_30s",
         "cautious_to_aggressive_buy_ratio_60s",
@@ -1917,6 +2071,10 @@ def calculate_trade_flow_factors(
     result = _calculate_trade_window_summary(trade_metrics, quotes, window)
     advanced = _calculate_trade_impact_factors(trades, quotes.index, window)
     result = pd.concat([result, advanced], axis=1)
+    result = pd.concat(
+        [result, calculate_trade_arrival_excitation_factors(trades, quotes.index)],
+        axis=1,
+    )
     result["vpin_50bucket"] = calculate_vpin_factor(trades, quotes.index)
     result["amihud_illiquidity_5m"] = calculate_amihud_illiquidity_factor(
         trades, quotes.index
