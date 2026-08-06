@@ -1,13 +1,17 @@
-"""Generate daily FangZheng ETF factor exposures from 1-minute market data.
+"""ETF-configured entrypoint for the generic daily FangZheng generator."""
 
-The implementation lives in the legacy module so the former minute entrypoint can
-remain a compatible alias while no longer emitting non-causal minute backfills.
-"""
+from __future__ import annotations
 
 try:
-    from scripts.generate_etf_fz_minute_factors import main
+    from scripts.generate_fz_daily_factors import *  # noqa: F403
+    from scripts.generate_fz_daily_factors import main as _daily_main
 except ModuleNotFoundError:  # Direct ``python scripts/...`` execution.
-    from generate_etf_fz_minute_factors import main
+    from generate_fz_daily_factors import *  # noqa: F403
+    from generate_fz_daily_factors import main as _daily_main
+
+
+def main(argv: list[str] | None = None) -> int:
+    return _daily_main(argv, default_asset_type="etf")
 
 
 if __name__ == "__main__":

@@ -8,7 +8,10 @@ import polars as pl
 import pytest
 
 from scripts import generate_etf_fz_daily_factors as daily_entry
-from scripts import generate_etf_fz_minute_factors as fz
+from scripts import generate_etf_fz_minute_factors as legacy_entry
+from scripts import generate_fz_daily_factors as fz
+
+from FractalQuant.factor.fz_factor import MinFreqFactor
 
 
 def _complete_day_frame(trade_date: str = "2026-01-05") -> pd.DataFrame:
@@ -130,8 +133,68 @@ def test_daily_writer_uses_factor_date_index_and_all_registered_factors(tmp_path
     )[0] == "skipped"
 
 
-def test_daily_entrypoint_reuses_legacy_engine() -> None:
-    assert daily_entry.main is fz.main
+def test_compatibility_entrypoints_reuse_daily_engine() -> None:
+    assert daily_entry.normalize_factor_output is fz.normalize_factor_output
+    assert legacy_entry.normalize_factor_output is fz.normalize_factor_output
+
+
+def test_asset_defaults_cover_stock_and_etf() -> None:
+    stock_args = fz.parse_args(["--asset-type", "stock"])
+    etf_args = fz.parse_args(["--asset-type", "etf"])
+
+    assert stock_args.input_root == fz.STOCK_DEFAULT_INPUT_ROOT
+    assert stock_args.daily_root == fz.STOCK_DEFAULT_DAILY_ROOT
+    assert stock_args.output_root == fz.STOCK_DEFAULT_OUTPUT_ROOT
+    assert etf_args.input_root == fz.ETF_DEFAULT_INPUT_ROOT
+    assert etf_args.daily_root == fz.ETF_DEFAULT_DAILY_ROOT
+    assert etf_args.output_root == fz.ETF_DEFAULT_OUTPUT_ROOT
+
+
+def test_replication_api_collects_and_validates_daily_results() -> None:
+    base = pl.DataFrame(
+        {
+            "code": ["000001.SZ", "000002.SZ"],
+            "date": [date(2026, 1, 5), date(2026, 1, 5)],
+            "factor": [1.0, 2.0],
+        }
+    )
+    result = MinFreqFactor._normalize_daily_result(base.lazy())
+
+    assert MinFreqFactor._normalize_daily_result(None) is None
+    assert isinstance(result, pl.DataFrame)
+    assert result.columns == ["code", "date", "factor"]
+
+    empty = base.head(0)
+    assert MinFreqFactor._normalize_daily_result(empty).is_empty()
+
+    duplicate = pl.concat([base.head(1), base.head(1)])
+    with pytest.raises(ValueError, match="重复的code/date"):
+        MinFreqFactor._normalize_daily_result(duplicate)
+
+    missing_keys = pl.DataFrame({"factor": pl.Series([], dtype=pl.Float64)})
+    with pytest.raises(ValueError, match="缺少键列"):
+        MinFreqFactor._normalize_daily_result(missing_keys)
+
+
+def test_composed_factor_keeps_daily_keys_after_20_day_warmup() -> None:
+    dates = pd.bdate_range("2026-01-01", periods=25).date
+    codes = [f"{index:06d}.SZ" for index in range(10)]
+    rows = [
+        {
+            "code": code,
+            "date": factor_date,
+            "YaoYanBoDongLv": float(code_index + day_index),
+            "YaoYanShouYiLv": float(code_index * 2 - day_index),
+        }
+        for code_index, code in enumerate(codes)
+        for day_index, factor_date in enumerate(dates)
+    ]
+
+    result = fz.fz_methods.cal_ShiDuMaoXian(pl.DataFrame(rows))
+
+    assert result.height == 250
+    assert result.select(["code", "date"]).n_unique() == 250
+    assert result.filter(pl.col("ShiDuMaoXian").is_not_null()).height == 60
 
 
 def test_date_range_keeps_20_trading_day_warmup_and_filters_output() -> None:

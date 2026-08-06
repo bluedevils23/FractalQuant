@@ -14,7 +14,7 @@
 | 管线 | 入口脚本 | 资产 | 因子数量 | 默认输出 |
 | --- | --- | --- | ---: | --- |
 | 标准分钟因子 | `generate_etf_minute_factors.py` | ETF | base 52 / multi 156 | `D:\workspace\stockdata\etf-data\etf_1min_factors*` |
-| FZ 日频因子 | `generate_etf_fz_daily_factors.py` | ETF | 34 | `D:\workspace\stockdata\etf-data\etf_daily_fz_factors` |
+| FZ 日频因子 | `generate_fz_daily_factors.py` | 股票 + ETF | 34 | 按 `--asset-type` 选择默认目录 |
 | CICC 分钟因子 | `generate_etf_cicc_minute_factors.py` | ETF | 58 | `D:\workspace\stockdata\etf-data\etf_1min_cicc_factors` |
 | Advanced 因子 | `generate_stock_advanced_factor.py` / `generate_etf_advanced_factor.py` | 股票 / ETF | 46 | `stock_advanced_factors` / `etf_1min_advanced_factors` |
 | Orderbook 因子 | `generate_stock_orderbook_factors.py` | 股票 + ETF | base 63 / multi 135 | `stock_1min_orderbook_factors*` / `etf_1min_orderbook_factors*` |
@@ -42,10 +42,9 @@
 例如 `501001.SZ` 可以匹配到分钟文件 `501001.SH.parquet`；只有显式传入
 `--strict-suffix` 时才要求完整后缀匹配。
 
-FZ、CICC 两个复现管线还依赖项目同级目录中的外部复现代码：
+CICC 复现管线仍依赖项目同级目录中的外部复现代码：
 
 ```text
-D:\workspace\stock-fractalquant\Replication-of-Minute-Frequency-Factor-refer-FZ
 D:\workspace\stock-fractalquant\Replication-of-Minute-Frequency-Factor-refer-CICC
 ```
 
@@ -77,11 +76,13 @@ uv run python scripts/generate_etf_minute_factors.py --window-profile multi --wo
 
 ### 3.2 FZ 日频因子
 
-入口：`scripts/generate_etf_fz_daily_factors.py`
-实现来源：项目同级 `Replication-of-Minute-Frequency-Factor-refer-FZ`
+统一入口：`scripts/generate_fz_daily_factors.py`
+ETF 兼容入口：`scripts/generate_etf_fz_daily_factors.py`
+实现来源：`FractalQuant/factor/fz_methods.py`、`fz_factor.py`、`fz_base.py`
 
-脚本先把分钟行情拆成交易日面板，计算原始 FZ 因子，再计算组合因子，最后按
-`code/factor_date` 输出每个 ETF 一份日频 parquet。输入必须是 orderbook 同口径的
+脚本通过 `--asset-type stock|etf` 选择股票或 ETF 默认数据目录，先把分钟行情拆成
+交易日面板，计算原始 FZ 因子，再计算组合因子，最后按 `code/factor_date` 输出
+每个标的一份日频 parquet。输入必须是 orderbook 同口径的
 241 根分钟：`09:30–11:30`、`13:01–15:00`；缺行、重复或异常时间网格的
 `code/date` 会跳过且记录告警。`GaoDiECha` 等因子还需要 ETF 日线数据。
 
@@ -89,10 +90,18 @@ uv run python scripts/generate_etf_minute_factors.py --window-profile multi --wo
 不再回填到 d 日的分钟线。旧 `generate_etf_fz_minute_factors.py` 仅保留兼容入口，
 运行时会输出弃用提示并生成同样的日频文件。
 
+默认输出目录：
+
+```text
+股票：D:\workspace\stockdata\stock-factors\stock_fz_daily_factors
+ETF： D:\workspace\stockdata\etf-data\etf_daily_fz_factors
+```
+
 常用命令：
 
 ```powershell
 uv run python scripts/generate_etf_fz_daily_factors.py --workers 5
+uv run python scripts/generate_fz_daily_factors.py --asset-type stock --workers 5
 ```
 
 该入口是文件级跳过：只要目标 parquet 已存在且未传 `--overwrite`，整个标的都会跳过。
@@ -298,7 +307,7 @@ uv run python scripts/generate_etf_advanced_factor.py --symbols 510300.SH --work
 
 ```powershell
 uv run python scripts/generate_etf_minute_factors.py --workers 5
-uv run python scripts/generate_etf_fz_daily_factors.py --workers 5
+uv run python scripts/generate_fz_daily_factors.py --asset-type etf --workers 5
 uv run python scripts/generate_etf_cicc_minute_factors.py --workers 5
 uv run python scripts/generate_etf_advanced_factor.py --workers 5
 uv run python scripts/generate_etf_orderbook_factors.py --workers 5

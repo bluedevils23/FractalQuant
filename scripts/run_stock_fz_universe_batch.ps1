@@ -10,7 +10,7 @@ $dailyRoot = 'D:\workspace\stockdata\stock-data\行情数据\stock_daily.parquet
 $universeRoot = 'D:\workspace\stockdata\stock-factors\stock_universe'
 $factorRoot = 'D:\workspace\stockdata\stock-factors'
 $stageRoot = Join-Path $factorRoot '_tmp_fz_stage'
-$generator = Join-Path $PSScriptRoot 'generate_etf_fz_daily_factors.py'
+$generator = Join-Path $PSScriptRoot 'generate_fz_daily_factors.py'
 
 function Test-UniverseOutput {
     param([string]$Universe, [string]$OutputRoot)
@@ -39,7 +39,7 @@ Test-UniverseOutput -Universe 'csi300' -OutputRoot (Join-Path $factorRoot 'stock
 
 foreach ($universe in @('csi500', 'csi1000')) {
     $outputRoot = Join-Path $factorRoot "stock_fz_daily_factors_$universe"
-    uv run python $generator --input-root $inputRoot --daily-root $dailyRoot --symbols-file (Join-Path $universeRoot "$universe.txt") --date-from 2022-01-01 --output-root $outputRoot --stage-root $stageRoot --workers 8
+    uv run python $generator --asset-type stock --input-root $inputRoot --daily-root $dailyRoot --symbols-file (Join-Path $universeRoot "$universe.txt") --date-from 2022-01-01 --output-root $outputRoot --stage-root $stageRoot --workers 8
     if ($LASTEXITCODE -ne 0) { throw "Generation failed for $universe" }
     Test-UniverseOutput -Universe $universe -OutputRoot $outputRoot
 }
