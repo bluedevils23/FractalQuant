@@ -36,6 +36,7 @@ from factor.price import (  # noqa: E402
     VolumePriceTrendFactor,
 )
 from factor.fractional import FractionalDiffLogCloseFactor  # noqa: E402
+from factor.regime import CausalHMMRegimeProbabilityFactor  # noqa: E402
 from factor.microstructure import (  # noqa: E402
     LiquidityDepthFactor,
     LiquidityMigrationFactor,
@@ -102,6 +103,7 @@ WINDOW_PROFILES = ("base", "multi")
 class FactorSpec:
     output_name: str
     factor: object
+    reset_daily: bool = True
 
 
 def _base_factor_specs() -> list[FactorSpec]:
@@ -159,7 +161,20 @@ def _base_factor_specs() -> list[FactorSpec]:
         VolumeClusteringFactor(window=50),
         LiquidityMigrationFactor(window=50),
     ]
-    return [FactorSpec(factor.name, factor) for factor in factors]
+    specs = [FactorSpec(factor.name, factor) for factor in factors]
+    specs.extend(
+        FactorSpec(
+            factor.name,
+            factor,
+            reset_daily=False,
+        )
+        for factor in (
+            CausalHMMRegimeProbabilityFactor("low"),
+            CausalHMMRegimeProbabilityFactor("mid"),
+            CausalHMMRegimeProbabilityFactor("high"),
+        )
+    )
+    return specs
 
 
 def _window_variants(
@@ -491,6 +506,8 @@ def calculate_factor_frame(
 ) -> pd.DataFrame:
     factor_input = prepare_factor_input(df)
     factor_specs = FACTOR_SPECS_BY_PROFILE[window_profile]
+    daily_specs = tuple(spec for spec in factor_specs if spec.reset_daily)
+    history_specs = tuple(spec for spec in factor_specs if not spec.reset_daily)
 
     # 按交易日分组分别计算滚动窗口因子，避免隔夜跨日污染：
     # 每个交易日开头会有窗口预热期（前若干根 bar 为 NaN），这是预期行为。
@@ -498,18 +515,22 @@ def calculate_factor_frame(
     trade_day_values = trade_days.to_numpy(dtype="datetime64[ns]", copy=False)
 
     if len(trade_day_values) <= 1:
-        factor_df = _calculate_factors_for_group(factor_input, factor_specs)
+        daily_factor_df = _calculate_factors_for_group(factor_input, daily_specs)
     else:
         split_points = np.flatnonzero(trade_day_values[1:] != trade_day_values[:-1]) + 1
         starts = np.concatenate(([0], split_points))
         stops = np.concatenate((split_points, [len(factor_input)]))
         per_day_frames = [
             _calculate_factors_for_group(
-                factor_input.iloc[start:stop], factor_specs
+                factor_input.iloc[start:stop], daily_specs
             )
             for start, stop in zip(starts, stops)
         ]
-        factor_df = pd.concat(per_day_frames, axis=0)
+        daily_factor_df = pd.concat(per_day_frames, axis=0)
+
+    history_factor_df = _calculate_factors_for_group(factor_input, history_specs)
+    factor_df = pd.concat([daily_factor_df, history_factor_df], axis=1)
+    factor_df = factor_df[[spec.output_name for spec in factor_specs]]
 
     return pd.concat([df, factor_df], axis=1)
 

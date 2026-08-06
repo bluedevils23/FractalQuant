@@ -24,6 +24,7 @@ from .price import (
     VolumePriceTrendFactor,
 )
 from .fractional import FractionalDiffLogCloseFactor
+from .regime import CausalHMMRegimeProbabilityFactor
 from .volatility import (
     ATRFactor,
     AnnualizedVolatilityFactor,
@@ -89,6 +90,7 @@ __all__ = [
     "BollingerBandWidthFactor",
     "CCIFactor",
     "CMOFactor",
+    "CausalHMMRegimeProbabilityFactor",
     "EMAFactor",
     "FractionalDiffLogCloseFactor",
     "GarmanKlassVolatilityFactor",

@@ -46,15 +46,18 @@ def test_factor_profiles_have_expected_unique_columns() -> None:
     base_names = [spec.output_name for spec in build_factor_specs("base")]
     multi_names = [spec.output_name for spec in build_factor_specs("multi")]
 
-    assert len(base_names) == len(set(base_names)) == 52
-    assert len(multi_names) == len(set(multi_names)) == 156
-    assert multi_names[:52] == base_names
+    assert len(base_names) == len(set(base_names)) == 55
+    assert len(multi_names) == len(set(multi_names)) == 159
+    assert multi_names[:55] == base_names
     assert {
         "returns_w3",
         "macd_f6_s13_sig5",
         "obv_delta_w20",
         "market_impact_w10",
         "liquidity_migration_w80",
+        "hmm_regime_prob_low_vol",
+        "hmm_regime_prob_mid_vol",
+        "hmm_regime_prob_high_vol",
     } <= set(multi_names)
 
 
@@ -126,8 +129,8 @@ def test_multi_profile_smoke_preserves_base_columns_and_resets_daily() -> None:
     multi = calculate_factor_frame(frame, "multi")
     base_factor_names = [spec.output_name for spec in build_factor_specs("base")]
 
-    assert len(base.columns) == len(frame.columns) + 52
-    assert len(multi.columns) == len(frame.columns) + 156
+    assert len(base.columns) == len(frame.columns) + 55
+    assert len(multi.columns) == len(frame.columns) + 159
     pd.testing.assert_frame_equal(
         multi[base_factor_names], base[base_factor_names]
     )
