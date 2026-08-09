@@ -11,30 +11,37 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq
+
+if __package__:
+    from scripts.auction_tick_cache import AuctionTickCache
+else:
+    from auction_tick_cache import AuctionTickCache
 
 
 LOGGER = logging.getLogger("generate_auction_factors")
 
 DEFAULT_TICK_ROOT = Path(r"E:\逐笔数据")
 DEFAULT_STOCK_MINUTE_ROOT = Path(
-    r"D:\workspace\stockdata\a-share-data\行情数据\stock_1min"
+    r"D:\workspace\stockdata\stock-data\行情数据\stock_1min"
 )
 DEFAULT_ETF_MINUTE_ROOT = Path(r"D:\workspace\stockdata\etf-data\etf_1min")
 DEFAULT_STOCK_DAILY_PATH = Path(
-    r"D:\workspace\stockdata\a-share-data\行情数据\stock_daily.parquet"
+    r"D:\workspace\stockdata\stock-data\行情数据\stock_daily.parquet"
 )
 DEFAULT_ETF_DAILY_PATH = Path(r"D:\workspace\stockdata\etf-data\etf_daily.parquet")
 DEFAULT_STOCK_OUTPUT_ROOT = Path(
-    r"D:\workspace\stockdata\a-share-data\stock_auction_factors"
+    r"D:\workspace\stockdata\stock-factors\stock_auction_factors"
 )
-DEFAULT_ETF_OUTPUT_ROOT = Path(r"D:\workspace\stockdata\etf-data\etf_auction_factors")
+DEFAULT_ETF_OUTPUT_ROOT = Path(r"D:\workspace\stockdata\etf-factors\etf_auction_factors")
 DEFAULT_STOCK_SESSION_PATH_OUTPUT_ROOT = Path(
-    r"D:\workspace\stockdata\a-share-data\stock_intraday_session_path_factors"
+    r"D:\workspace\stockdata\stock-factors\stock_intraday_session_path_factors"
 )
 DEFAULT_ETF_SESSION_PATH_OUTPUT_ROOT = Path(
-    r"D:\workspace\stockdata\etf-data\etf_intraday_session_path_factors"
+    r"D:\workspace\stockdata\etf-factors\etf_intraday_session_path_factors"
 )
 DEFAULT_BENCHMARK_TS_CODE = "510300.SH"
+DEFAULT_AUCTION_CACHE_ROOT = Path(r"D:\workspace\stockdata\auction_tick_cache")
 
 ASSET_TYPES = ("stock", "etf", "both")
 DATE_PATTERN = re.compile(r"^\d{8}$")
@@ -66,6 +73,14 @@ REFERENCE_COLUMNS = [
     "previous_20d_average_daily_amount",
     "previous_5d_average_daily_amount",
     "auction_stage2_twap_price",
+    "auction_stage1_end_time",
+    "auction_stage2_end_time",
+    "previous_day_volume_shares",
+    "previous_day_high",
+    "previous_7d_close_max",
+    "previous_day_float_market_cap_cny",
+    "auction_limit_up_price",
+    "auction_limit_down_price",
     "auction_submitted_volume",
     "benchmark_ts_code",
     "benchmark_available_time",
@@ -133,6 +148,35 @@ PRIORITY_REPORT_FACTOR_COLUMNS = [
     "auction_gap_excess_benchmark",
     "auction_stage2_excess_return_benchmark",
 ]
+REPORT_SUPPLEMENT_FACTOR_COLUMNS = [
+    "auction_range_ratio",
+    "auction_stage1_range_ratio",
+    "auction_stage2_range_ratio",
+    "auction_stage1_end_return_from_prev_close",
+    "auction_stage2_end_return_from_stage1_end",
+    "auction_up_step_ratio",
+    "auction_down_step_ratio",
+    "auction_snapshot_count_total",
+    "auction_l3_buy_share_final",
+    "auction_l3_buy_share_stage1_end",
+    "auction_l3_buy_share_change_stage2",
+    "auction_stage1_max_return_from_prev_close",
+    "auction_stage1_min_return_from_prev_close",
+    "auction_open_pullback_from_stage1_max",
+    "auction_open_rebound_from_stage1_min",
+    "auction_last60s_price_return",
+    "auction_final_to_full_max",
+]
+CONTEXT_SUPPLEMENT_FACTOR_COLUMNS = [
+    "auction_volume_to_prevday_volume",
+    "auction_amount_to_float_mcap_prevclose",
+    "auction_open_to_prev_high",
+    "auction_open_to_prev7d_close_max",
+    "auction_stage1_touched_limit_up",
+    "auction_stage1_touched_limit_down",
+    "auction_stage1_limit_up_distance_bps",
+    "auction_stage1_limit_down_distance_bps",
+]
 FACTOR_COLUMNS = (
     CORE_FACTOR_COLUMNS
     + EVENT_FACTOR_COLUMNS
@@ -140,6 +184,8 @@ FACTOR_COLUMNS = (
     + ROBUST_IMBALANCE_FACTOR_COLUMNS
     + PARTICIPATION_FACTOR_COLUMNS
     + PRIORITY_REPORT_FACTOR_COLUMNS
+    + REPORT_SUPPLEMENT_FACTOR_COLUMNS
+    + CONTEXT_SUPPLEMENT_FACTOR_COLUMNS
 )
 OUTPUT_COLUMNS = KEY_COLUMNS + DIAGNOSTIC_COLUMNS + REFERENCE_COLUMNS + FACTOR_COLUMNS
 SESSION_PATH_OUTPUT_COLUMNS = [
@@ -253,6 +299,17 @@ def parse_args() -> argparse.Namespace:
         help="Only process the first N matched symbols.",
     )
     parser.add_argument("--workers", type=int, default=min(8, os.cpu_count() or 1))
+    parser.add_argument(
+        "--auction-cache-root",
+        type=Path,
+        default=DEFAULT_AUCTION_CACHE_ROOT,
+        help="Read-through cache root for normalized opening-auction tick slices.",
+    )
+    parser.add_argument(
+        "--refresh-auction-cache",
+        action="store_true",
+        help="Rebuild cached tick slices from the source CSV files.",
+    )
     parser.add_argument(
         "--overwrite",
         action="store_true",
@@ -434,115 +491,32 @@ def parse_trade_time(trade_date: pd.Series, raw_time: pd.Series) -> pd.Series:
     )
 
 
-def load_quote_frame(symbol_dir: Path) -> pd.DataFrame:
-    quote_path = symbol_dir / "行情.csv"
-    if not quote_path.exists():
-        raise FileNotFoundError(f"Missing quote file: {quote_path}")
-
-    frame = pd.read_csv(
-        quote_path,
-        encoding="gbk",
-        usecols=list(RAW_COLUMN_MAP),
-        dtype=str,
-        low_memory=False,
-    ).rename(columns=RAW_COLUMN_MAP)
-    frame["trade_time"] = parse_trade_time(frame["raw_trade_date"], frame["raw_time"])
-
-    numeric_columns = PRICE_COLUMNS + QUANTITY_COLUMNS + ["trade_amount"]
-    for column in numeric_columns:
-        frame[column] = pd.to_numeric(frame[column], errors="coerce")
-    frame[PRICE_COLUMNS] = frame[PRICE_COLUMNS] / 10000.0
-    frame[PRICE_COLUMNS] = frame[PRICE_COLUMNS].where(frame[PRICE_COLUMNS] > 0)
-    frame[QUANTITY_COLUMNS + ["trade_amount"]] = frame[
-        QUANTITY_COLUMNS + ["trade_amount"]
-    ].fillna(0.0)
-
-    frame = frame.dropna(subset=["trade_time"])
-    frame = frame.sort_values("trade_time", kind="mergesort")
-    return frame.drop_duplicates("trade_time", keep="last").reset_index(drop=True)
+def load_quote_frame(
+    symbol_dir: Path, cache: AuctionTickCache | None = None
+) -> pd.DataFrame:
+    if cache is not None:
+        return cache.load_quote(symbol_dir)
+    return AuctionTickCache(None).load_quote(symbol_dir)
 
 
 def _empty_event_frame() -> pd.DataFrame:
     return pd.DataFrame(columns=EVENT_COLUMNS)
 
 
-def _load_raw_orders(symbol_dir: Path) -> pd.DataFrame:
-    path = symbol_dir / "逐笔委托.csv"
-    if not path.exists():
-        raise FileNotFoundError(f"Missing order file: {path}")
-    frame = pd.read_csv(
-        path,
-        encoding="gbk",
-        usecols=[
-            "自然日",
-            "时间",
-            "交易所委托号",
-            "委托类型",
-            "委托代码",
-            "委托价格",
-            "委托数量",
-        ],
-        dtype=str,
-        low_memory=False,
-    ).rename(
-        columns={
-            "自然日": "raw_trade_date",
-            "时间": "raw_time",
-            "交易所委托号": "order_id",
-            "委托类型": "order_type",
-            "委托代码": "side",
-            "委托价格": "price",
-            "委托数量": "quantity",
-        }
-    )
-    frame["trade_time"] = parse_trade_time(frame["raw_trade_date"], frame["raw_time"])
-    frame["order_id"] = pd.to_numeric(frame["order_id"], errors="coerce").astype(
-        "Int64"
-    )
-    frame["price"] = pd.to_numeric(frame["price"], errors="coerce") / 10000.0
-    frame["quantity"] = pd.to_numeric(frame["quantity"], errors="coerce")
-    frame["order_type"] = frame["order_type"].astype(str).str.strip().str.upper()
-    frame["side"] = frame["side"].astype(str).str.strip().str.upper()
-    return frame
+def _load_raw_orders(
+    symbol_dir: Path, cache: AuctionTickCache | None = None
+) -> pd.DataFrame:
+    if cache is not None:
+        return cache.load_orders(symbol_dir)
+    return AuctionTickCache(None).load_orders(symbol_dir)
 
 
-def _load_sz_cancellations(symbol_dir: Path) -> pd.DataFrame:
-    path = symbol_dir / "逐笔成交.csv"
-    if not path.exists():
-        raise FileNotFoundError(f"Missing transaction file: {path}")
-    frame = pd.read_csv(
-        path,
-        encoding="gbk",
-        usecols=[
-            "自然日",
-            "时间",
-            "成交代码",
-            "成交数量",
-            "叫卖序号",
-            "叫买序号",
-        ],
-        dtype=str,
-        low_memory=False,
-    ).rename(
-        columns={
-            "自然日": "raw_trade_date",
-            "时间": "raw_time",
-            "成交代码": "trade_code",
-            "成交数量": "quantity",
-            "叫卖序号": "ask_order_id",
-            "叫买序号": "bid_order_id",
-        }
-    )
-    frame["trade_time"] = parse_trade_time(frame["raw_trade_date"], frame["raw_time"])
-    frame["trade_code"] = frame["trade_code"].astype(str).str.strip().str.upper()
-    frame["quantity"] = pd.to_numeric(frame["quantity"], errors="coerce")
-    frame["ask_order_id"] = (
-        pd.to_numeric(frame["ask_order_id"], errors="coerce").fillna(0).astype("int64")
-    )
-    frame["bid_order_id"] = (
-        pd.to_numeric(frame["bid_order_id"], errors="coerce").fillna(0).astype("int64")
-    )
-    return frame
+def _load_sz_cancellations(
+    symbol_dir: Path, cache: AuctionTickCache | None = None
+) -> pd.DataFrame:
+    if cache is not None:
+        return cache.load_transactions(symbol_dir)
+    return AuctionTickCache(None).load_transactions(symbol_dir)
 
 
 def _auction_event_bounds(
@@ -699,16 +673,17 @@ def load_auction_event_frame(
     ts_code: str,
     *,
     expected_trade_date: str | pd.Timestamp | None = None,
+    cache: AuctionTickCache | None = None,
 ) -> tuple[pd.DataFrame, bool]:
     exchange = ts_code.rsplit(".", 1)[-1].upper()
     try:
-        orders = _load_raw_orders(symbol_dir)
+        orders = _load_raw_orders(symbol_dir, cache=cache)
         if exchange == "SH":
             return _reconstruct_sh_events(orders, expected_trade_date)
         if exchange == "SZ":
             return _reconstruct_sz_events(
                 orders,
-                _load_sz_cancellations(symbol_dir),
+                _load_sz_cancellations(symbol_dir, cache=cache),
                 expected_trade_date,
             )
         LOGGER.warning("Unsupported exchange for auction events: %s", ts_code)
@@ -876,6 +851,115 @@ def _apply_stage2_path_factors(
     row["auction_stage2_reversal_count"] = int(
         np.count_nonzero(nonzero_directions[1:] != nonzero_directions[:-1])
     )
+
+
+def _indicative_price_range_ratio(frame: pd.DataFrame) -> float:
+    prices = pd.to_numeric(frame["indicative_price"], errors="coerce").to_numpy(
+        dtype=float
+    )
+    prices = prices[np.isfinite(prices) & (prices > 0)]
+    if prices.size == 0:
+        return np.nan
+    minimum = float(prices.min())
+    return float((prices.max() - minimum) / minimum)
+
+
+def _finite_indicative_price_frame(frame: pd.DataFrame) -> pd.DataFrame:
+    prices = pd.to_numeric(frame["indicative_price"], errors="coerce")
+    return frame.loc[np.isfinite(prices) & prices.gt(0)]
+
+
+def _l3_buy_share(endpoint: pd.Series) -> float:
+    imbalance = pd.to_numeric(
+        pd.Series([endpoint["l3_imbalance"]]), errors="coerce"
+    ).iloc[0]
+    if not np.isfinite(imbalance):
+        return np.nan
+    return float((imbalance + 1.0) / 2.0)
+
+
+def _apply_report_supplement_factors(
+    row: dict[str, object],
+    valid_price: pd.DataFrame,
+    stage1_valid: pd.DataFrame,
+    stage2_valid: pd.DataFrame,
+    previous_close: float,
+    nominal_end_time: pd.Timestamp,
+) -> None:
+    valid_price = _finite_indicative_price_frame(valid_price)
+    stage1_valid = _finite_indicative_price_frame(stage1_valid)
+    stage2_valid = _finite_indicative_price_frame(stage2_valid)
+    row["auction_snapshot_count_total"] = int(len(valid_price))
+    row["auction_range_ratio"] = _indicative_price_range_ratio(valid_price)
+    row["auction_stage1_range_ratio"] = _indicative_price_range_ratio(stage1_valid)
+    row["auction_stage2_range_ratio"] = _indicative_price_range_ratio(stage2_valid)
+
+    if not valid_price.empty:
+        prices = valid_price["indicative_price"].to_numpy(dtype=float)
+        final = valid_price.iloc[-1]
+        changes = np.diff(prices)
+        row["auction_up_step_ratio"] = float(
+            np.count_nonzero(changes > 0) / len(prices)
+        )
+        row["auction_down_step_ratio"] = float(
+            np.count_nonzero(changes < 0) / len(prices)
+        )
+        row["auction_final_to_full_max"] = _safe_return(
+            float(final["indicative_price"]), float(prices.max())
+        )
+        row["auction_l3_buy_share_final"] = _l3_buy_share(final)
+
+        last_minute = valid_price.loc[
+            valid_price["trade_time"].ge(nominal_end_time - pd.Timedelta(minutes=1))
+        ]
+        if len(last_minute) >= 2:
+            row["auction_last60s_price_return"] = _safe_return(
+                float(last_minute.iloc[-1]["indicative_price"]),
+                float(last_minute.iloc[0]["indicative_price"]),
+            )
+
+    stage1_final = None
+    stage1_buy_share = np.nan
+    if not stage1_valid.empty:
+        stage1_final = stage1_valid.iloc[-1]
+        stage1_prices = stage1_valid["indicative_price"].to_numpy(dtype=float)
+        row["auction_stage1_end_time"] = pd.Timestamp(stage1_final["trade_time"])
+        row["auction_stage1_end_return_from_prev_close"] = _safe_return(
+            float(stage1_final["indicative_price"]), previous_close
+        )
+        row["auction_stage1_max_return_from_prev_close"] = _safe_return(
+            float(stage1_prices.max()), previous_close
+        )
+        row["auction_stage1_min_return_from_prev_close"] = _safe_return(
+            float(stage1_prices.min()), previous_close
+        )
+        stage1_buy_share = _l3_buy_share(stage1_final)
+        row["auction_l3_buy_share_stage1_end"] = stage1_buy_share
+
+        open_price = row["auction_open_price"]
+        if np.isfinite(open_price):
+            stage1_max = float(stage1_prices.max())
+            stage1_min = float(stage1_prices.min())
+            row["auction_open_pullback_from_stage1_max"] = float(
+                1.0 - open_price / stage1_max
+            )
+            row["auction_open_rebound_from_stage1_min"] = _safe_return(
+                open_price, stage1_min
+            )
+
+    if not stage2_valid.empty:
+        stage2_final = stage2_valid.iloc[-1]
+        row["auction_stage2_end_time"] = pd.Timestamp(stage2_final["trade_time"])
+        if stage1_final is not None:
+            row["auction_stage2_end_return_from_stage1_end"] = _safe_return(
+                float(stage2_final["indicative_price"]),
+                float(stage1_final["indicative_price"]),
+            )
+        stage2_buy_share = _l3_buy_share(stage2_final)
+        if np.isfinite(stage1_buy_share) and np.isfinite(stage2_buy_share):
+            row["auction_l3_buy_share_change_stage2"] = float(
+                stage2_buy_share - stage1_buy_share
+            )
 
 
 def _relative_imbalance_change(end_value: float, start_value: float) -> float:
@@ -1053,6 +1137,8 @@ def _empty_output_row(trade_date: str, ts_code: str) -> dict[str, object]:
             "trade_date": pd.Timestamp(trade_date).strftime("%Y-%m-%d"),
             "available_time": pd.NaT,
             "ts_code": ts_code,
+            "auction_stage1_end_time": pd.NaT,
+            "auction_stage2_end_time": pd.NaT,
             "auction_has_match": False,
             "snapshot_count_stage1": 0,
             "snapshot_count_stage2": 0,
@@ -1126,6 +1212,14 @@ def calculate_daily_auction_factors(
     elif not auction.empty or (events is not None and not events.empty):
         row["available_time"] = nominal_end_time
 
+    _apply_report_supplement_factors(
+        row,
+        valid_price,
+        stage1_valid,
+        stage2_valid,
+        previous_close,
+        nominal_end_time,
+    )
     _apply_matched_volume_participation(row)
     _apply_stage2_twap_factors(row, stage2, split_time, nominal_end_time)
 
@@ -1274,7 +1368,19 @@ def build_historical_context(
     normalized_targets = sorted({pd.Timestamp(value).normalize() for value in target_dates})
     read_start = normalized_targets[0] - pd.Timedelta(days=90)
     read_end = normalized_targets[-1]
-    columns = ["close", "high", "low", "pre_close", "adj_factor"]
+    required_columns = ["close", "high", "low", "pre_close", "adj_factor"]
+    optional_columns = ["vol", "circ_mv", "up_limit", "down_limit"]
+    available_columns = set(pq.read_schema(daily_path).names)
+    missing_required = [
+        column for column in required_columns if column not in available_columns
+    ]
+    if missing_required:
+        raise ValueError(
+            f"Daily file is missing required columns {missing_required}: {daily_path}"
+        )
+    columns = required_columns + [
+        column for column in optional_columns if column in available_columns
+    ]
     try:
         daily = pd.read_parquet(
             daily_path,
@@ -1291,6 +1397,9 @@ def build_historical_context(
     work["ts_code"] = work["ts_code"].astype(str).str.upper()
     for column in columns:
         work[column] = pd.to_numeric(work[column], errors="coerce")
+    for column in optional_columns:
+        if column not in work.columns:
+            work[column] = np.nan
     work = work.loc[
         work["trade_date"].between(read_start, read_end)
     ].sort_values(["ts_code", "trade_date"], kind="mergesort")
@@ -1302,6 +1411,11 @@ def build_historical_context(
     valid_pre_close = work["pre_close"].where(work["pre_close"].gt(0))
     valid_adj_factor = work["adj_factor"].where(work["adj_factor"].gt(0))
     work["_adj_close"] = valid_close * valid_adj_factor
+    work["previous_day_volume_shares"] = work["vol"].where(work["vol"].gt(0)) * 100.0
+    work["previous_day_high"] = valid_high
+    work["previous_day_float_market_cap_cny"] = (
+        work["circ_mv"].where(work["circ_mv"].gt(0)) * 10000.0
+    )
     work["prevday_intraday_drawdown_from_session_high"] = valid_close / valid_high - 1.0
     work["prevday_intraday_rebound_from_session_low"] = valid_close / valid_low - 1.0
     work["prevday_intraday_return_from_prev_close"] = (
@@ -1327,6 +1441,14 @@ def build_historical_context(
         work[target] = work["_adj_close"] / work.pop("_lagged_adj_close") - 1.0
 
     grouped = work.groupby("ts_code", sort=False)
+    rolling_7d_close_max = grouped["close"].transform(
+        lambda values: values.rolling(7, min_periods=7).max()
+    )
+    rolling_first_session_7d = grouped["_session_number"].transform(
+        lambda values: values.rolling(7, min_periods=7).min()
+    )
+    has_consecutive_7d = work["_session_number"].sub(rolling_first_session_7d).eq(6)
+    work["previous_7d_close_max"] = rolling_7d_close_max.where(has_consecutive_7d)
     rolling_ma20 = grouped["_adj_close"].transform(
         lambda values: values.rolling(20, min_periods=20).mean()
     )
@@ -1366,8 +1488,28 @@ def build_historical_context(
         "prev_20d_return_rank_cs",
         "_prev_2d_return",
         "_market_above_ma20",
+        "previous_day_volume_shares",
+        "previous_day_high",
+        "previous_7d_close_max",
+        "previous_day_float_market_cap_cny",
     ]
     context = work[context_columns].merge(mappings, on="trade_date", how="inner")
+    target_limits = work.loc[
+        work["trade_date"].isin(normalized_targets),
+        ["trade_date", "ts_code", "up_limit", "down_limit"],
+    ].rename(
+        columns={
+            "trade_date": "target_date",
+            "up_limit": "auction_limit_up_price",
+            "down_limit": "auction_limit_down_price",
+        }
+    )
+    context = context.merge(
+        target_limits,
+        on=["target_date", "ts_code"],
+        how="left",
+        validate="one_to_one",
+    )
     context["trade_date"] = context.pop("target_date").dt.strftime("%Y-%m-%d")
     if requested_codes is not None:
         context = context.loc[context["ts_code"].isin(requested_codes)]
@@ -1382,6 +1524,7 @@ def build_benchmark_context(
     symbol_paths: list[Path],
     target_dates: list[str],
     historical_context: pd.DataFrame | None = None,
+    cache: AuctionTickCache | None = None,
 ) -> pd.DataFrame:
     paths_by_date = {path.parent.name: path for path in symbol_paths}
     historical_by_date = (
@@ -1403,18 +1546,28 @@ def build_benchmark_context(
         }
         path = paths_by_date.get(pd.Timestamp(trade_date).strftime("%Y%m%d"))
         if path is not None:
-            benchmark_row = calculate_daily_auction_factors(
-                load_quote_frame(path), benchmark_ts_code
-            )
-            record["benchmark_available_time"] = benchmark_row["available_time"]
-            record["benchmark_auction_has_match"] = benchmark_row["auction_has_match"]
-            if bool(benchmark_row["auction_has_match"]):
-                record["market_return_from_prev_close"] = benchmark_row[
-                    "auction_overnight_return"
+            quotes = load_quote_frame(path, cache=cache)
+            if quotes.empty:
+                LOGGER.warning(
+                    "Empty benchmark auction quote frame for %s on %s",
+                    benchmark_ts_code,
+                    record["trade_date"],
+                )
+            else:
+                benchmark_row = calculate_daily_auction_factors(
+                    quotes, benchmark_ts_code
+                )
+                record["benchmark_available_time"] = benchmark_row["available_time"]
+                record["benchmark_auction_has_match"] = benchmark_row[
+                    "auction_has_match"
                 ]
-                record["_benchmark_auction_return_stage2"] = benchmark_row[
-                    "auction_return_stage2"
-                ]
+                if bool(benchmark_row["auction_has_match"]):
+                    record["market_return_from_prev_close"] = benchmark_row[
+                        "auction_overnight_return"
+                    ]
+                    record["_benchmark_auction_return_stage2"] = benchmark_row[
+                        "auction_return_stage2"
+                    ]
         date_key = record["trade_date"]
         if not historical_by_date.empty and date_key in historical_by_date.index:
             historical = historical_by_date.loc[date_key]
@@ -1426,6 +1579,56 @@ def build_benchmark_context(
             record["market_momentum_2d_prevclose"] = historical["_prev_2d_return"]
         records.append(record)
     return pd.DataFrame(records)
+
+
+def _apply_context_supplement_factors(result: pd.DataFrame, index: int) -> None:
+    matched_volume = result.at[index, "auction_matched_volume"]
+    auction_amount = result.at[index, "auction_amount"]
+    open_price = result.at[index, "auction_open_price"]
+    result.at[index, "auction_volume_to_prevday_volume"] = _safe_ratio(
+        matched_volume, result.at[index, "previous_day_volume_shares"]
+    )
+    result.at[index, "auction_amount_to_float_mcap_prevclose"] = _safe_ratio(
+        auction_amount, result.at[index, "previous_day_float_market_cap_cny"]
+    )
+    result.at[index, "auction_open_to_prev_high"] = _safe_return(
+        open_price, result.at[index, "previous_day_high"]
+    )
+    result.at[index, "auction_open_to_prev7d_close_max"] = _safe_return(
+        open_price, result.at[index, "previous_7d_close_max"]
+    )
+
+    previous_close = result.at[index, "previous_close"]
+    stage1_max_return = result.at[
+        index, "auction_stage1_max_return_from_prev_close"
+    ]
+    stage1_min_return = result.at[
+        index, "auction_stage1_min_return_from_prev_close"
+    ]
+    if not np.isfinite(previous_close) or previous_close <= 0:
+        return
+
+    if np.isfinite(stage1_max_return):
+        stage1_max = float(previous_close * (1.0 + stage1_max_return))
+        limit_up = result.at[index, "auction_limit_up_price"]
+        if np.isfinite(limit_up) and limit_up > 0:
+            result.at[index, "auction_stage1_touched_limit_up"] = float(
+                stage1_max >= limit_up
+            )
+            result.at[index, "auction_stage1_limit_up_distance_bps"] = float(
+                (limit_up - stage1_max) / limit_up * 10000.0
+            )
+
+    if np.isfinite(stage1_min_return):
+        stage1_min = float(previous_close * (1.0 + stage1_min_return))
+        limit_down = result.at[index, "auction_limit_down_price"]
+        if np.isfinite(limit_down) and limit_down > 0:
+            result.at[index, "auction_stage1_touched_limit_down"] = float(
+                stage1_min <= limit_down
+            )
+            result.at[index, "auction_stage1_limit_down_distance_bps"] = float(
+                (stage1_min - limit_down) / limit_down * 10000.0
+            )
 
 
 def apply_external_context(
@@ -1457,6 +1660,12 @@ def apply_external_context(
         "prevday_intraday_return_from_prev_close",
         "prev_2d_return_rank_cs",
         "prev_20d_return_rank_cs",
+        "previous_day_volume_shares",
+        "previous_day_high",
+        "previous_7d_close_max",
+        "previous_day_float_market_cap_cny",
+        "auction_limit_up_price",
+        "auction_limit_down_price",
     ]
     for index, row in result.iterrows():
         trade_date = pd.Timestamp(row["trade_date"]).strftime("%Y-%m-%d")
@@ -1465,7 +1674,10 @@ def apply_external_context(
             if isinstance(context, pd.DataFrame):
                 context = context.iloc[-1]
             for column in symbol_columns:
-                result.at[index, column] = context[column]
+                if column in context.index:
+                    result.at[index, column] = context[column]
+
+        _apply_context_supplement_factors(result, index)
 
         if benchmark_by_date.empty or trade_date not in benchmark_by_date.index:
             continue
@@ -1615,6 +1827,18 @@ def process_session_path_only(
     date_to: str | None,
     overwrite: bool,
 ) -> tuple[Path, int]:
+    output_path = output_root / f"{ts_code}.parquet"
+    existing_dates = _existing_trade_dates(output_path)
+    if not overwrite and date_from is not None and date_to is not None:
+        expected_dates = set(
+            pd.date_range(date_from, date_to, freq="B").strftime("%Y-%m-%d")
+        )
+        if expected_dates and expected_dates.issubset(existing_dates):
+            LOGGER.info(
+                "%s session-path skipped: requested dates already exist", ts_code
+            )
+            return output_path, 0
+
     requested = build_session_path_factor_frame(minute_path, ts_code)
     if date_from is not None:
         requested = requested.loc[
@@ -1625,7 +1849,6 @@ def process_session_path_only(
             requested["trade_date"].le(pd.Timestamp(date_to).strftime("%Y-%m-%d"))
         ]
 
-    output_path = output_root / f"{ts_code}.parquet"
     combined = merge_session_path_output(output_path, requested, overwrite)
     output_root.mkdir(parents=True, exist_ok=True)
     combined.to_parquet(output_path, index=False)
@@ -1783,9 +2006,12 @@ def merge_symbol_output(
     combined["trade_date"] = pd.to_datetime(combined["trade_date"]).dt.strftime(
         "%Y-%m-%d"
     )
-    combined["available_time"] = pd.to_datetime(
-        combined["available_time"], errors="coerce"
-    )
+    for time_column in (
+        "available_time",
+        "auction_stage1_end_time",
+        "auction_stage2_end_time",
+    ):
+        combined[time_column] = pd.to_datetime(combined[time_column], errors="coerce")
     combined = combined.drop_duplicates("trade_date", keep="last")
     return combined.sort_values("trade_date", kind="mergesort").reset_index(drop=True)[
         OUTPUT_COLUMNS
@@ -1800,6 +2026,43 @@ def _date_in_requested_range(
     )
 
 
+def _existing_trade_dates(output_path: Path) -> set[str]:
+    if not output_path.exists():
+        return set()
+    try:
+        existing = pd.read_parquet(output_path, columns=["trade_date"])
+    except (OSError, ValueError, KeyError):
+        return set()
+    return set(pd.to_datetime(existing["trade_date"], errors="coerce").dropna().dt.strftime("%Y-%m-%d"))
+
+
+def _missing_paths_with_warmup(
+    ordered_paths: list[Path], missing_paths: list[Path]
+) -> tuple[list[Path], list[Path]]:
+    if not missing_paths:
+        return [], []
+    # Each missing-date block gets only the preceding history it needs.
+    missing_keys = {path.parent.name for path in missing_paths}
+    missing_indexes = [
+        index for index, path in enumerate(ordered_paths) if path.parent.name in missing_keys
+    ]
+    warmup_keys: set[str] = set()
+    block_start = missing_indexes[0]
+    previous_index = block_start
+    blocks: list[tuple[int, int]] = []
+    for index in missing_indexes[1:]:
+        if index != previous_index + 1:
+            blocks.append((block_start, previous_index))
+            block_start = index
+        previous_index = index
+    blocks.append((block_start, previous_index))
+    for start, _ in blocks:
+        prior = ordered_paths[:start]
+        warmup_keys.update(path.parent.name for path in prior[-HISTORICAL_AMOUNT_LOOKBACK_DAYS:])
+    warmup_paths = [path for path in ordered_paths if path.parent.name in warmup_keys]
+    return missing_paths, warmup_paths
+
+
 def process_symbol_series(
     asset_type: str,
     ts_code: str,
@@ -1812,91 +2075,136 @@ def process_symbol_series(
     symbol_context: pd.DataFrame | None = None,
     benchmark_context: pd.DataFrame | None = None,
     session_path_output_root: Path | None = None,
+    auction_cache_root: Path | None = DEFAULT_AUCTION_CACHE_ROOT,
+    refresh_auction_cache: bool = False,
 ) -> tuple[str, Path, int]:
     ordered_paths = sorted(symbol_paths, key=lambda path: path.parent.name)
-    requested_paths = [
+    all_requested_paths = [
         path
         for path in ordered_paths
         if _date_in_requested_range(path.parent.name, date_from, date_to)
     ]
     output_path = output_root / f"{ts_code}.parquet"
-    if not requested_paths:
+    existing_dates = _existing_trade_dates(output_path)
+    if overwrite:
+        missing_paths = all_requested_paths
+    else:
+        missing_paths = [
+            path
+            for path in all_requested_paths
+            if pd.Timestamp(path.parent.name).strftime("%Y-%m-%d") not in existing_dates
+        ]
+    if not missing_paths:
+        LOGGER.info(
+            "%s skipped: requested=%s existing=%s missing=0",
+            ts_code,
+            len(all_requested_paths),
+            len(existing_dates),
+        )
         return ("skipped", output_path, 0)
 
-    first_requested_date = requested_paths[0].parent.name
-    prior_paths = [
-        path for path in ordered_paths if path.parent.name < first_requested_date
-    ]
-    warmup_records: list[tuple[dict[str, object], pd.DataFrame]] = []
-    valid_amount_history_count = 0
-    valid_event_history_count = 0
-    for path in reversed(prior_paths):
+    requested_paths, warmup_paths = _missing_paths_with_warmup(
+        ordered_paths, missing_paths
+    )
+    LOGGER.info(
+        "%s dates: requested=%s existing=%s missing=%s warmup=%s",
+        ts_code,
+        len(all_requested_paths),
+        len(existing_dates),
+        len(requested_paths),
+        len(warmup_paths),
+    )
+    cache = AuctionTickCache(auction_cache_root, refresh=refresh_auction_cache)
+
+    def calculate_path_record(
+        path: Path,
+    ) -> tuple[dict[str, object], pd.DataFrame] | None:
+        quotes = load_quote_frame(path, cache=cache)
+        if quotes.empty:
+            LOGGER.warning(
+                "Empty auction quote frame for %s on %s; skipping date",
+                ts_code,
+                path.parent.name,
+            )
+            return None
         events, event_ok = load_auction_event_frame(
-            path, ts_code, expected_trade_date=path.parent.name
+            path, ts_code, expected_trade_date=path.parent.name, cache=cache
         )
-        daily = calculate_daily_auction_factors(
-            load_quote_frame(path), ts_code, events, event_ok
-        )
-        warmup_records.append((daily, events))
-        if (
-            np.isfinite(daily["auction_amount"])
-            and daily["auction_amount"] > 0
-            and np.isfinite(daily["auction_matched_volume"])
-            and daily["auction_matched_volume"] > 0
-        ):
-            valid_amount_history_count += 1
-        if event_ok and not events.loc[events["event_type"].eq("A")].empty:
-            valid_event_history_count += 1
-        if (
-            valid_amount_history_count >= HISTORICAL_AMOUNT_LOOKBACK_DAYS
-            and valid_event_history_count >= LARGE_ORDER_LOOKBACK_DAYS
-        ):
-            break
+        daily = calculate_daily_auction_factors(quotes, ts_code, events, event_ok)
+        return daily, events
+
+    warmup_records: list[tuple[dict[str, object], pd.DataFrame]] = []
+    for path in warmup_paths:
+        record = calculate_path_record(path)
+        if record is not None:
+            warmup_records.append(record)
 
     requested_records: list[tuple[dict[str, object], pd.DataFrame]] = []
     for path in requested_paths:
-        events, event_ok = load_auction_event_frame(
-            path, ts_code, expected_trade_date=path.parent.name
-        )
-        daily = calculate_daily_auction_factors(
-            load_quote_frame(path), ts_code, events, event_ok
-        )
-        requested_records.append((daily, events))
+        record = calculate_path_record(path)
+        if record is not None:
+            requested_records.append(record)
 
     all_records = list(reversed(warmup_records)) + requested_records
-    all_rows = [row for row, _ in all_records]
-    event_frames = {row["trade_date"]: events for row, events in all_records}
-    daily_amount_history = load_daily_amount_history(minute_path)
-    factor_frame = apply_historical_ratios(
-        pd.DataFrame(all_rows),
-        event_frames=event_frames,
-        daily_amount_history=daily_amount_history,
-    )
-    factor_frame = apply_external_context(
-        factor_frame,
-        symbol_context=symbol_context,
-        benchmark_context=benchmark_context,
-    )
+    if not all_records:
+        LOGGER.warning("%s skipped: no valid auction quote dates", ts_code)
     requested_dates = {
         pd.Timestamp(path.parent.name).strftime("%Y-%m-%d") for path in requested_paths
     }
-    requested_frame = factor_frame.loc[
-        factor_frame["trade_date"].isin(requested_dates)
-    ].copy()
+    if all_records:
+        all_rows = [row for row, _ in all_records]
+        event_frames = {row["trade_date"]: events for row, events in all_records}
+        daily_amount_history = load_daily_amount_history(minute_path)
+        factor_frame = apply_historical_ratios(
+            pd.DataFrame(all_rows),
+            event_frames=event_frames,
+            daily_amount_history=daily_amount_history,
+        )
+        factor_frame = apply_external_context(
+            factor_frame,
+            symbol_context=symbol_context,
+            benchmark_context=benchmark_context,
+        )
+        requested_frame = factor_frame.loc[
+            factor_frame["trade_date"].isin(requested_dates)
+        ].copy()
+    else:
+        requested_frame = pd.DataFrame(columns=OUTPUT_COLUMNS)
 
-    combined = merge_symbol_output(output_path, requested_frame, overwrite)
-    output_root.mkdir(parents=True, exist_ok=True)
-    combined.to_parquet(output_path, index=False)
+    if not requested_frame.empty or output_path.exists():
+        combined = merge_symbol_output(output_path, requested_frame, overwrite)
+        output_root.mkdir(parents=True, exist_ok=True)
+        combined.to_parquet(output_path, index=False)
     if session_path_output_root is not None:
         session_path_output = session_path_output_root / f"{ts_code}.parquet"
-        session_requested = build_session_path_factor_frame(
-            minute_path, ts_code, requested_dates
+        session_existing_dates = _existing_trade_dates(session_path_output)
+        session_dates = (
+            requested_dates
+            if overwrite
+            else requested_dates - session_existing_dates
         )
-        session_combined = merge_session_path_output(
-            session_path_output, session_requested, overwrite
-        )
-        session_path_output_root.mkdir(parents=True, exist_ok=True)
-        session_combined.to_parquet(session_path_output, index=False)
+        if session_dates:
+            session_requested = build_session_path_factor_frame(
+                minute_path, ts_code, session_dates
+            )
+            session_combined = merge_session_path_output(
+                session_path_output, session_requested, overwrite
+            )
+            session_path_output_root.mkdir(parents=True, exist_ok=True)
+            session_combined.to_parquet(session_path_output, index=False)
+        else:
+            LOGGER.info(
+                "%s session-path skipped: requested=%s existing=%s missing=0",
+                ts_code,
+                len(requested_dates),
+                len(session_existing_dates),
+            )
+    LOGGER.info(
+        "%s cache: hits=%s rebuilds=%s",
+        ts_code,
+        cache.stats.hits,
+        cache.stats.rebuilds,
+    )
     return (asset_type, output_path, len(requested_frame))
 
 
@@ -1995,11 +2303,11 @@ def main() -> int:
             return 1
         return 0
 
-    date_dirs = discover_trade_date_dirs(args.tick_root, date_to)
     benchmark_ts_code = args.benchmark_ts_code.strip().upper()
     benchmark_numeric_code = numeric_code(benchmark_ts_code)
     if benchmark_numeric_code is None:
         raise ValueError(f"Invalid --benchmark-ts-code: {args.benchmark_ts_code}")
+    date_dirs = discover_trade_date_dirs(args.tick_root, date_to)
     grouped_paths = group_symbol_paths(
         date_dirs,
         {code for _, code, _ in assets} | {benchmark_numeric_code},
@@ -2021,16 +2329,27 @@ def main() -> int:
         for kind, code, symbol in assets
         if grouped_paths.get(code)
     ]
-    target_dates = sorted(
-        {
-            path.parent.name
-            for _, _, _, paths in tasks
+    target_dates: set[str] = set()
+    pending_symbols: dict[str, set[str]] = {"stock": set(), "etf": set()}
+    for kind, _, symbol, paths in tasks:
+        output_path = output_roots[kind] / f"{symbol}.parquet"
+        existing_dates = _existing_trade_dates(output_path)
+        pending = [
+            path
             for path in paths
             if _date_in_requested_range(path.parent.name, date_from, date_to)
-        }
-    )
+            and (
+                args.overwrite
+                or pd.Timestamp(path.parent.name).strftime("%Y-%m-%d")
+                not in existing_dates
+            )
+        ]
+        if pending:
+            pending_symbols[kind].add(symbol)
+            target_dates.update(path.parent.name for path in pending)
+    target_dates = sorted(target_dates)
     requested_by_kind = {
-        kind: {symbol for asset_kind, _, symbol, _ in tasks if asset_kind == kind}
+        kind: pending_symbols[kind]
         for kind in ("stock", "etf")
     }
     historical_context_by_kind: dict[str, dict[str, pd.DataFrame]] = {
@@ -2059,6 +2378,9 @@ def main() -> int:
         grouped_paths.get(benchmark_numeric_code, []),
         target_dates,
         benchmark_historical,
+        cache=AuctionTickCache(
+            args.auction_cache_root, refresh=args.refresh_auction_cache
+        ),
     )
     LOGGER.info(
         "Processing %s symbols from %s matched stock/ETF universe entries",
@@ -2086,6 +2408,8 @@ def main() -> int:
                     session_path_output_roots[kind]
                     if args.write_session_path_factors
                     else None,
+                    args.auction_cache_root,
+                    args.refresh_auction_cache,
                 )
                 written += int(row_count > 0)
                 LOGGER.info("Wrote %s requested rows to %s", row_count, output_path)
@@ -2110,6 +2434,8 @@ def main() -> int:
                     session_path_output_roots[kind]
                     if args.write_session_path_factors
                     else None,
+                    args.auction_cache_root,
+                    args.refresh_auction_cache,
                 ): symbol
                 for kind, _, symbol, paths in tasks
             }

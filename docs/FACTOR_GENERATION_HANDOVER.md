@@ -32,9 +32,9 @@
 | 数据 | 默认位置 | 说明 |
 | --- | --- | --- |
 | ETF 1 分钟 | `D:\workspace\stockdata\etf-data\etf_1min` | 每个 ETF 一个 parquet，通常含 `trade_time/open/high/low/close/volume 或 vol/amount/adj_factor` |
-| 股票 1 分钟 | `D:\workspace\stockdata\a-share-data\stock_1min` | 部分脚本也接受 `a-share-data` 作为父目录并自动解析子目录 |
+| 股票 1 分钟 | `D:\workspace\stockdata\stock-data\行情数据\stock_1min` | auction 生成器的默认股票分钟目录 |
 | ETF 日线 | `D:\workspace\stockdata\etf-data\etf_daily.parquet` | FZ、日内策略、竞价上下文使用 |
-| 股票日线 | `D:\workspace\stockdata\a-share-data\stock_daily.parquet` | 日内策略、竞价上下文使用 |
+| 股票日线 | `D:\workspace\stockdata\stock-data\行情数据\stock_daily.parquet` | 日内策略、竞价上下文使用 |
 | 逐笔数据 | `E:\逐笔数据` | 目录结构为 `YYYY\YYYYMM\YYYYMMDD\symbol`，orderbook、advanced、竞价使用 |
 | 指数 1 分钟 | `D:\workspace\stockdata\index-data\index_1min` | noise-bound 因子使用 |
 
@@ -245,7 +245,7 @@ D:\workspace\stockdata\etf-data\etf_auction_factors
 
 默认 benchmark 为 `510300.SH`。使用 `--write-session-path-factors` 时，还会输出
 分钟级 session path companion parquet，默认目录为
-`D:\workspace\stockdata\etf-data\etf_intraday_session_path_factors`。
+`D:\workspace\stockdata\etf-factors\etf_intraday_session_path_factors`。
 
 ```powershell
 uv run python scripts/generate_auction_factors.py --asset-type etf --workers 5

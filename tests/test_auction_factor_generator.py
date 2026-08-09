@@ -6,21 +6,27 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from scripts.auction_tick_cache import AuctionTickCache
 from scripts.generate_auction_factors import (
+    CONTEXT_SUPPLEMENT_FACTOR_COLUMNS,
     EVENT_FACTOR_COLUMNS,
     OUTPUT_COLUMNS,
+    REPORT_SUPPLEMENT_FACTOR_COLUMNS,
     _finalize_event_frame,
     _stage2_slope,
     apply_historical_ratios,
     apply_external_context,
     build_asset_universe,
+    build_benchmark_context,
     build_historical_context,
     build_session_path_factor_frame,
     calculate_daily_auction_factors,
     group_symbol_paths,
     load_auction_event_frame,
     load_daily_amount_history,
+    load_quote_frame,
     merge_symbol_output,
+    process_symbol_series,
     process_session_path_only,
 )
 
@@ -169,6 +175,35 @@ def test_daily_factor_formulas_and_output_contract() -> None:
     assert np.isclose(row["auction_stage2_range_bps"], 40.0)
     assert np.isclose(row["auction_stage2_efficiency_ratio"], 1.0)
     assert np.isclose(row["auction_unmatched_imbalance"], 1.0)
+    assert np.isclose(row["auction_range_ratio"], (10.06 - 10.00) / 10.00)
+    assert np.isclose(row["auction_stage1_range_ratio"], (10.01 - 10.00) / 10.00)
+    assert np.isclose(row["auction_stage2_range_ratio"], (10.06 - 10.02) / 10.02)
+    assert np.isclose(
+        row["auction_stage1_end_return_from_prev_close"], 10.01 / 10.00 - 1.0
+    )
+    assert np.isclose(
+        row["auction_stage2_end_return_from_stage1_end"], 10.06 / 10.01 - 1.0
+    )
+    assert row["auction_up_step_ratio"] == 4 / 5
+    assert row["auction_down_step_ratio"] == 0.0
+    assert row["auction_snapshot_count_total"] == 5
+    assert row["auction_l3_buy_share_final"] == 0.9
+    assert row["auction_l3_buy_share_stage1_end"] == 0.7
+    assert np.isclose(row["auction_l3_buy_share_change_stage2"], 0.2)
+    assert np.isclose(
+        row["auction_stage1_max_return_from_prev_close"], 10.01 / 10.00 - 1.0
+    )
+    assert row["auction_stage1_min_return_from_prev_close"] == 0.0
+    assert np.isclose(
+        row["auction_open_pullback_from_stage1_max"], 1.0 - 10.05 / 10.01
+    )
+    assert np.isclose(
+        row["auction_open_rebound_from_stage1_min"], 10.05 / 10.00 - 1.0
+    )
+    assert np.isnan(row["auction_last60s_price_return"])
+    assert row["auction_final_to_full_max"] == 0.0
+    assert row["auction_stage1_end_time"] == pd.Timestamp("2026-03-31 09:18:00")
+    assert row["auction_stage2_end_time"] == pd.Timestamp("2026-03-31 09:24:59")
 
     expected_twap = (10.02 * 120 + 10.04 * 179 + 10.06) / 300
     expected_imbalance_twap = (0.6 * 120 + 0.2 * 179 + 0.8) / 300
@@ -213,7 +248,39 @@ def test_quote_at_0925_is_not_part_of_the_auction_path() -> None:
     row = calculate_daily_auction_factors(quotes, "000001.SZ")
 
     assert row["snapshot_count_stage2"] == 3
+    assert row["auction_snapshot_count_total"] == 5
     assert np.isclose(row["auction_final_indicative_price"], 10.06)
+    assert np.isclose(row["auction_range_ratio"], (10.06 - 10.00) / 10.00)
+
+
+def test_report_supplement_path_factors_use_published_boundaries() -> None:
+    quotes = _auction_quotes()
+    extra = _quote_row("2026-03-31 09:24:00", 10.03, 500, 500)
+    quotes = pd.concat([quotes, pd.DataFrame([extra])], ignore_index=True)
+    quotes = quotes.sort_values("trade_time", kind="mergesort").reset_index(drop=True)
+    row = calculate_daily_auction_factors(quotes, "000001.SZ")
+
+    assert len(REPORT_SUPPLEMENT_FACTOR_COLUMNS) == 17
+    assert row["auction_snapshot_count_total"] == 6
+    assert row["auction_up_step_ratio"] == 4 / 6
+    assert row["auction_down_step_ratio"] == 1 / 6
+    assert np.isclose(row["auction_last60s_price_return"], 10.06 / 10.03 - 1.0)
+    assert row["auction_final_to_full_max"] == 0.0
+
+    final_mask = quotes["trade_time"].eq(pd.Timestamp("2026-03-31 09:24:59"))
+    quotes.loc[final_mask, ["ask_price1", "bid_price1"]] = 10.00
+    reversed_row = calculate_daily_auction_factors(quotes, "000001.SZ")
+    assert np.isclose(
+        reversed_row["auction_final_to_full_max"], 10.00 / 10.04 - 1.0
+    )
+    assert np.isclose(
+        reversed_row["auction_last60s_price_return"], 10.00 / 10.03 - 1.0
+    )
+
+    quotes.loc[0, ["ask_price1", "bid_price1"]] = np.inf
+    nonfinite_row = calculate_daily_auction_factors(quotes, "000001.SZ")
+    assert nonfinite_row["auction_snapshot_count_total"] == 5
+    assert np.isfinite(nonfinite_row["auction_range_ratio"])
 
 
 def test_second_batch_event_factor_formulas_and_boundaries() -> None:
@@ -604,6 +671,10 @@ def test_historical_context_uses_prior_day_and_full_universe_ranks(tmp_path) -> 
                     "low": close - 10.0,
                     "pre_close": close - 1.0,
                     "adj_factor": 1.0,
+                    "vol": close * 10.0,
+                    "circ_mv": close * 1000.0,
+                    "up_limit": close + 20.0,
+                    "down_limit": close - 20.0,
                 }
             )
     daily_path = tmp_path / "daily.parquet"
@@ -628,6 +699,12 @@ def test_historical_context_uses_prior_day_and_full_universe_ranks(tmp_path) -> 
     assert np.isclose(context["prev_20d_return_rank_cs"], 2 / 3)
     assert context["_market_above_ma20"] == 1.0
     assert np.isclose(context["_prev_2d_return"], 121 / 119 - 1)
+    assert context["previous_day_volume_shares"] == 1210 * 100
+    assert context["previous_day_high"] == 131.0
+    assert context["previous_7d_close_max"] == 121.0
+    assert context["previous_day_float_market_cap_cny"] == 121000 * 10000
+    assert context["auction_limit_up_price"] == 142.0
+    assert context["auction_limit_down_price"] == 102.0
 
     suspended_path = tmp_path / "daily_with_suspension.parquet"
     suspended = pd.DataFrame(rows).loc[
@@ -649,6 +726,12 @@ def test_external_context_applies_benchmark_time_and_excess_returns() -> None:
     frame = _historical_frame([100.0])
     frame.loc[0, "auction_overnight_return"] = 0.02
     frame.loc[0, "auction_return_stage2"] = 0.01
+    frame.loc[0, "previous_close"] = 10.0
+    frame.loc[0, "auction_open_price"] = 10.05
+    frame.loc[0, "auction_matched_volume"] = 1000.0
+    frame.loc[0, "auction_amount"] = 10050.0
+    frame.loc[0, "auction_stage1_max_return_from_prev_close"] = 0.1
+    frame.loc[0, "auction_stage1_min_return_from_prev_close"] = -0.1
     frame.loc[0, "available_time"] = pd.Timestamp("2026-01-01 09:25:02")
     symbol_context = pd.DataFrame(
         [
@@ -659,6 +742,12 @@ def test_external_context_applies_benchmark_time_and_excess_returns() -> None:
                 "prevday_intraday_return_from_prev_close": 0.01,
                 "prev_2d_return_rank_cs": 0.75,
                 "prev_20d_return_rank_cs": 0.6,
+                "previous_day_volume_shares": 100000.0,
+                "previous_day_high": 10.2,
+                "previous_7d_close_max": 10.5,
+                "previous_day_float_market_cap_cny": 1_000_000_000.0,
+                "auction_limit_up_price": 11.0,
+                "auction_limit_down_price": 9.0,
             }
         ]
     )
@@ -685,6 +774,69 @@ def test_external_context_applies_benchmark_time_and_excess_returns() -> None:
     assert result["market_above_ma20_prevclose"] == 1.0
     assert np.isclose(result["auction_gap_excess_benchmark"], 0.015)
     assert np.isclose(result["auction_stage2_excess_return_benchmark"], 0.006)
+    assert len(CONTEXT_SUPPLEMENT_FACTOR_COLUMNS) == 8
+    assert np.isclose(result["auction_volume_to_prevday_volume"], 0.01)
+    assert np.isclose(
+        result["auction_amount_to_float_mcap_prevclose"], 10050 / 1_000_000_000
+    )
+    assert np.isclose(result["auction_open_to_prev_high"], 10.05 / 10.2 - 1.0)
+    assert np.isclose(
+        result["auction_open_to_prev7d_close_max"], 10.05 / 10.5 - 1.0
+    )
+    assert result["auction_stage1_touched_limit_up"] == 1.0
+    assert result["auction_stage1_touched_limit_down"] == 1.0
+    assert result["auction_stage1_limit_up_distance_bps"] == 0.0
+    assert result["auction_stage1_limit_down_distance_bps"] == 0.0
+
+
+def test_limit_context_distinguishes_not_touched_from_missing() -> None:
+    frame = _historical_frame([100.0])
+    frame.loc[0, "previous_close"] = 10.0
+    frame.loc[0, "auction_stage1_max_return_from_prev_close"] = 0.05
+    frame.loc[0, "auction_stage1_min_return_from_prev_close"] = -0.05
+    context = pd.DataFrame(
+        [
+            {
+                "trade_date": "2026-01-01",
+                "auction_limit_up_price": 11.0,
+                "auction_limit_down_price": 9.0,
+            }
+        ]
+    )
+
+    result = apply_external_context(frame, context).iloc[0]
+    assert result["auction_stage1_touched_limit_up"] == 0.0
+    assert result["auction_stage1_touched_limit_down"] == 0.0
+    assert np.isclose(
+        result["auction_stage1_limit_up_distance_bps"], (11.0 - 10.5) / 11.0 * 10000
+    )
+    assert np.isclose(
+        result["auction_stage1_limit_down_distance_bps"], (9.5 - 9.0) / 9.0 * 10000
+    )
+
+    missing = apply_external_context(frame, pd.DataFrame([{"trade_date": "2026-01-01"}]))
+    assert np.isnan(missing.loc[0, "auction_stage1_touched_limit_up"])
+    assert np.isnan(missing.loc[0, "auction_stage1_touched_limit_down"])
+
+
+def test_empty_benchmark_quote_frame_keeps_default_context(
+    tmp_path, monkeypatch, caplog
+) -> None:
+    benchmark_path = tmp_path / "20260105" / "510300.SH"
+    benchmark_path.mkdir(parents=True)
+    monkeypatch.setattr(
+        "scripts.generate_auction_factors.load_quote_frame",
+        lambda *args, **kwargs: pd.DataFrame(),
+    )
+
+    result = build_benchmark_context(
+        "510300.SH", [benchmark_path], ["2026-01-05"]
+    ).iloc[0]
+
+    assert not bool(result["benchmark_auction_has_match"])
+    assert pd.isna(result["benchmark_available_time"])
+    assert np.isnan(result["market_return_from_prev_close"])
+    assert "Empty benchmark auction quote frame" in caplog.text
 
 
 def test_session_path_companion_is_minute_causal_and_cumulative_across_lunch(tmp_path) -> None:
@@ -1115,3 +1267,197 @@ def test_incremental_merge_preserves_or_replaces_requested_dates(tmp_path) -> No
     overwritten = merge_symbol_output(output_path, replacement, overwrite=True)
     assert overwritten.loc[1, "auction_amount"] == 999.0
     assert overwritten["trade_date"].tolist() == ["2026-01-01", "2026-01-02"]
+
+
+def _raw_quote(timestamp: int, price: int = 100000) -> dict[str, object]:
+    row: dict[str, object] = {
+        "自然日": 20260331,
+        "时间": timestamp,
+        "成交价": price,
+        "成交量": 0,
+        "成交额": 0,
+        "开盘价": 0,
+        "前收盘": 100000,
+    }
+    for level in range(1, 4):
+        row[f"申卖价{level}"] = price
+        row[f"申买价{level}"] = price
+        row[f"申卖量{level}"] = 100
+        row[f"申买量{level}"] = 100
+    return row
+
+
+def test_tick_cache_streams_auction_window_and_invalidates_source(tmp_path) -> None:
+    raw_dir = tmp_path / "2026" / "202603" / "20260331" / "000001.SZ"
+    raw_dir.mkdir(parents=True)
+    quote_path = raw_dir / "行情.csv"
+    pd.DataFrame(
+        [
+            _raw_quote(91459000),
+            _raw_quote(91500000, 100100),
+            _raw_quote(92500000, 100200),
+            _raw_quote(92959000, 100300),
+            _raw_quote(93000000, 100400),
+        ]
+    ).to_csv(quote_path, index=False, encoding="gbk")
+
+    uncached = load_quote_frame(raw_dir)
+    cache = AuctionTickCache(tmp_path / "cache")
+    cached = load_quote_frame(raw_dir, cache=cache)
+    assert cached["trade_time"].tolist() == uncached["trade_time"].tolist()
+    assert cached["trade_time"].min() == pd.Timestamp("2026-03-31 09:15:00")
+    assert cached["trade_time"].max() == pd.Timestamp("2026-03-31 09:29:59")
+    assert cache.stats.rebuilds == 1
+
+    load_quote_frame(raw_dir, cache=cache)
+    assert cache.stats.hits == 1
+
+    quote_path.write_text(quote_path.read_text(encoding="gbk") + "\n", encoding="gbk")
+    load_quote_frame(raw_dir, cache=cache)
+    assert cache.stats.rebuilds == 2
+
+
+def test_tick_cache_filters_orders_and_transactions_at_0925(tmp_path) -> None:
+    raw_dir = tmp_path / "2026" / "202603" / "20260331" / "000001.SZ"
+    raw_dir.mkdir(parents=True)
+    _write_raw_order_file(
+        raw_dir,
+        [
+            _raw_order(91500000, 1, "A", "B", 100),
+            _raw_order(92459000, 2, "A", "S", 100),
+            _raw_order(92500000, 3, "A", "B", 100),
+        ],
+    )
+    pd.DataFrame(
+        [
+            _raw_cancel(91800000, 20, bid_order_id=1),
+            _raw_cancel(92500000, 20, bid_order_id=2),
+        ]
+    ).to_csv(raw_dir / "逐笔成交.csv", index=False, encoding="gbk")
+
+    cache = AuctionTickCache(tmp_path / "cache")
+    orders = cache.load_orders(raw_dir)
+    transactions = cache.load_transactions(raw_dir)
+    assert orders["trade_time"].max() == pd.Timestamp("2026-03-31 09:24:59")
+    assert transactions["trade_time"].max() == pd.Timestamp("2026-03-31 09:18:00")
+
+
+def test_existing_auction_dates_skip_source_reads(tmp_path, monkeypatch) -> None:
+    output_root = tmp_path / "auction"
+    output_root.mkdir()
+    pd.DataFrame({"trade_date": ["2026-03-31"]}).to_parquet(
+        output_root / "000001.SZ.parquet", index=False
+    )
+    raw_dir = tmp_path / "2026" / "202603" / "20260331" / "000001.SZ"
+    raw_dir.mkdir(parents=True)
+
+    def fail_loader(*args, **kwargs):
+        raise AssertionError("existing dates must not read source ticks")
+
+    monkeypatch.setattr("scripts.generate_auction_factors.load_quote_frame", fail_loader)
+    monkeypatch.setattr(
+        "scripts.generate_auction_factors.load_auction_event_frame", fail_loader
+    )
+    _, output_path, row_count = process_symbol_series(
+        "stock",
+        "000001.SZ",
+        [raw_dir],
+        tmp_path / "minute.parquet",
+        output_root,
+        "20260331",
+        "20260331",
+        overwrite=False,
+    )
+    assert output_path == output_root / "000001.SZ.parquet"
+    assert row_count == 0
+
+
+def test_empty_auction_date_is_skipped_without_aborting_symbol(tmp_path, monkeypatch) -> None:
+    paths = [
+        tmp_path / "2026" / "202601" / "20260101" / "000001.SZ",
+        tmp_path / "2026" / "202601" / "20260102" / "000001.SZ",
+    ]
+    for path in paths:
+        path.mkdir(parents=True)
+
+    empty_quote = pd.DataFrame()
+    valid_quote = pd.DataFrame({"trade_time": [pd.Timestamp("2026-01-02 09:25")]})
+    monkeypatch.setattr(
+        "scripts.generate_auction_factors.load_quote_frame",
+        lambda path, **kwargs: empty_quote if path.parent.name == "20260101" else valid_quote,
+    )
+    monkeypatch.setattr(
+        "scripts.generate_auction_factors.load_auction_event_frame",
+        lambda *args, **kwargs: (pd.DataFrame(), False),
+    )
+    row = {column: np.nan for column in OUTPUT_COLUMNS}
+    row.update(
+        {
+            "trade_date": "2026-01-02",
+            "available_time": pd.Timestamp("2026-01-02 09:25"),
+            "ts_code": "000001.SZ",
+            "auction_event_reconstruction_ok": False,
+        }
+    )
+    monkeypatch.setattr(
+        "scripts.generate_auction_factors.calculate_daily_auction_factors",
+        lambda *args, **kwargs: row.copy(),
+    )
+    monkeypatch.setattr(
+        "scripts.generate_auction_factors.load_daily_amount_history",
+        lambda path: pd.Series(dtype=float, index=pd.DatetimeIndex([])),
+    )
+
+    _, output_path, row_count = process_symbol_series(
+        "stock",
+        "000001.SZ",
+        paths,
+        tmp_path / "minute.parquet",
+        tmp_path / "auction",
+        "20260101",
+        "20260102",
+        overwrite=False,
+        auction_cache_root=None,
+    )
+
+    result = pd.read_parquet(output_path)
+    assert row_count == 1
+    assert result["trade_date"].tolist() == ["2026-01-02"]
+
+
+def test_existing_session_path_date_skips_minute_read(tmp_path) -> None:
+    output_root = tmp_path / "session"
+    output_root.mkdir()
+    pd.DataFrame({"trade_date": ["2026-03-31"]}).to_parquet(
+        output_root / "000001.SZ.parquet", index=False
+    )
+
+    output_path, row_count = process_session_path_only(
+        "000001.SZ",
+        tmp_path / "missing-minute.parquet",
+        output_root,
+        "20260331",
+        "20260331",
+        overwrite=False,
+    )
+    assert output_path == output_root / "000001.SZ.parquet"
+    assert row_count == 0
+
+
+def test_existing_session_path_range_skips_minute_read(tmp_path) -> None:
+    output_root = tmp_path / "session"
+    output_root.mkdir()
+    pd.DataFrame(
+        {"trade_date": ["2026-03-30", "2026-03-31"]}
+    ).to_parquet(output_root / "000001.SZ.parquet", index=False)
+
+    output_path, row_count = process_session_path_only(
+        "000001.SZ",
+        tmp_path / "missing-minute.parquet",
+        output_root,
+        "20260330",
+        "20260331",
+        overwrite=False,
+    )
+    assert output_path == output_root / "000001.SZ.parquet"
+    assert row_count == 0
