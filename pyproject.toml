@@ -48,3 +48,11 @@ package-dir = {"" = "FractalQuant"}
 
 [tool.setuptools.packages.find]
 where = ["FractalQuant"]
+
+[dependency-groups]
+dev = [
+    "pytest-asyncio>=1.4.0",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"

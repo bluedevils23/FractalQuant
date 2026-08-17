@@ -43,10 +43,9 @@ def test_imports():
         )
         
         print("✓ 所有模块导入成功")
-        return True
     except ImportError as e:
         print(f"✗ 导入失败: {e}")
-        return False
+        raise AssertionError(f"模块导入失败: {e}") from e
 
 async def test_yahoo_finance():
     """测试Yahoo Finance获取器"""
