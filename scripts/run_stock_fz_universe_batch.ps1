@@ -27,7 +27,7 @@ if files != universe:
     raise SystemExit(f"file set mismatch: expected={len(universe)}, actual={len(files)}")
 for symbol in sorted(universe):
     frame = pd.read_parquet(output_root / f"{symbol}.parquet")
-    if frame.shape[1] != 35 or frame.index.name != "factor_date" or not frame.index.is_unique:
+    if frame.shape[1] != 39 or frame.index.name != "factor_date" or not frame.index.is_unique:
         raise SystemExit(f"invalid output schema: {symbol}")
 '@
     uv run python -c $script (Join-Path $universeRoot "$Universe.txt") $OutputRoot

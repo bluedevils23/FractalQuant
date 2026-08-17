@@ -14,7 +14,7 @@
 | 管线 | 入口脚本 | 资产 | 因子数量 | 默认输出 |
 | --- | --- | --- | ---: | --- |
 | 标准分钟因子 | `generate_etf_minute_factors.py` | ETF | base 52 / multi 156 | `D:\workspace\stockdata\etf-data\etf_1min_factors*` |
-| FZ 日频因子 | `generate_fz_daily_factors.py` | 股票 + ETF | 34 | 按 `--asset-type` 选择默认目录 |
+| FZ 日频因子 | `generate_fz_daily_factors.py` | 股票 + ETF | 38 | 按 `--asset-type` 选择默认目录 |
 | CICC 分钟因子 | `generate_etf_cicc_minute_factors.py` | ETF | 58 | `D:\workspace\stockdata\etf-data\etf_1min_cicc_factors` |
 | Advanced 因子 | `generate_stock_advanced_factor.py` / `generate_etf_advanced_factor.py` | 股票 / ETF | 46 | `stock_advanced_factors` / `etf_1min_advanced_factors` |
 | Orderbook 因子 | `generate_stock_orderbook_factors.py` | 股票 + ETF | base 63 / multi 135 | `stock_1min_orderbook_factors*` / `etf_1min_orderbook_factors*` |
@@ -84,11 +84,30 @@ ETF 兼容入口：`scripts/generate_etf_fz_daily_factors.py`
 交易日面板，计算原始 FZ 因子，再计算组合因子，最后按 `code/factor_date` 输出
 每个标的一份日频 parquet。输入必须是 orderbook 同口径的
 241 根分钟：`09:30–11:30`、`13:01–15:00`；缺行、重复或异常时间网格的
-`code/date` 会跳过且记录告警。`GaoDiECha` 等因子还需要 ETF 日线数据。
+`code/date` 会跳过且记录告警。`GaoDiECha` 等因子还需要对应资产的日线数据。
+
+潮汐因子在通过241分钟输入校验后，按研报剔除 `09:30` 和 `15:00`，将其余239分钟
+重新编号；9分钟邻域成交量在完整序列上计算，涨潮低点使用 `5..t-1`，退潮低点使用
+`t+1..233`。边界分钟参与低点选择，缺少任一有效半潮汐时保持空值。`ChaoXi` 要求
+最近20个交易日的两个原始半潮汐值均有效，不会删除缺失日后跨更长区间凑满20个样本。
 
 `factor_date=d` 的暴露包含 d 日完整分钟信息，只能在 d+1 或之后用于回测和交易；
-不再回填到 d 日的分钟线。旧 `generate_etf_fz_minute_factors.py` 仅保留兼容入口，
-运行时会输出弃用提示并生成同样的日频文件。
+月频回测应选取月末构造日，而不是把日频因子复制到分钟行。旧
+`generate_etf_fz_minute_factors.py` 仅保留兼容入口，运行时会输出弃用提示并生成同样的
+日频文件。
+
+`CaoMuJieBing` 依赖 `retail_trade_ratio` 和中证全指 `000985.CSI` 日收益
+`csi_all_share_return`。`retail_trade_ratio` 是单笔成交额小于4万元的个人投资者买卖额
+均值除以当日总成交额，必须来自逐笔成交数据，不得用零值、普通成交量或分钟 OHLCV
+推算。股票可传入 `--build-cao-mu-source`，从 `E:\逐笔数据` 的逐笔成交 CSV 构造并
+增量缓存到 `D:\workspace\stockdata\stock-factors\stock_cao_mu_jie_bing_source.parquet`；
+中证全指收益率由 `D:\workspace\stockdata\指数数据\index_daily\000985.CSI.parquet`
+的收盘价计算。生成器会合并该侧车文件但不会修改原始股票日线。逐笔文件缺失的日期，
+该因子仍为空；传入 `--strict-source-fields` 会在分钟分片前终止。
+
+生成成功后，输出目录会写入 `_fz_generation_manifest.json`，记录 schema、因子源字段
+可用性、异常交易日统计和时点语义。当前生成器的截面标准化和市场相对计算仅使用本次
+选中的目标标的；使用静态 CSI 名单会保留幸存者偏差，不能将结果声明为全 A 研报复现。
 
 默认输出目录：
 
@@ -102,9 +121,21 @@ ETF： D:\workspace\stockdata\etf-data\etf_daily_fz_factors
 ```powershell
 uv run python scripts/generate_etf_fz_daily_factors.py --workers 5
 uv run python scripts/generate_fz_daily_factors.py --asset-type stock --workers 5
+uv run python scripts/generate_fz_daily_factors.py --asset-type stock --build-cao-mu-source --overwrite --workers 5
+uv run python scripts/generate_fz_daily_factors.py --asset-type stock --strict-source-fields
 ```
 
 该入口是文件级跳过：只要目标 parquet 已存在且未传 `--overwrite`，整个标的都会跳过。
+
+共38个FZ因子。新增的 `ChongJian` 与 `ZaiHouChongJian` 分别是日协方差和20日
+“灾后重建”暴露；`YueYaoYanBoDongLv`、`YueYaoYanShouYiLv` 是可独立回测的
+20日耀眼子因子。已有输出文件不会自动补列，需显式传入 `--overwrite` 重算。
+
+研报映射：
+
+- [适度冒险](https://mp.weixin.qq.com/s/2pObrtp3V0dv50MFGg_fhw)、[潮汐](https://mp.weixin.qq.com/s/_2xWXM8iyNzYDYolT9vVsw)、[勇攀高峰与灾后重建](https://mp.weixin.qq.com/s/-IxH3n-uR0BwOIbOyzqPrw)、[云开雾散](https://mp.weixin.qq.com/s/vX4I9SpKRF3_HKQOGhtZcQ)；
+- [飞蛾扑火](https://mp.weixin.qq.com/s/V8r1Xbz5J0A9D5J_9GD_IA)、[草木皆兵](https://mp.weixin.qq.com/s/hdtzQaCF2h6ZjZd-0HAftQ)、[水中行舟](https://mp.weixin.qq.com/s/Zv6XX8ddUvBCtG-4LM1MKQ)、[花隐林间](https://mp.weixin.qq.com/s/4G8Fm2x1Bv61idbbQS2BlA)；
+- [待著而救](https://mp.weixin.qq.com/s/vCK2QIi0W19WWTyfiWpAyQ)、[多空博弈](https://mp.weixin.qq.com/s/04H8mVTVxa6OznMSj3JKgg)、[协同效应](https://mp.weixin.qq.com/s/_L3kv76mgoxctgW45iwIBA)。
 
 ### 3.3 CICC 分钟因子
 

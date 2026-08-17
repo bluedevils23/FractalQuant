@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import argparse
 from bisect import bisect_right
+from collections import Counter
+from datetime import datetime, timezone
+import json
 import logging
 import os
 import sys
@@ -38,6 +41,13 @@ STOCK_DEFAULT_DAILY_ROOT = Path(
 STOCK_DEFAULT_OUTPUT_ROOT = Path(
     r"D:\workspace\stockdata\stock-factors\stock_fz_daily_factors"
 )
+STOCK_DEFAULT_CAO_MU_SOURCE = Path(
+    r"D:\workspace\stockdata\stock-factors\stock_cao_mu_jie_bing_source.parquet"
+)
+STOCK_DEFAULT_TICK_ROOT = Path(r"E:\逐笔数据")
+CSI_ALL_SHARE_DEFAULT_DAILY_ROOT = Path(
+    r"D:\workspace\stockdata\指数数据\index_daily\000985.CSI.parquet"
+)
 ASSET_DEFAULTS = {
     "etf": (
         ETF_DEFAULT_INPUT_ROOT,
@@ -55,6 +65,14 @@ MORNING_MINUTES = pd.date_range("09:30", "11:30", freq="min").time
 AFTERNOON_MINUTES = pd.date_range("13:01", "15:00", freq="min").time
 EXPECTED_MINUTE_TIMES = frozenset((*MORNING_MINUTES, *AFTERNOON_MINUTES))
 EXPECTED_MINUTE_ROWS = len(EXPECTED_MINUTE_TIMES)
+CAO_MU_REQUIRED_SOURCE_FIELDS = (
+    "retail_trade_ratio",
+    "csi_all_share_return",
+)
+CAO_MU_SOURCE_COLUMNS = ("ts_code", "trade_date", *CAO_MU_REQUIRED_SOURCE_FIELDS)
+CAO_MU_SMALL_TRADE_AMOUNT = 40_000.0
+TIDE_FACTOR_NAMES = frozenset({"QiangShiBanChaoXi", "RuoShiBanChaoXi"})
+MANIFEST_NAME = "_fz_generation_manifest.json"
 
 
 @dataclass(frozen=True)
@@ -72,6 +90,7 @@ RAW_FACTOR_SPECS = (
     FactorSpec("MoHuGuanLianDu", fz_methods.cal_MoHuGuanLianDu),
     FactorSpec("MoHuJinEBi", fz_methods.cal_MoHuJinEBi),
     FactorSpec("MoHuJiaCha", fz_methods.cal_MoHuJiaCha),
+    FactorSpec("ChongJian", fz_methods.cal_ChongJian),
     FactorSpec("PanDeng", fz_methods.cal_PanDeng),
     FactorSpec("TiaoYueDu", fz_methods.cal_TiaoYueDu),
     FactorSpec("RiBoDongLv", fz_methods.cal_RiBoDongLv),
@@ -88,14 +107,17 @@ RAW_FACTOR_SPECS = (
     ),
     FactorSpec("ZhenFuBoYi", fz_methods.cal_ZhenFuBoYi),
     FactorSpec("ChengJiaoLiangXieTong", fz_methods.cal_ChengJiaoLiangXieTong),
-    FactorSpec("XieTongJiaCha", fz_methods.cal_XieTongJiaCha),
+    FactorSpec("XieTongJiaCha", fz_methods.cal_XieTongJiaCha, needs_daily_pv=True),
 )
 
 COMPOSED_FACTOR_SPECS = (
     FactorSpec("ShiDuMaoXian", fz_methods.cal_ShiDuMaoXian),
+    FactorSpec("YueYaoYanBoDongLv", fz_methods.cal_YueYaoYanBoDongLv),
+    FactorSpec("YueYaoYanShouYiLv", fz_methods.cal_YueYaoYanShouYiLv),
     FactorSpec("ChaoXi", fz_methods.cal_ChaoXi),
     FactorSpec("YunKaiWuSan", fz_methods.cal_YunKaiWuSan),
     FactorSpec("YongPanGaoFeng", fz_methods.cal_YongPanGaoFeng),
+    FactorSpec("ZaiHouChongJian", fz_methods.cal_ZaiHouChongJian),
     FactorSpec("FeiEPuHuo", fz_methods.cal_FeiEPuHuo),
     FactorSpec("CaoMuJieBing", fz_methods.cal_CaoMuJieBing),
     FactorSpec("SuiBoZhuLiu", fz_methods.cal_SuiBoZhuLiu),
@@ -147,6 +169,10 @@ ALL_FACTOR_NAMES = tuple(
         FactorSpec("ChengJiaoLiangXieTong", fz_methods.cal_ChengJiaoLiangXieTong),
         FactorSpec("XieTongJiaCha", fz_methods.cal_XieTongJiaCha),
         FactorSpec("XieTongXiaoYing", fz_methods.cal_XieTongXiaoYing),
+        FactorSpec("ChongJian", fz_methods.cal_ChongJian),
+        FactorSpec("ZaiHouChongJian", fz_methods.cal_ZaiHouChongJian),
+        FactorSpec("YueYaoYanBoDongLv", fz_methods.cal_YueYaoYanBoDongLv),
+        FactorSpec("YueYaoYanShouYiLv", fz_methods.cal_YueYaoYanShouYiLv),
     )
 )
 
@@ -157,8 +183,9 @@ def parse_args(
 ) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Generate stock or ETF FangZheng daily factor exposures from local "
-            "1-minute parquet files."
+            "Generate 38 stock or ETF FangZheng daily factor exposures from local "
+            "241-minute parquet files. Inputs use the report's OHLCV minute logic; "
+            "factor_date=d is available from the next trading day."
         )
     )
     parser.add_argument(
@@ -219,6 +246,43 @@ def parse_args(
         help="Overwrite existing output files.",
     )
     parser.add_argument(
+        "--strict-source-fields",
+        action="store_true",
+        help=(
+            "Fail before minute staging when a report-required daily source "
+            "field is absent or incomplete."
+        ),
+    )
+    parser.add_argument(
+        "--cao-mu-source",
+        type=Path,
+        default=None,
+        help=(
+            "Optional daily source parquet with ts_code, trade_date, "
+            "retail_trade_ratio, and csi_all_share_return."
+        ),
+    )
+    parser.add_argument(
+        "--build-cao-mu-source",
+        action="store_true",
+        help=(
+            "Build or incrementally update the CaoMuJieBing daily source from "
+            "stock tick trades and CSI All Share daily closes."
+        ),
+    )
+    parser.add_argument(
+        "--tick-root",
+        type=Path,
+        default=STOCK_DEFAULT_TICK_ROOT,
+        help="Root of per-day stock tick trade CSV files used by --build-cao-mu-source.",
+    )
+    parser.add_argument(
+        "--csi-all-share-daily-root",
+        type=Path,
+        default=CSI_ALL_SHARE_DEFAULT_DAILY_ROOT,
+        help="CSI All Share 000985.CSI daily parquet used by --build-cao-mu-source.",
+    )
+    parser.add_argument(
         "--workers",
         type=int,
         default=os.cpu_count() or 1,
@@ -247,6 +311,13 @@ def parse_args(
     args.input_root = args.input_root or default_input
     args.daily_root = args.daily_root or default_daily
     args.output_root = args.output_root or default_output
+    if args.build_cao_mu_source and args.cao_mu_source is None:
+        if args.asset_type != "stock":
+            parser.error("--build-cao-mu-source is currently supported only for stock")
+        args.cao_mu_source = STOCK_DEFAULT_CAO_MU_SOURCE
+    elif args.asset_type == "stock" and args.cao_mu_source is None:
+        if STOCK_DEFAULT_CAO_MU_SOURCE.exists():
+            args.cao_mu_source = STOCK_DEFAULT_CAO_MU_SOURCE
     return args
 
 
@@ -385,7 +456,11 @@ def normalize_daily_frame(raw_df: pd.DataFrame) -> pd.DataFrame:
 
     numeric_columns = [
         column
-        for column in ("open", "high", "low", "close", "volume", "amount", "total_size", "total_share")
+        for column in (
+            "open", "high", "low", "close", "volume", "amount",
+            "total_size", "total_share", "retail_trade_ratio",
+            "csi_all_share_return",
+        )
         if column in df.columns
     ]
     for column in numeric_columns:
@@ -503,19 +578,14 @@ def load_daily_inputs(
             missing_cmc,
         )
 
-    daily_base = daily_df[
-        [
-            "ts_code",
-            "trade_date",
-            "open",
-            "high",
-            "low",
-            "close",
-            "volume",
-            "amount",
-            "cmc",
-        ]
-    ].copy()
+    daily_base_columns = [
+        "ts_code", "trade_date", "open", "high", "low", "close",
+        "volume", "amount", "cmc",
+    ]
+    daily_base_columns.extend(
+        field for field in CAO_MU_REQUIRED_SOURCE_FIELDS if field in daily_df.columns
+    )
+    daily_base = daily_df[daily_base_columns].copy()
 
     daily_pv = daily_df[["ts_code", "trade_date", "open", "close", "cmc"]].copy()
     daily_pv = daily_pv.rename(
@@ -530,6 +600,234 @@ def load_daily_inputs(
     daily_pv["Trddt"] = pd.to_datetime(daily_pv["Trddt"]).dt.strftime("%Y-%m-%d")
     daily_pv_pl = pl.from_pandas(daily_pv, include_index=False)
     return daily_base, daily_pv_pl
+
+
+def assess_cao_mu_source_fields(
+    daily_base: pd.DataFrame,
+    date_from: pd.Timestamp | None = None,
+    date_to: pd.Timestamp | None = None,
+) -> dict[str, object]:
+    relevant = daily_base
+    if date_from is not None:
+        relevant = relevant.loc[
+            relevant["trade_date"] >= pd.Timestamp(date_from).normalize()
+        ]
+    if date_to is not None:
+        relevant = relevant.loc[
+            relevant["trade_date"] <= pd.Timestamp(date_to).normalize()
+        ]
+
+    missing_fields = [
+        field for field in CAO_MU_REQUIRED_SOURCE_FIELDS if field not in relevant.columns
+    ]
+    null_rows = {
+        field: int(relevant[field].isna().sum())
+        for field in CAO_MU_REQUIRED_SOURCE_FIELDS
+        if field in relevant.columns
+    }
+    if missing_fields:
+        status = "unavailable"
+    elif any(null_rows.values()):
+        status = "partial"
+    else:
+        status = "available"
+    return {
+        "status": status,
+        "required_fields": list(CAO_MU_REQUIRED_SOURCE_FIELDS),
+        "missing_fields": missing_fields,
+        "null_rows": null_rows,
+        "checked_rows": int(len(relevant)),
+        "retail_trade_ratio_definition": (
+            "mean(individual-investor buy amount, sell amount) for trades below "
+            "CNY 40000 divided by total daily amount"
+        ),
+        "benchmark": "CSI All Share 000985.CSI daily return",
+    }
+
+
+def enforce_source_field_policy(
+    availability: dict[str, object], strict: bool
+) -> None:
+    if strict and availability["status"] != "available":
+        raise ValueError(
+            "CaoMuJieBing report inputs are not fully available: "
+            f"missing_fields={availability['missing_fields']}, "
+            f"null_rows={availability['null_rows']}"
+        )
+
+
+def normalize_cao_mu_source_frame(raw_df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize the independently materialized inputs for CaoMuJieBing."""
+    df = raw_df.copy()
+    if isinstance(df.index, pd.MultiIndex) and {"trade_date", "ts_code"} <= set(df.index.names):
+        df = df.reset_index()
+    required = set(CAO_MU_SOURCE_COLUMNS)
+    missing = sorted(required - set(df.columns))
+    if missing:
+        raise ValueError(f"CaoMuJieBing source is missing columns: {missing}")
+    df = df[list(CAO_MU_SOURCE_COLUMNS)].copy()
+    df["ts_code"] = df["ts_code"].astype(str)
+    df["trade_date"] = pd.to_datetime(df["trade_date"]).dt.normalize()
+    for column in CAO_MU_REQUIRED_SOURCE_FIELDS:
+        df[column] = pd.to_numeric(df[column], errors="coerce")
+    if df.duplicated(["ts_code", "trade_date"]).any():
+        raise ValueError("CaoMuJieBing source has duplicate ts_code/trade_date keys.")
+    return df.sort_values(["ts_code", "trade_date"]).reset_index(drop=True)
+
+
+def load_csi_all_share_returns(index_daily_root: Path) -> pd.DataFrame:
+    if not index_daily_root.exists():
+        raise FileNotFoundError(
+            f"CSI All Share daily parquet does not exist: {index_daily_root}"
+        )
+    index_df = pd.read_parquet(index_daily_root)
+    if "trade_date" not in index_df.columns:
+        index_df = index_df.reset_index()
+    required = {"trade_date", "close"}
+    missing = sorted(required - set(index_df.columns))
+    if missing:
+        raise ValueError(f"CSI All Share daily parquet is missing columns: {missing}")
+    index_df = index_df[["trade_date", "close"]].copy()
+    index_df["trade_date"] = pd.to_datetime(index_df["trade_date"]).dt.normalize()
+    index_df["close"] = pd.to_numeric(index_df["close"], errors="coerce")
+    index_df = index_df.sort_values("trade_date").drop_duplicates("trade_date", keep="last")
+    index_df["csi_all_share_return"] = index_df["close"].pct_change(fill_method=None)
+    return index_df[["trade_date", "csi_all_share_return"]]
+
+
+def tick_trade_path(tick_root: Path, ts_code: str, trade_date: pd.Timestamp) -> Path:
+    date_text = pd.Timestamp(trade_date).strftime("%Y%m%d")
+    return (
+        tick_root
+        / date_text[:4]
+        / date_text[:6]
+        / date_text
+        / ts_code
+        / "逐笔成交.csv"
+    )
+
+
+def calculate_retail_trade_ratio(tick_path: Path) -> float | None:
+    """Return the report's daily small-investor trade ratio from matched ticks."""
+    required_columns = ("成交代码", "BS标志", "成交价格", "成交数量")
+    try:
+        ticks = pd.read_csv(
+            tick_path,
+            encoding="gb18030",
+            usecols=list(required_columns),
+            low_memory=False,
+        )
+    except (OSError, UnicodeDecodeError, pd.errors.EmptyDataError, ValueError) as error:
+        LOGGER.warning("Cannot read tick trade file %s: %s", tick_path, error)
+        return None
+
+    trade_code = ticks["成交代码"].fillna("").astype(str).str.strip()
+    side = ticks["BS标志"].fillna("").astype(str).str.strip()
+    price = pd.to_numeric(ticks["成交价格"], errors="coerce")
+    quantity = pd.to_numeric(ticks["成交数量"], errors="coerce")
+    matched = trade_code.eq("0") & side.isin(("B", "S")) & (price > 0) & (quantity > 0)
+    if not matched.any():
+        return None
+
+    valid_side = side.loc[matched]
+    # Wind tick prices are quoted in 1/10000 CNY; the common scale cancels in the ratio.
+    amount = (price.loc[matched] * quantity.loc[matched]) / 10_000.0
+    total_amount = float(amount.sum())
+    if not pd.notna(total_amount) or total_amount <= 0:
+        return None
+    small_amount = amount.loc[amount < CAO_MU_SMALL_TRADE_AMOUNT]
+    small_side = valid_side.loc[small_amount.index]
+    buy_amount = float(small_amount.loc[small_side.eq("B")].sum())
+    sell_amount = float(small_amount.loc[small_side.eq("S")].sum())
+    return (buy_amount + sell_amount) / (2.0 * total_amount)
+
+
+def build_cao_mu_source(
+    daily_base: pd.DataFrame,
+    tick_root: Path,
+    index_daily_root: Path,
+    source_path: Path,
+    date_from: pd.Timestamp | None = None,
+    date_to: pd.Timestamp | None = None,
+) -> pd.DataFrame:
+    """Incrementally materialize the daily tick and benchmark inputs for stocks."""
+    if not tick_root.exists():
+        raise FileNotFoundError(f"Tick root does not exist: {tick_root}")
+    requested = daily_base[["ts_code", "trade_date"]].copy()
+    if date_from is not None:
+        requested = requested.loc[requested["trade_date"] >= pd.Timestamp(date_from).normalize()]
+    if date_to is not None:
+        requested = requested.loc[requested["trade_date"] <= pd.Timestamp(date_to).normalize()]
+    requested = requested.drop_duplicates().sort_values(["ts_code", "trade_date"])
+
+    existing = (
+        normalize_cao_mu_source_frame(pd.read_parquet(source_path))
+        if source_path.exists()
+        else pd.DataFrame(columns=CAO_MU_SOURCE_COLUMNS)
+    )
+    existing_keys = set(
+        zip(
+            existing.loc[existing["retail_trade_ratio"].notna(), "ts_code"],
+            existing.loc[existing["retail_trade_ratio"].notna(), "trade_date"],
+        )
+    )
+    missing = requested.loc[
+        [key not in existing_keys for key in zip(requested["ts_code"], requested["trade_date"])]
+    ]
+    if missing.empty:
+        LOGGER.info("CaoMuJieBing source %s already covers all requested keys", source_path)
+        return existing
+    rows: list[dict[str, object]] = []
+    missing_tick_files = 0
+    for ts_code, trade_date in missing.itertuples(index=False):
+        tick_path = tick_trade_path(tick_root, ts_code, trade_date)
+        if not tick_path.exists():
+            missing_tick_files += 1
+            continue
+        ratio = calculate_retail_trade_ratio(tick_path)
+        if ratio is not None:
+            rows.append(
+                {
+                    "ts_code": ts_code,
+                    "trade_date": trade_date,
+                    "retail_trade_ratio": ratio,
+                }
+            )
+    retail_df = pd.DataFrame(rows)
+    if retail_df.empty:
+        retail_df = pd.DataFrame(columns=["ts_code", "trade_date", "retail_trade_ratio"])
+    else:
+        retail_df["trade_date"] = pd.to_datetime(retail_df["trade_date"]).dt.normalize()
+
+    benchmark = load_csi_all_share_returns(index_daily_root)
+    new_source = missing.merge(retail_df, on=["ts_code", "trade_date"], how="left")
+    new_source = new_source.merge(benchmark, on="trade_date", how="left")
+    combined = pd.concat([existing, new_source], ignore_index=True)
+    combined = normalize_cao_mu_source_frame(
+        combined.drop_duplicates(["ts_code", "trade_date"], keep="last")
+    )
+    source_path.parent.mkdir(parents=True, exist_ok=True)
+    combined.to_parquet(source_path, index=False)
+    LOGGER.info(
+        "Updated CaoMuJieBing source %s with %s keys (%s tick files missing)",
+        source_path,
+        len(new_source),
+        missing_tick_files,
+    )
+    return combined
+
+
+def merge_cao_mu_source(daily_base: pd.DataFrame, source_path: Path) -> pd.DataFrame:
+    if not source_path.exists():
+        raise FileNotFoundError(f"CaoMuJieBing source parquet does not exist: {source_path}")
+    source = normalize_cao_mu_source_frame(pd.read_parquet(source_path))
+    merged = daily_base.merge(source, on=["ts_code", "trade_date"], how="left", suffixes=("", "_source"))
+    for column in CAO_MU_REQUIRED_SOURCE_FIELDS:
+        source_column = f"{column}_source"
+        if source_column in merged.columns:
+            merged[column] = merged[column].combine_first(merged[source_column])
+            merged = merged.drop(columns=[source_column])
+    return merged
 
 
 def build_base_keys(frame: pl.DataFrame) -> pl.DataFrame:
@@ -607,12 +905,18 @@ def calculate_raw_daily_exposure(
     minute_panel = load_day_minute_panel(date_dir)
     base_keys = build_base_keys(minute_panel)
     day_exposure = base_keys
+    tide_factors: pl.DataFrame | None = None
     for spec in RAW_FACTOR_SPECS:
-        factor_df = (
-            spec.function(minute_panel, daily_pv_window)
-            if spec.needs_daily_pv
-            else spec.function(minute_panel)
-        )
+        if spec.name in TIDE_FACTOR_NAMES:
+            if tide_factors is None:
+                tide_factors = fz_methods._calculate_tidal_half_factors(minute_panel)
+            factor_df = tide_factors.select(["code", "date", spec.name])
+        else:
+            factor_df = (
+                spec.function(minute_panel, daily_pv_window)
+                if spec.needs_daily_pv
+                else spec.function(minute_panel)
+            )
         day_exposure = day_exposure.join(
             normalize_factor_output(spec.name, factor_df, base_keys),
             on=["code", "date"],
@@ -667,8 +971,17 @@ def enrich_with_daily_base(
         ),
         include_index=False,
     )
+    daily_columns = [
+        "code", "date", "open", "high", "low", "close",
+        "volume", "amount", "cmc",
+    ]
+    daily_columns.extend(
+        field
+        for field in CAO_MU_REQUIRED_SOURCE_FIELDS
+        if field in daily_base_pl.columns
+    )
     panel = raw_panel.join(
-        daily_base_pl.select(["code", "date", "open", "high", "low", "close", "volume", "amount", "cmc"]),
+        daily_base_pl.select(daily_columns),
         on=["code", "date"],
         how="left",
     ).sort(["code", "date"])
@@ -771,6 +1084,79 @@ def write_daily_factors_for_symbol(
     return ("written", output_path, len(result), len(result.columns))
 
 
+def write_generation_manifest(
+    output_root: Path,
+    *,
+    asset_type: str,
+    symbols_file: Path | None,
+    symbol_count: int,
+    source_availability: dict[str, object],
+    skipped_days: list[tuple[str, str, str]],
+    written_count: int,
+    skipped_existing_count: int,
+    date_from: pd.Timestamp | None,
+    date_to: pd.Timestamp | None,
+) -> Path:
+    reason_counts = Counter(reason for _, _, reason in skipped_days)
+    payload = {
+        "schema_version": 1,
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "asset_type": asset_type,
+        "output_schema": {
+            "index": "factor_date",
+            "columns": ["ts_code", *ALL_FACTOR_NAMES],
+            "factor_count": len(ALL_FACTOR_NAMES),
+            "column_count": len(ALL_FACTOR_NAMES) + 1,
+        },
+        "factor_availability": {
+            "CaoMuJieBing": source_availability,
+        },
+        "calculation_universe": {
+            "mode": "target_symbols",
+            "symbol_count": symbol_count,
+            "symbols_file": str(symbols_file) if symbols_file is not None else None,
+            "warning": (
+                "Cross-sectional and market-relative values use only the selected "
+                "target symbols; a static symbols file may introduce survivorship bias."
+            ),
+        },
+        "factor_date_range": {
+            "from": date_from.date().isoformat() if date_from is not None else None,
+            "to": date_to.date().isoformat() if date_to is not None else None,
+        },
+        "timing": {
+            "factor_date": "construction date using the complete daily minute panel",
+            "usable_from": "next trading day (d+1)",
+        },
+        "input_validation": {
+            "expected_minute_rows": EXPECTED_MINUTE_ROWS,
+            "invalid_code_dates": len(skipped_days),
+            "reason_counts": dict(sorted(reason_counts.items())),
+        },
+        "outputs": {
+            "written_symbols": written_count,
+            "skipped_existing_symbols": skipped_existing_count,
+            "failed_symbols": 0,
+        },
+    }
+    output_root.mkdir(parents=True, exist_ok=True)
+    manifest_path = output_root / MANIFEST_NAME
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            dir=output_root, suffix=".json", delete=False, mode="w", encoding="utf-8"
+        ) as temporary_file:
+            temporary_path = Path(temporary_file.name)
+            json.dump(payload, temporary_file, ensure_ascii=False, indent=2)
+            temporary_file.write("\n")
+        os.replace(temporary_path, manifest_path)
+    except Exception:
+        if temporary_path is not None and temporary_path.exists():
+            temporary_path.unlink()
+        raise
+    return manifest_path
+
+
 def main(
     argv: list[str] | None = None,
     default_asset_type: str = "etf",
@@ -792,12 +1178,48 @@ def main(
     if args.date_from is not None and args.date_to is not None and args.date_from > args.date_to:
         raise ValueError("--date-from must be on or before --date-to")
 
+    if args.build_cao_mu_source:
+        assert args.cao_mu_source is not None
+        build_cao_mu_source(
+            daily_base,
+            args.tick_root,
+            args.csi_all_share_daily_root,
+            args.cao_mu_source,
+            compute_date_from,
+            args.date_to,
+        )
+    if args.cao_mu_source is not None:
+        daily_base = merge_cao_mu_source(daily_base, args.cao_mu_source)
+
+    source_availability = assess_cao_mu_source_fields(
+        daily_base, compute_date_from, args.date_to
+    )
+    enforce_source_field_policy(source_availability, args.strict_source_fields)
+    if source_availability["status"] != "available":
+        LOGGER.warning(
+            "CaoMuJieBing source status is %s; missing_fields=%s, null_rows=%s. "
+            "The factor remains null where inputs are unavailable.",
+            source_availability["status"],
+            source_availability["missing_fields"],
+            source_availability["null_rows"],
+        )
+
     worker_count = max(1, args.workers)
     LOGGER.info(
         "Processing %s %s minute parquet files for FZ daily factors",
         len(files),
         args.asset_type,
     )
+    LOGGER.warning(
+        "Cross-sectional FZ calculations use only the %s selected target symbols; "
+        "this is not a full-A report replication.",
+        len(files),
+    )
+    if args.symbols_file is not None:
+        LOGGER.warning(
+            "The symbols file is static and does not remove historical survivorship bias: %s",
+            args.symbols_file,
+        )
     if args.date_from is not None or args.date_to is not None:
         LOGGER.info(
             "Writing factor dates from %s to %s (compute starts at %s for 20-day warmup)",
@@ -866,6 +1288,8 @@ def main(
         )
 
     failures: list[tuple[Path, str]] = []
+    written_count = 0
+    skipped_existing_count = 0
     if worker_count == 1:
         for input_path in files:
             try:
@@ -876,8 +1300,10 @@ def main(
                     final_factor_frame,
                 )
                 if status == "skipped":
+                    skipped_existing_count += 1
                     LOGGER.info("Skipping existing output: %s", output_path)
                 else:
+                    written_count += 1
                     LOGGER.info(
                         "Wrote %s rows and %s columns to %s",
                         row_count,
@@ -905,8 +1331,10 @@ def main(
                 try:
                     status, output_path, row_count, column_count = future.result()
                     if status == "skipped":
+                        skipped_existing_count += 1
                         LOGGER.info("Skipping existing output: %s", output_path)
                     else:
+                        written_count += 1
                         LOGGER.info(
                             "Wrote %s rows and %s columns to %s",
                             row_count,
@@ -923,6 +1351,19 @@ def main(
             LOGGER.error("  %s -> %s", failed_path, reason)
         return 1
 
+    manifest_path = write_generation_manifest(
+        args.output_root,
+        asset_type=args.asset_type,
+        symbols_file=args.symbols_file,
+        symbol_count=len(files),
+        source_availability=source_availability,
+        skipped_days=skipped_days,
+        written_count=written_count,
+        skipped_existing_count=skipped_existing_count,
+        date_from=args.date_from,
+        date_to=args.date_to,
+    )
+    LOGGER.info("Wrote generation manifest to %s", manifest_path)
     LOGGER.info("Completed successfully")
     return 0
 
