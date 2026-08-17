@@ -712,8 +712,8 @@ def _calculate_indicative_price(frame: pd.DataFrame) -> pd.Series:
 
 
 def _calculate_l3_imbalance(frame: pd.DataFrame) -> pd.Series:
-    bid_qty = frame[[f"bid_qty{level}" for level in range(1, 4)]].sum(axis=1)
-    ask_qty = frame[[f"ask_qty{level}" for level in range(1, 4)]].sum(axis=1)
+    bid_qty = frame[[f"bid_qty{level}" for level in range(2, 4)]].sum(axis=1)
+    ask_qty = frame[[f"ask_qty{level}" for level in range(2, 4)]].sum(axis=1)
     total = bid_qty + ask_qty
     return ((bid_qty - ask_qty) / total).where(total > 0)
 
@@ -898,12 +898,16 @@ def _apply_report_supplement_factors(
         prices = valid_price["indicative_price"].to_numpy(dtype=float)
         final = valid_price.iloc[-1]
         changes = np.diff(prices)
-        row["auction_up_step_ratio"] = float(
-            np.count_nonzero(changes > 0) / len(prices)
-        )
-        row["auction_down_step_ratio"] = float(
-            np.count_nonzero(changes < 0) / len(prices)
-        )
+        if len(changes) > 0:
+            row["auction_up_step_ratio"] = float(
+                np.count_nonzero(changes > 0) / len(changes)
+            )
+            row["auction_down_step_ratio"] = float(
+                np.count_nonzero(changes < 0) / len(changes)
+            )
+        else:
+            row["auction_up_step_ratio"] = 0.0
+            row["auction_down_step_ratio"] = 0.0
         row["auction_final_to_full_max"] = _safe_return(
             float(final["indicative_price"]), float(prices.max())
         )
@@ -1291,14 +1295,17 @@ def calculate_daily_auction_factors(
 
     if not valid_price.empty:
         final = valid_price.iloc[-1]
-        unmatched_bid = float(final["bid_qty2"])
-        unmatched_ask = float(final["ask_qty2"])
+        unmatched_bid = float(final["bid_qty2"] + final["bid_qty3"])
+        unmatched_ask = float(final["ask_qty2"] + final["ask_qty3"])
         unmatched_total = unmatched_bid + unmatched_ask
-        row["auction_unmatched_imbalance"] = (
-            float((unmatched_bid - unmatched_ask) / unmatched_total)
-            if unmatched_total > 0
-            else 0.0
-        )
+        if not np.isfinite(unmatched_bid) or not np.isfinite(unmatched_ask):
+            row["auction_unmatched_imbalance"] = np.nan
+        elif unmatched_total > 0:
+            row["auction_unmatched_imbalance"] = float(
+                (unmatched_bid - unmatched_ask) / unmatched_total
+            )
+        else:
+            row["auction_unmatched_imbalance"] = 0.0
     _apply_stage_reversal(row)
     return row
 

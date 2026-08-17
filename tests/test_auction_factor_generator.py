@@ -37,15 +37,19 @@ def _quote_row(
     bid_total: float,
     ask_total: float,
     *,
-    bid_qty2: float = 0.0,
-    ask_qty2: float = 0.0,
+    bid_qty2: float | None = None,
+    ask_qty2: float | None = None,
     previous_close: float = 10.0,
     open_price: float = np.nan,
     trade_volume: float = 0.0,
     trade_amount: float = 0.0,
 ) -> dict[str, object]:
-    bid_qty1 = max(0.0, bid_total - bid_qty2)
-    ask_qty1 = max(0.0, ask_total - ask_qty2)
+    bid_qty1 = 0.0
+    ask_qty1 = 0.0
+    bid_qty2 = bid_total if bid_qty2 is None else bid_qty2
+    ask_qty2 = ask_total if ask_qty2 is None else ask_qty2
+    bid_qty3 = max(0.0, bid_total - bid_qty2)
+    ask_qty3 = max(0.0, ask_total - ask_qty2)
     return {
         "trade_time": pd.Timestamp(timestamp),
         "trade_price": open_price,
@@ -58,13 +62,13 @@ def _quote_row(
         "ask_price3": np.nan,
         "ask_qty1": ask_qty1,
         "ask_qty2": ask_qty2,
-        "ask_qty3": 0.0,
+        "ask_qty3": ask_qty3,
         "bid_price1": price,
         "bid_price2": np.nan,
         "bid_price3": np.nan,
         "bid_qty1": bid_qty1,
         "bid_qty2": bid_qty2,
-        "bid_qty3": 0.0,
+        "bid_qty3": bid_qty3,
     }
 
 
@@ -174,7 +178,7 @@ def test_daily_factor_formulas_and_output_contract() -> None:
     assert np.isclose(row["auction_commitment_shift"], 0.3)
     assert np.isclose(row["auction_stage2_range_bps"], 40.0)
     assert np.isclose(row["auction_stage2_efficiency_ratio"], 1.0)
-    assert np.isclose(row["auction_unmatched_imbalance"], 1.0)
+    assert np.isclose(row["auction_unmatched_imbalance"], 0.8)
     assert np.isclose(row["auction_range_ratio"], (10.06 - 10.00) / 10.00)
     assert np.isclose(row["auction_stage1_range_ratio"], (10.01 - 10.00) / 10.00)
     assert np.isclose(row["auction_stage2_range_ratio"], (10.06 - 10.02) / 10.02)
@@ -184,7 +188,7 @@ def test_daily_factor_formulas_and_output_contract() -> None:
     assert np.isclose(
         row["auction_stage2_end_return_from_stage1_end"], 10.06 / 10.01 - 1.0
     )
-    assert row["auction_up_step_ratio"] == 4 / 5
+    assert row["auction_up_step_ratio"] == 4 / 4
     assert row["auction_down_step_ratio"] == 0.0
     assert row["auction_snapshot_count_total"] == 5
     assert row["auction_l3_buy_share_final"] == 0.9
@@ -262,8 +266,8 @@ def test_report_supplement_path_factors_use_published_boundaries() -> None:
 
     assert len(REPORT_SUPPLEMENT_FACTOR_COLUMNS) == 17
     assert row["auction_snapshot_count_total"] == 6
-    assert row["auction_up_step_ratio"] == 4 / 6
-    assert row["auction_down_step_ratio"] == 1 / 6
+    assert row["auction_up_step_ratio"] == 4 / 5
+    assert row["auction_down_step_ratio"] == 1 / 5
     assert np.isclose(row["auction_last60s_price_return"], 10.06 / 10.03 - 1.0)
     assert row["auction_final_to_full_max"] == 0.0
 
@@ -281,6 +285,36 @@ def test_report_supplement_path_factors_use_published_boundaries() -> None:
     nonfinite_row = calculate_daily_auction_factors(quotes, "000001.SZ")
     assert nonfinite_row["auction_snapshot_count_total"] == 5
     assert np.isfinite(nonfinite_row["auction_range_ratio"])
+
+
+def test_report_step_ratios_are_zero_for_single_snapshot() -> None:
+    row = calculate_daily_auction_factors(
+        _auction_quotes().iloc[[0]].copy(), "000001.SZ"
+    )
+
+    assert row["auction_up_step_ratio"] == 0.0
+    assert row["auction_down_step_ratio"] == 0.0
+
+
+def test_unmatched_imbalance_is_missing_when_final_quantities_are_nan() -> None:
+    quotes = _auction_quotes()
+    final_index = quotes.index[-2]
+    quotes.loc[final_index, ["bid_qty2", "ask_qty2"]] = np.nan
+
+    row = calculate_daily_auction_factors(quotes, "000001.SZ")
+
+    assert np.isnan(row["auction_unmatched_imbalance"])
+
+
+def test_l3_imbalance_excludes_equal_virtual_level1_quantity() -> None:
+    baseline = calculate_daily_auction_factors(_auction_quotes(), "000001.SZ")
+    quotes = _auction_quotes()
+    quotes[["bid_qty1", "ask_qty1"]] = 1_000_000.0
+    result = calculate_daily_auction_factors(quotes, "000001.SZ")
+
+    assert result["auction_l3_imbalance_twap_stage2"] == pytest.approx(
+        baseline["auction_l3_imbalance_twap_stage2"]
+    )
 
 
 def test_second_batch_event_factor_formulas_and_boundaries() -> None:
@@ -507,7 +541,12 @@ def test_zero_depth_and_zero_previous_close_do_not_create_infinity() -> None:
 
 def test_zero_initial_imbalance_uses_relative_floor_without_infinity() -> None:
     quotes = _auction_quotes()
-    quotes.loc[0, ["bid_qty1", "ask_qty1"]] = [500.0, 500.0]
+    quotes.loc[0, ["bid_qty2", "ask_qty2", "bid_qty3", "ask_qty3"]] = [
+        500.0,
+        500.0,
+        0.0,
+        0.0,
+    ]
     row = calculate_daily_auction_factors(quotes, "000001.SZ")
 
     assert np.isclose(row["auction_imbalance_relative_change_stage1"], 8.0)
