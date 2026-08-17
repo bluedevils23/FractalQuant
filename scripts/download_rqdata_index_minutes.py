@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 import logging
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date, time, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -15,6 +15,7 @@ DEFAULT_DATE_FROM = date(2026, 3, 19)
 OUTPUT_COLUMNS = ("ts_code", "open", "high", "low", "close", "vol", "amount")
 PRICE_FIELDS = ("open", "high", "low", "close", "volume", "total_turnover")
 LOGGER = logging.getLogger("download_rqdata_index_minutes")
+SESSION_START_TIME = time(9, 31)
 
 
 @dataclass(frozen=True)
@@ -105,6 +106,7 @@ def normalize_rqdata_frame(raw: pd.DataFrame, output_code: str) -> pd.DataFrame:
         },
         index=pd.DatetimeIndex(trade_time, name="trade_time"),
     )
+    frame = frame.loc[frame.index.time >= SESSION_START_TIME]
     frame["trade_date"] = frame.index.normalize()
     valid_ohlc = frame[["open", "high", "low", "close"]].gt(0).all(axis=1)
     non_trading_dates = valid_ohlc.groupby(frame["trade_date"]).any()
@@ -200,6 +202,11 @@ def load_existing(path: Path, output_code: str) -> pd.DataFrame | None:
     if not path.exists():
         return None
     existing = pd.read_parquet(path)
+    if not isinstance(existing.index, pd.MultiIndex) or existing.index.nlevels != 2:
+        raise ValueError(f"Unexpected index schema for {output_code}")
+    existing.index = existing.index.set_names(["trade_date", "trade_time"])
+    trade_times = pd.to_datetime(existing.index.get_level_values("trade_time"))
+    existing = existing.loc[trade_times.time >= SESSION_START_TIME]
     validate_minute_frame(existing, output_code)
     return existing
 

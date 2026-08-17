@@ -59,7 +59,9 @@ DEFAULT_ETF_ROOT = Path(r"D:\workspace\stockdata\etf-data\etf_1min")
 DEFAULT_ETF_DAILY_PATH = Path(
     r"D:\workspace\stockdata\etf-data\etf_daily.parquet"
 )
-DEFAULT_INDEX_ROOT = Path(r"D:\workspace\stockdata\指数数据\index_1min")
+DEFAULT_INDEX_ROOT = Path(
+    r"D:\workspace\stockdata\指数数据\index_1min_rqdata"
+)
 DEFAULT_OUTPUT_ROOT = Path(
     r"D:\workspace\stockdata\etf-data\etf_1min_crossmarket_factors"
 )
