@@ -26,6 +26,8 @@ DEFAULT_STOCK_MINUTE_ROOT = Path(
     r"D:\workspace\stockdata\stock-data\行情数据\stock_1min"
 )
 DEFAULT_ETF_MINUTE_ROOT = Path(r"D:\workspace\stockdata\etf-data\etf_1min")
+DEFAULT_QMT_TICK_ROOT = Path(r"D:\workspace\stockdata\etf-data\etf_tick_qmt")
+DEFAULT_QMT_MINUTE_ROOT = Path(r"D:\workspace\stockdata\etf-data\etf_1min_qmt")
 DEFAULT_STOCK_DAILY_PATH = Path(
     r"D:\workspace\stockdata\stock-data\行情数据\stock_daily.parquet"
 )
@@ -34,6 +36,9 @@ DEFAULT_STOCK_OUTPUT_ROOT = Path(
     r"D:\workspace\stockdata\stock-factors\stock_auction_factors"
 )
 DEFAULT_ETF_OUTPUT_ROOT = Path(r"D:\workspace\stockdata\etf-factors\etf_auction_factors")
+DEFAULT_QMT_OUTPUT_ROOT = Path(
+    r"D:\workspace\stockdata\etf-factors\etf_auction_factors_qmt_0930_match"
+)
 DEFAULT_STOCK_SESSION_PATH_OUTPUT_ROOT = Path(
     r"D:\workspace\stockdata\stock-factors\stock_intraday_session_path_factors"
 )
@@ -50,6 +55,7 @@ SYMBOL_PATTERN = re.compile(r"^(\d{6})(?:\.(?:SH|SZ|BJ))?$", re.IGNORECASE)
 KEY_COLUMNS = ["trade_date", "available_time", "ts_code"]
 DIAGNOSTIC_COLUMNS = [
     "auction_has_match",
+    "auction_match_source",
     "snapshot_count_stage1",
     "snapshot_count_stage2",
     "auction_event_reconstruction_ok",
@@ -167,6 +173,24 @@ REPORT_SUPPLEMENT_FACTOR_COLUMNS = [
     "auction_last60s_price_return",
     "auction_final_to_full_max",
 ]
+REPORT_SMOOTHED_SOURCE_COLUMNS = [
+    "auction_range_ratio",
+    "auction_stage1_range_ratio",
+    "auction_stage2_range_ratio",
+    "auction_overnight_return",
+    "auction_stage1_end_return_from_prev_close",
+    "auction_stage2_end_return_from_stage1_end",
+    "auction_up_step_ratio",
+    "auction_down_step_ratio",
+    "auction_snapshot_count_total",
+    "auction_matched_volume",
+    "auction_l3_buy_share_final",
+    "auction_l3_buy_share_stage1_end",
+    "auction_l3_buy_share_change_stage2",
+]
+REPORT_SMOOTHED_FACTOR_COLUMNS = [
+    f"{column}_mean_20d" for column in REPORT_SMOOTHED_SOURCE_COLUMNS
+]
 CONTEXT_SUPPLEMENT_FACTOR_COLUMNS = [
     "auction_volume_to_prevday_volume",
     "auction_amount_to_float_mcap_prevclose",
@@ -177,6 +201,21 @@ CONTEXT_SUPPLEMENT_FACTOR_COLUMNS = [
     "auction_stage1_limit_up_distance_bps",
     "auction_stage1_limit_down_distance_bps",
 ]
+SUPPLEMENT_REFERENCE_COLUMNS = [
+    "auction_stage1_end_time",
+    "auction_stage2_end_time",
+    "previous_day_volume_shares",
+    "previous_day_high",
+    "previous_7d_close_max",
+    "previous_day_float_market_cap_cny",
+    "auction_limit_up_price",
+    "auction_limit_down_price",
+]
+SUPPLEMENT_OUTPUT_COLUMNS = (
+    SUPPLEMENT_REFERENCE_COLUMNS
+    + REPORT_SUPPLEMENT_FACTOR_COLUMNS
+    + CONTEXT_SUPPLEMENT_FACTOR_COLUMNS
+)
 FACTOR_COLUMNS = (
     CORE_FACTOR_COLUMNS
     + EVENT_FACTOR_COLUMNS
@@ -186,6 +225,7 @@ FACTOR_COLUMNS = (
     + PRIORITY_REPORT_FACTOR_COLUMNS
     + REPORT_SUPPLEMENT_FACTOR_COLUMNS
     + CONTEXT_SUPPLEMENT_FACTOR_COLUMNS
+    + REPORT_SMOOTHED_FACTOR_COLUMNS
 )
 OUTPUT_COLUMNS = KEY_COLUMNS + DIAGNOSTIC_COLUMNS + REFERENCE_COLUMNS + FACTOR_COLUMNS
 SESSION_PATH_OUTPUT_COLUMNS = [
@@ -259,12 +299,25 @@ def parse_args() -> argparse.Namespace:
         "--stock-minute-root", type=Path, default=DEFAULT_STOCK_MINUTE_ROOT
     )
     parser.add_argument("--etf-minute-root", type=Path, default=DEFAULT_ETF_MINUTE_ROOT)
+    parser.add_argument("--qmt-tick-root", type=Path, default=DEFAULT_QMT_TICK_ROOT)
+    parser.add_argument("--qmt-minute-root", type=Path, default=DEFAULT_QMT_MINUTE_ROOT)
     parser.add_argument("--stock-daily-path", type=Path, default=DEFAULT_STOCK_DAILY_PATH)
     parser.add_argument("--etf-daily-path", type=Path, default=DEFAULT_ETF_DAILY_PATH)
     parser.add_argument(
         "--stock-output-root", type=Path, default=DEFAULT_STOCK_OUTPUT_ROOT
     )
     parser.add_argument("--etf-output-root", type=Path, default=DEFAULT_ETF_OUTPUT_ROOT)
+    parser.add_argument("--qmt-output-root", type=Path, default=DEFAULT_QMT_OUTPUT_ROOT)
+    parser.add_argument(
+        "--use-qmt-auction-source",
+        action="store_true",
+        help="Generate ETF auction factors from QMT ticks and the 09:30 minute match bar.",
+    )
+    parser.add_argument(
+        "--use-qmt-match-fallback",
+        action="store_true",
+        help="Use QMT ETF match data after native quote and transaction fallbacks.",
+    )
     parser.add_argument(
         "--stock-session-path-output-root",
         type=Path,
@@ -283,6 +336,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--symbols-file", type=Path, default=None, help="Optional UTF-8 symbol list."
+    )
+    parser.add_argument(
+        "--existing-output-only",
+        action="store_true",
+        help="Restrict processing to symbols with an existing auction output parquet.",
     )
     parser.add_argument("--date-from", type=str, default=None)
     parser.add_argument("--date-to", type=str, default=None)
@@ -314,6 +372,11 @@ def parse_args() -> argparse.Namespace:
         "--overwrite",
         action="store_true",
         help="Replace requested dates while preserving dates outside the requested range.",
+    )
+    parser.add_argument(
+        "--refresh-existing-factors",
+        action="store_true",
+        help="Recompute and replace requested dates after factor formula changes.",
     )
     parser.add_argument(
         "--write-session-path-factors",
@@ -440,6 +503,16 @@ def build_asset_universe(
     return sorted(assets, key=lambda item: (item[0], item[2]))
 
 
+def existing_output_codes(output_root: Path) -> set[str]:
+    if not output_root.exists():
+        return set()
+    return {
+        code
+        for path in output_root.glob("*.parquet")
+        if (code := numeric_code(path.stem)) is not None
+    }
+
+
 def discover_trade_date_dirs(tick_root: Path, date_to: str | None) -> list[Path]:
     if not tick_root.exists():
         raise FileNotFoundError(f"Tick root does not exist: {tick_root}")
@@ -497,6 +570,190 @@ def load_quote_frame(
     if cache is not None:
         return cache.load_quote(symbol_dir)
     return AuctionTickCache(None).load_quote(symbol_dir)
+
+
+def load_open_transaction_match(
+    symbol_dir: Path, cache: AuctionTickCache | None = None
+) -> dict[str, object] | None:
+    """Extract a conservative 09:25 opening match from transaction prints."""
+    transaction_frame = (
+        cache.load_open_transactions(symbol_dir)
+        if cache is not None
+        else AuctionTickCache(None).load_open_transactions(symbol_dir)
+    )
+    if transaction_frame.empty:
+        return None
+    candidates = transaction_frame.loc[
+        transaction_frame["trade_code"].ne("C")
+        & transaction_frame["bs_flag"].isin(["B", "S"])
+        & transaction_frame["price"].gt(0)
+        & transaction_frame["quantity"].gt(0)
+    ].copy()
+    if candidates.empty:
+        return None
+    candidates["notional"] = candidates["price"] * candidates["quantity"]
+    price_volume = candidates.groupby("price", sort=False)["quantity"].sum()
+    selected_price = float(price_volume.idxmax())
+    selected = candidates.loc[candidates["price"].eq(selected_price)]
+    matched_volume = float(selected["quantity"].sum())
+    if not np.isfinite(matched_volume) or matched_volume <= 0:
+        return None
+    trade_time = pd.Timestamp(selected["trade_time"].min()).normalize() + pd.Timedelta(
+        hours=9, minutes=25
+    )
+    return {
+        "trade_time": trade_time,
+        "open_price": selected_price,
+        "trade_volume": matched_volume,
+        "trade_amount": float(selected_price * matched_volume),
+    }
+
+
+def load_qmt_quote_frame(tick_path: Path) -> pd.DataFrame:
+    """Normalize QMT tick snapshots to the opening-auction quote contract."""
+    columns = [
+        "last_price",
+        "previous_close",
+        *[f"ask_price{level}" for level in range(1, 4)],
+        *[f"ask_vol{level}" for level in range(1, 4)],
+        *[f"bid_price{level}" for level in range(1, 4)],
+        *[f"bid_vol{level}" for level in range(1, 4)],
+    ]
+    frame = pd.read_parquet(tick_path, columns=columns).reset_index()
+    required = {"trade_date", "trade_time"}
+    if not required.issubset(frame.columns):
+        raise ValueError(f"QMT tick file must expose trade_date and trade_time: {tick_path}")
+    frame["trade_time"] = pd.to_datetime(frame["trade_time"], errors="coerce")
+    frame = frame.dropna(subset=["trade_time"])
+    clock = frame["trade_time"].dt.time
+    frame = frame.loc[
+        (clock >= pd.Timestamp("09:15").time())
+        & (clock < pd.Timestamp("09:25").time())
+    ].copy()
+    result = pd.DataFrame({"trade_time": frame["trade_time"]})
+    result["trade_price"] = pd.to_numeric(frame["last_price"], errors="coerce")
+    result["trade_volume"] = 0.0
+    result["trade_amount"] = 0.0
+    result["open_price"] = np.nan
+    result["previous_close"] = pd.to_numeric(
+        frame["previous_close"], errors="coerce"
+    )
+    for level in range(1, 4):
+        result[f"ask_price{level}"] = pd.to_numeric(
+            frame[f"ask_price{level}"], errors="coerce"
+        )
+        result[f"ask_qty{level}"] = pd.to_numeric(
+            frame[f"ask_vol{level}"], errors="coerce"
+        )
+        result[f"bid_price{level}"] = pd.to_numeric(
+            frame[f"bid_price{level}"], errors="coerce"
+        )
+        result[f"bid_qty{level}"] = pd.to_numeric(
+            frame[f"bid_vol{level}"], errors="coerce"
+        )
+    return result.sort_values("trade_time", kind="mergesort").drop_duplicates(
+        "trade_time", keep="last"
+    ).reset_index(drop=True)
+
+
+def load_qmt_0930_matches(minute_path: Path) -> dict[str, dict[str, object]]:
+    """Read the QMT 09:30 bar as an explicitly labelled match fallback."""
+    frame = pd.read_parquet(minute_path, columns=["open", "vol", "amount"]).reset_index()
+    required = {"trade_date", "trade_time"}
+    if not required.issubset(frame.columns):
+        raise ValueError(f"QMT minute file must expose trade_date and trade_time: {minute_path}")
+    frame["trade_date"] = pd.to_datetime(frame["trade_date"], errors="coerce")
+    frame["trade_time"] = pd.to_datetime(frame["trade_time"], errors="coerce")
+    frame["open"] = pd.to_numeric(frame["open"], errors="coerce")
+    frame["vol"] = pd.to_numeric(frame["vol"], errors="coerce")
+    frame["amount"] = pd.to_numeric(frame["amount"], errors="coerce")
+    matches = frame.loc[
+        frame["trade_date"].notna()
+        & frame["trade_time"].notna()
+        & frame["trade_time"].dt.strftime("%H:%M:%S").eq("09:30:00")
+        & frame["open"].gt(0)
+        & frame["vol"].gt(0)
+        & frame["amount"].gt(0)
+    ].copy()
+    matches = matches.drop_duplicates("trade_date", keep="last")
+    return {
+        trade_date.strftime("%Y-%m-%d"): {
+            # Requested 09:25 backfill convention; this is not the bar publish time.
+            "trade_time": trade_date + pd.Timedelta(hours=9, minutes=25),
+            "open_price": float(row["open"]),
+            "trade_volume": float(row["vol"]),
+            "trade_amount": float(row["amount"]),
+        }
+        for trade_date, row in matches.set_index("trade_date").iterrows()
+    }
+
+
+def load_qmt_0925_tick_matches(tick_path: Path) -> dict[str, dict[str, object]]:
+    """Read the last valid QMT tick snapshot in the 09:25 opening-match minute."""
+    frame = pd.read_parquet(
+        tick_path, columns=["last_price", "volume", "amount"]
+    ).reset_index()
+    required = {"trade_date", "trade_time"}
+    if not required.issubset(frame.columns):
+        raise ValueError(f"QMT tick file must expose trade_date and trade_time: {tick_path}")
+    frame["trade_date"] = pd.to_datetime(frame["trade_date"], errors="coerce")
+    frame["trade_time"] = pd.to_datetime(frame["trade_time"], errors="coerce")
+    frame["last_price"] = pd.to_numeric(frame["last_price"], errors="coerce")
+    frame["volume"] = pd.to_numeric(frame["volume"], errors="coerce")
+    frame["amount"] = pd.to_numeric(frame["amount"], errors="coerce")
+    matches = frame.loc[
+        frame["trade_date"].notna()
+        & frame["trade_time"].notna()
+        & frame["trade_time"].dt.strftime("%H:%M:%S").between(
+            "09:25:00", "09:25:59"
+        )
+        & frame["last_price"].gt(0)
+        & frame["volume"].gt(0)
+        & frame["amount"].gt(0)
+    ].copy()
+    matches = matches.sort_values("trade_time", kind="mergesort").drop_duplicates(
+        "trade_date", keep="last"
+    )
+    return {
+        trade_date.strftime("%Y-%m-%d"): {
+            "trade_time": trade_date + pd.Timedelta(hours=9, minutes=25),
+            "open_price": float(row["last_price"]),
+            # The local QMT tick archive already stores cumulative volume in shares.
+            "trade_volume": float(row["volume"]),
+            "trade_amount": float(row["amount"]),
+        }
+        for trade_date, row in matches.set_index("trade_date").iterrows()
+    }
+
+
+def _load_qmt_match_fallbacks(
+    ts_code: str,
+    tick_path: Path | None,
+    minute_path: Path | None,
+) -> tuple[dict[str, dict[str, object]], dict[str, dict[str, object]]]:
+    minute_matches: dict[str, dict[str, object]] = {}
+    tick_matches: dict[str, dict[str, object]] = {}
+    if minute_path is None or not minute_path.exists():
+        LOGGER.warning("%s QMT minute fallback file is unavailable", ts_code)
+    else:
+        try:
+            minute_matches = load_qmt_0930_matches(minute_path)
+        except (OSError, ValueError, KeyError) as exc:
+            LOGGER.warning("%s QMT minute fallback failed: %s", ts_code, exc)
+    if tick_path is None or not tick_path.exists():
+        LOGGER.warning("%s QMT tick fallback file is unavailable", ts_code)
+    else:
+        try:
+            tick_matches = load_qmt_0925_tick_matches(tick_path)
+        except (OSError, ValueError, KeyError) as exc:
+            LOGGER.warning("%s QMT tick fallback failed: %s", ts_code, exc)
+    LOGGER.info(
+        "%s QMT fallback matches: minute=%s tick=%s",
+        ts_code,
+        len(minute_matches),
+        len(tick_matches),
+    )
+    return minute_matches, tick_matches
 
 
 def _empty_event_frame() -> pd.DataFrame:
@@ -1144,6 +1401,7 @@ def _empty_output_row(trade_date: str, ts_code: str) -> dict[str, object]:
             "auction_stage1_end_time": pd.NaT,
             "auction_stage2_end_time": pd.NaT,
             "auction_has_match": False,
+            "auction_match_source": "none",
             "snapshot_count_stage1": 0,
             "snapshot_count_stage2": 0,
             "auction_event_reconstruction_ok": False,
@@ -1161,6 +1419,8 @@ def calculate_daily_auction_factors(
     ts_code: str,
     events: pd.DataFrame | None = None,
     event_reconstruction_ok: bool = False,
+    match_override: dict[str, object] | None = None,
+    match_source: str | None = None,
 ) -> dict[str, object]:
     if quotes.empty:
         raise ValueError(f"Empty quote frame for {ts_code}")
@@ -1185,6 +1445,27 @@ def calculate_daily_auction_factors(
     match_rows = quotes.loc[match_mask]
     has_match = not match_rows.empty
     match_row = match_rows.iloc[0] if has_match else None
+    if match_override is not None:
+        override_price = pd.to_numeric(match_override.get("open_price"), errors="coerce")
+        override_volume = pd.to_numeric(match_override.get("trade_volume"), errors="coerce")
+        override_amount = pd.to_numeric(match_override.get("trade_amount"), errors="coerce")
+        if (
+            np.isfinite(override_price)
+            and override_price > 0
+            and np.isfinite(override_volume)
+            and override_volume > 0
+            and np.isfinite(override_amount)
+            and override_amount > 0
+        ):
+            match_row = pd.Series(
+                {
+                    "trade_time": match_override.get("trade_time", nominal_end_time),
+                    "open_price": float(override_price),
+                    "trade_volume": float(override_volume),
+                    "trade_amount": float(override_amount),
+                }
+            )
+            has_match = True
     auction = quotes.loc[
         quotes["trade_time"].ge(start_time)
         & quotes["trade_time"].lt(nominal_end_time)
@@ -1202,6 +1483,8 @@ def calculate_daily_auction_factors(
     previous_close = _first_finite(quotes["previous_close"])
     row["previous_close"] = previous_close
     row["auction_has_match"] = has_match
+    if has_match:
+        row["auction_match_source"] = match_source or "quote"
     row["snapshot_count_stage1"] = int(len(stage1_valid))
     row["snapshot_count_stage2"] = int(len(stage2_valid))
 
@@ -1307,6 +1590,115 @@ def calculate_daily_auction_factors(
         else:
             row["auction_unmatched_imbalance"] = 0.0
     _apply_stage_reversal(row)
+    return row
+
+
+def _calculate_daily_with_match_fallback(
+    quotes: pd.DataFrame,
+    ts_code: str,
+    events: pd.DataFrame | None = None,
+    event_reconstruction_ok: bool = False,
+    symbol_dir: Path | None = None,
+    cache: AuctionTickCache | None = None,
+    qmt_minute_matches: dict[str, dict[str, object]] | None = None,
+    qmt_tick_matches: dict[str, dict[str, object]] | None = None,
+) -> dict[str, object]:
+    daily = calculate_daily_auction_factors(
+        quotes, ts_code, events, event_reconstruction_ok
+    )
+    if bool(daily["auction_has_match"]):
+        return daily
+
+    if symbol_dir is not None:
+        try:
+            transaction_match = load_open_transaction_match(symbol_dir, cache=cache)
+        except (FileNotFoundError, ValueError) as exc:
+            LOGGER.warning("%s native 09:25 transaction fallback unavailable: %s", ts_code, exc)
+        else:
+            if transaction_match is not None:
+                daily = calculate_daily_auction_factors(
+                    quotes,
+                    ts_code,
+                    events,
+                    event_reconstruction_ok,
+                    match_override=transaction_match,
+                    match_source="transaction_0925",
+                )
+                if bool(daily["auction_has_match"]):
+                    return daily
+
+    trade_date = str(daily["trade_date"])
+    for source, matches in (
+        ("qmt_0930_minute", qmt_minute_matches),
+        ("qmt_tick_0925", qmt_tick_matches),
+    ):
+        if not matches or trade_date not in matches:
+            continue
+        candidate = calculate_daily_auction_factors(
+            quotes,
+            ts_code,
+            events,
+            event_reconstruction_ok,
+            match_override=matches[trade_date],
+            match_source=source,
+        )
+        if bool(candidate["auction_has_match"]):
+            return candidate
+    return daily
+
+
+def calculate_supplemental_auction_fields(
+    quotes: pd.DataFrame, ts_code: str
+) -> dict[str, object]:
+    """Calculate only columns introduced by the report-supplement extension."""
+    if quotes.empty:
+        raise ValueError(f"Empty auction quote frame for {ts_code}")
+    trade_day = pd.Timestamp(quotes["trade_time"].iloc[0]).normalize()
+    nominal_end_time = trade_day + pd.Timedelta(hours=9, minutes=25)
+    match_deadline = trade_day + pd.Timedelta(hours=9, minutes=30)
+    row: dict[str, object] = {column: np.nan for column in SUPPLEMENT_OUTPUT_COLUMNS}
+    row["trade_date"] = trade_day.strftime("%Y-%m-%d")
+    row["auction_stage1_end_time"] = pd.NaT
+    row["auction_stage2_end_time"] = pd.NaT
+    row["previous_close"] = _first_finite(quotes["previous_close"])
+    row["auction_open_price"] = np.nan
+    row["auction_amount"] = np.nan
+    row["auction_matched_volume"] = np.nan
+
+    match_rows = quotes.loc[
+        quotes["trade_time"].ge(nominal_end_time)
+        & quotes["trade_time"].lt(match_deadline)
+        & quotes["open_price"].notna()
+        & quotes["trade_volume"].gt(0)
+        & quotes["trade_amount"].gt(0)
+    ]
+    if not match_rows.empty:
+        match_row = match_rows.iloc[0]
+        row["auction_open_price"] = float(match_row["open_price"])
+        row["auction_amount"] = float(match_row["trade_amount"])
+        row["auction_matched_volume"] = float(match_row["trade_volume"])
+
+    auction = quotes.loc[
+        quotes["trade_time"].ge(trade_day + pd.Timedelta(hours=9, minutes=15))
+        & quotes["trade_time"].lt(nominal_end_time)
+    ].copy()
+    auction["indicative_price"] = _calculate_indicative_price(auction)
+    auction["l3_imbalance"] = _calculate_l3_imbalance(auction)
+    valid_price = auction.dropna(subset=["indicative_price"])
+    stage1 = valid_price.loc[
+        valid_price["trade_time"].lt(trade_day + pd.Timedelta(hours=9, minutes=20))
+    ]
+    stage2 = valid_price.loc[
+        valid_price["trade_time"].ge(trade_day + pd.Timedelta(hours=9, minutes=20))
+    ]
+    _apply_report_supplement_factors(
+        row,
+        valid_price,
+        stage1,
+        stage2,
+        row["previous_close"],
+        nominal_end_time,
+    )
     return row
 
 
@@ -1532,6 +1924,8 @@ def build_benchmark_context(
     target_dates: list[str],
     historical_context: pd.DataFrame | None = None,
     cache: AuctionTickCache | None = None,
+    qmt_minute_matches: dict[str, dict[str, object]] | None = None,
+    qmt_tick_matches: dict[str, dict[str, object]] | None = None,
 ) -> pd.DataFrame:
     paths_by_date = {path.parent.name: path for path in symbol_paths}
     historical_by_date = (
@@ -1561,8 +1955,13 @@ def build_benchmark_context(
                     record["trade_date"],
                 )
             else:
-                benchmark_row = calculate_daily_auction_factors(
-                    quotes, benchmark_ts_code
+                benchmark_row = _calculate_daily_with_match_fallback(
+                    quotes,
+                    benchmark_ts_code,
+                    symbol_dir=path,
+                    cache=cache,
+                    qmt_minute_matches=qmt_minute_matches,
+                    qmt_tick_matches=qmt_tick_matches,
                 )
                 record["benchmark_available_time"] = benchmark_row["available_time"]
                 record["benchmark_auction_has_match"] = benchmark_row[
@@ -1636,6 +2035,37 @@ def _apply_context_supplement_factors(result: pd.DataFrame, index: int) -> None:
             result.at[index, "auction_stage1_limit_down_distance_bps"] = float(
                 (stage1_min - limit_down) / limit_down * 10000.0
             )
+
+
+def apply_supplemental_context(
+    frame: pd.DataFrame, symbol_context: pd.DataFrame | None
+) -> pd.DataFrame:
+    """Apply only daily context needed by the report-supplement columns."""
+    result = frame.copy()
+    context_by_date = (
+        symbol_context.set_index("trade_date", drop=False)
+        if symbol_context is not None and not symbol_context.empty
+        else pd.DataFrame()
+    )
+    context_columns = [
+        "previous_day_volume_shares",
+        "previous_day_high",
+        "previous_7d_close_max",
+        "previous_day_float_market_cap_cny",
+        "auction_limit_up_price",
+        "auction_limit_down_price",
+    ]
+    for index, row in result.iterrows():
+        trade_date = pd.Timestamp(row["trade_date"]).strftime("%Y-%m-%d")
+        if not context_by_date.empty and trade_date in context_by_date.index:
+            context = context_by_date.loc[trade_date]
+            if isinstance(context, pd.DataFrame):
+                context = context.iloc[-1]
+            for column in context_columns:
+                if column in context.index:
+                    result.at[index, column] = context[column]
+        _apply_context_supplement_factors(result, index)
+    return result
 
 
 def apply_external_context(
@@ -1971,34 +2401,42 @@ def apply_historical_ratios(
                 order_notional_history.append(
                     valid_adds["notional"].to_numpy(dtype=float)
                 )
-    return result[OUTPUT_COLUMNS]
+    return apply_report_smoothed_factors(result)[OUTPUT_COLUMNS]
+
+
+def apply_report_smoothed_factors(frame: pd.DataFrame) -> pd.DataFrame:
+    """Add the report's inclusive 20-trading-day means without future data."""
+    result = frame.sort_values("trade_date", kind="mergesort").reset_index(drop=True).copy()
+    for source, target in zip(
+        REPORT_SMOOTHED_SOURCE_COLUMNS,
+        REPORT_SMOOTHED_FACTOR_COLUMNS,
+        strict=True,
+    ):
+        if source not in result:
+            result[target] = np.nan
+            continue
+        values = pd.to_numeric(result[source], errors="coerce")
+        result[target] = values.rolling(20, min_periods=20).mean()
+    return result
 
 
 def merge_symbol_output(
     output_path: Path,
     requested: pd.DataFrame,
     overwrite: bool,
+    replace_existing_dates: set[str] | None = None,
 ) -> pd.DataFrame:
     if output_path.exists():
         existing = pd.read_parquet(output_path)
-        missing_columns = [
-            column for column in OUTPUT_COLUMNS if column not in existing.columns
-        ]
-        if missing_columns and not overwrite:
-            LOGGER.warning(
-                "%s uses an older schema; %s new columns will remain missing on "
-                "existing dates unless those dates are rerun with --overwrite.",
-                output_path,
-                len(missing_columns),
-            )
         existing = existing.reindex(columns=OUTPUT_COLUMNS)
     else:
         existing = pd.DataFrame(columns=OUTPUT_COLUMNS)
 
     requested_dates = set(requested["trade_date"].astype(str))
-    if overwrite:
+    replace_dates = requested_dates if overwrite else (replace_existing_dates or set())
+    if replace_dates:
         existing = existing.loc[
-            ~existing["trade_date"].astype(str).isin(requested_dates)
+            ~existing["trade_date"].astype(str).isin(replace_dates)
         ]
         additions = requested
     else:
@@ -2043,6 +2481,51 @@ def _existing_trade_dates(output_path: Path) -> set[str]:
     return set(pd.to_datetime(existing["trade_date"], errors="coerce").dropna().dt.strftime("%Y-%m-%d"))
 
 
+def _output_uses_current_schema(output_path: Path) -> bool:
+    if not output_path.exists():
+        return True
+    try:
+        columns = set(pq.ParquetFile(output_path).schema_arrow.names)
+    except (OSError, ValueError):
+        return False
+    return set(OUTPUT_COLUMNS).issubset(columns)
+
+
+def _missing_output_columns(output_path: Path) -> set[str]:
+    if not output_path.exists():
+        return set()
+    try:
+        columns = set(pq.ParquetFile(output_path).schema_arrow.names)
+    except (OSError, ValueError):
+        return set(OUTPUT_COLUMNS)
+    return set(OUTPUT_COLUMNS) - columns
+
+
+def merge_supplement_output(
+    output_path: Path,
+    supplement: pd.DataFrame,
+    columns_to_update: list[str],
+) -> pd.DataFrame:
+    existing = pd.read_parquet(output_path).reindex(columns=OUTPUT_COLUMNS)
+    existing["trade_date"] = pd.to_datetime(
+        existing["trade_date"], errors="coerce"
+    ).dt.strftime("%Y-%m-%d")
+    for column in ("auction_stage1_end_time", "auction_stage2_end_time"):
+        existing[column] = pd.to_datetime(existing[column], errors="coerce")
+    updates = supplement.set_index("trade_date")
+    for trade_date, values in updates.iterrows():
+        matching = existing["trade_date"].eq(trade_date)
+        if not matching.any():
+            continue
+        for column in columns_to_update:
+            existing.loc[matching, column] = values[column]
+    for column in ("available_time", "auction_stage1_end_time", "auction_stage2_end_time"):
+        existing[column] = pd.to_datetime(existing[column], errors="coerce")
+    return existing.sort_values("trade_date", kind="mergesort").drop_duplicates(
+        "trade_date", keep="last"
+    ).reset_index(drop=True)[OUTPUT_COLUMNS]
+
+
 def _missing_paths_with_warmup(
     ordered_paths: list[Path], missing_paths: list[Path]
 ) -> tuple[list[Path], list[Path]]:
@@ -2070,6 +2553,214 @@ def _missing_paths_with_warmup(
     return missing_paths, warmup_paths
 
 
+def _missing_dates_with_warmup(
+    ordered_dates: list[str], missing_dates: list[str]
+) -> tuple[list[str], list[str]]:
+    if not missing_dates:
+        return [], []
+    missing_keys = set(missing_dates)
+    indexes = [index for index, date in enumerate(ordered_dates) if date in missing_keys]
+    warmup_keys: set[str] = set()
+    block_start = indexes[0]
+    previous_index = block_start
+    blocks: list[tuple[int, int]] = []
+    for index in indexes[1:]:
+        if index != previous_index + 1:
+            blocks.append((block_start, previous_index))
+            block_start = index
+        previous_index = index
+    blocks.append((block_start, previous_index))
+    for start, _ in blocks:
+        warmup_keys.update(ordered_dates[max(0, start - HISTORICAL_AMOUNT_LOOKBACK_DAYS) : start])
+    return missing_dates, [date for date in ordered_dates if date in warmup_keys]
+
+
+def process_qmt_symbol_series(
+    ts_code: str,
+    tick_path: Path,
+    minute_path: Path,
+    output_root: Path,
+    date_from: str | None,
+    date_to: str | None,
+    overwrite: bool,
+    symbol_context: pd.DataFrame | None = None,
+    benchmark_context: pd.DataFrame | None = None,
+) -> tuple[str, Path, int]:
+    output_path = output_root / f"{ts_code}.parquet"
+    missing_output_columns = _missing_output_columns(output_path)
+    if (
+        missing_output_columns
+        and missing_output_columns.issubset(REPORT_SMOOTHED_FACTOR_COLUMNS)
+        and not overwrite
+    ):
+        existing = pd.read_parquet(output_path)
+        combined = apply_report_smoothed_factors(existing).reindex(columns=OUTPUT_COLUMNS)
+        output_root.mkdir(parents=True, exist_ok=True)
+        combined.to_parquet(output_path, index=False)
+        LOGGER.info(
+            "%s QMT backfilled %s report-smoothed columns from existing output",
+            ts_code,
+            len(missing_output_columns),
+        )
+        return "etf", output_path, len(combined)
+    quotes = load_qmt_quote_frame(tick_path)
+    if quotes.empty:
+        LOGGER.warning("QMT tick has no 09:15-09:25 quotes for %s", ts_code)
+        return "skipped", output_path, 0
+    matches = load_qmt_0930_matches(minute_path)
+    quotes["trade_date"] = quotes["trade_time"].dt.strftime("%Y-%m-%d")
+    grouped = {
+        date: group.drop(columns="trade_date").reset_index(drop=True)
+        for date, group in quotes.groupby("trade_date", sort=True)
+    }
+    # Keep the full source calendar so dates before date_from can warm up
+    # rolling auction histories without being written to the requested output.
+    ordered_dates = sorted(grouped)
+    requested_calendar_dates = [
+        date for date in ordered_dates if _date_in_requested_range(date, date_from, date_to)
+    ]
+    existing_dates = _existing_trade_dates(output_path)
+    missing_dates = [
+        date
+        for date in requested_calendar_dates
+        if overwrite or date not in existing_dates
+    ]
+    if not missing_dates:
+        LOGGER.info(
+            "%s QMT skipped: requested=%s existing=%s missing=0",
+            ts_code,
+            len(ordered_dates),
+            len(existing_dates),
+        )
+        return "skipped", output_path, 0
+    requested_dates, warmup_dates = _missing_dates_with_warmup(
+        ordered_dates, missing_dates
+    )
+    calculation_dates = warmup_dates + requested_dates
+    records: list[dict[str, object]] = []
+    event_frames: dict[str, pd.DataFrame] = {}
+    for date in calculation_dates:
+        daily = calculate_daily_auction_factors(
+            grouped[date],
+            ts_code,
+            _empty_event_frame(),
+            False,
+            match_override=matches.get(date),
+            match_source="qmt_0930_minute" if date in matches else None,
+        )
+        records.append(daily)
+        event_frames[date] = _empty_event_frame()
+    daily_amount_history = load_daily_amount_history(minute_path)
+    factor_frame = apply_historical_ratios(
+        pd.DataFrame(records),
+        event_frames=event_frames,
+        daily_amount_history=daily_amount_history,
+    )
+    factor_frame = apply_external_context(
+        factor_frame,
+        symbol_context=symbol_context,
+        benchmark_context=benchmark_context,
+    )
+    requested_frame = factor_frame.loc[
+        factor_frame["trade_date"].isin(set(requested_dates))
+    ].copy()
+    combined = merge_symbol_output(
+        output_path,
+        requested_frame,
+        overwrite,
+        replace_existing_dates=set(requested_dates) if overwrite else None,
+    )
+    output_root.mkdir(parents=True, exist_ok=True)
+    combined.to_parquet(output_path, index=False)
+    LOGGER.info(
+        "%s QMT dates: requested=%s existing=%s missing=%s warmup=%s matches=%s",
+        ts_code,
+        len(ordered_dates),
+        len(existing_dates),
+        len(requested_dates),
+        len(warmup_dates),
+        sum(date in matches for date in requested_dates),
+    )
+    return "etf", output_path, len(requested_frame)
+
+
+def _qmt_date_bounds(paths: list[Path]) -> tuple[pd.Timestamp, pd.Timestamp]:
+    minimum: pd.Timestamp | None = None
+    maximum: pd.Timestamp | None = None
+    for path in paths:
+        metadata = pq.ParquetFile(path).metadata
+        for row_group_index in range(metadata.num_row_groups):
+            row_group = metadata.row_group(row_group_index)
+            for column_index in range(row_group.num_columns):
+                column = row_group.column(column_index)
+                if column.path_in_schema != "trade_date" or column.statistics is None:
+                    continue
+                start = pd.Timestamp(column.statistics.min).normalize()
+                end = pd.Timestamp(column.statistics.max).normalize()
+                minimum = start if minimum is None or start < minimum else minimum
+                maximum = end if maximum is None or end > maximum else maximum
+    if minimum is None or maximum is None:
+        raise ValueError("QMT tick files have no trade_date statistics")
+    return minimum, maximum
+
+
+def build_qmt_benchmark_context(
+    benchmark_ts_code: str,
+    tick_path: Path | None,
+    minute_path: Path | None,
+    target_dates: list[str],
+    historical_context: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    if tick_path is None or minute_path is None:
+        return build_benchmark_context(benchmark_ts_code, [], target_dates, historical_context)
+    quotes = load_qmt_quote_frame(tick_path)
+    matches = load_qmt_0930_matches(minute_path)
+    quotes["trade_date"] = quotes["trade_time"].dt.strftime("%Y-%m-%d")
+    grouped = {
+        date: group.drop(columns="trade_date").reset_index(drop=True)
+        for date, group in quotes.groupby("trade_date", sort=True)
+    }
+    historical_by_date = (
+        historical_context.set_index("trade_date", drop=False)
+        if historical_context is not None and not historical_context.empty
+        else pd.DataFrame()
+    )
+    records: list[dict[str, object]] = []
+    for date in sorted(set(target_dates)):
+        record = {
+            "trade_date": date,
+            "benchmark_ts_code": benchmark_ts_code,
+            "benchmark_available_time": pd.NaT,
+            "benchmark_auction_has_match": False,
+            "market_return_from_prev_close": np.nan,
+            "_benchmark_auction_return_stage2": np.nan,
+            "market_above_ma20_prevclose": np.nan,
+            "market_momentum_2d_prevclose": np.nan,
+        }
+        if date in grouped:
+            row = calculate_daily_auction_factors(
+                grouped[date],
+                benchmark_ts_code,
+                _empty_event_frame(),
+                False,
+                match_override=matches.get(date),
+                match_source="qmt_0930_minute" if date in matches else None,
+            )
+            record["benchmark_available_time"] = row["available_time"]
+            record["benchmark_auction_has_match"] = row["auction_has_match"]
+            if bool(row["auction_has_match"]):
+                record["market_return_from_prev_close"] = row["auction_overnight_return"]
+                record["_benchmark_auction_return_stage2"] = row["auction_return_stage2"]
+        if not historical_by_date.empty and date in historical_by_date.index:
+            historical = historical_by_date.loc[date]
+            if isinstance(historical, pd.DataFrame):
+                historical = historical.iloc[-1]
+            record["market_above_ma20_prevclose"] = historical["_market_above_ma20"]
+            record["market_momentum_2d_prevclose"] = historical["_prev_2d_return"]
+        records.append(record)
+    return pd.DataFrame(records)
+
+
 def process_symbol_series(
     asset_type: str,
     ts_code: str,
@@ -2084,6 +2775,10 @@ def process_symbol_series(
     session_path_output_root: Path | None = None,
     auction_cache_root: Path | None = DEFAULT_AUCTION_CACHE_ROOT,
     refresh_auction_cache: bool = False,
+    refresh_existing_factors: bool = False,
+    use_qmt_match_fallback: bool = False,
+    qmt_tick_path: Path | None = None,
+    qmt_minute_path: Path | None = None,
 ) -> tuple[str, Path, int]:
     ordered_paths = sorted(symbol_paths, key=lambda path: path.parent.name)
     all_requested_paths = [
@@ -2093,8 +2788,91 @@ def process_symbol_series(
     ]
     output_path = output_root / f"{ts_code}.parquet"
     existing_dates = _existing_trade_dates(output_path)
-    if overwrite:
+    output_uses_current_schema = _output_uses_current_schema(output_path)
+    missing_output_columns = _missing_output_columns(output_path)
+    smoothed_columns = [
+        column
+        for column in REPORT_SMOOTHED_FACTOR_COLUMNS
+        if column in missing_output_columns
+    ]
+    derived_only = bool(smoothed_columns) and missing_output_columns.issubset(
+        REPORT_SMOOTHED_FACTOR_COLUMNS
+    )
+    if derived_only and not (overwrite or refresh_existing_factors):
+        existing = pd.read_parquet(output_path)
+        combined = apply_report_smoothed_factors(existing).reindex(columns=OUTPUT_COLUMNS)
+        output_root.mkdir(parents=True, exist_ok=True)
+        combined.to_parquet(output_path, index=False)
+        LOGGER.info(
+            "%s backfilled %s report-smoothed columns from %s existing dates",
+            ts_code,
+            len(smoothed_columns),
+            len(combined),
+        )
+        return (asset_type, output_path, len(combined))
+    supplement_columns = [
+        column for column in SUPPLEMENT_OUTPUT_COLUMNS if column in missing_output_columns
+    ]
+    supplement_only = bool(supplement_columns) and missing_output_columns.issubset(
+        set(SUPPLEMENT_OUTPUT_COLUMNS) | set(REPORT_SMOOTHED_FACTOR_COLUMNS)
+    )
+    if supplement_only and not (overwrite or refresh_existing_factors):
+        if not all_requested_paths:
+            return ("skipped", output_path, 0)
+        LOGGER.info(
+            "%s backfilling %s supplement columns for %s dates",
+            ts_code,
+            len(supplement_columns),
+            len(all_requested_paths),
+        )
+        cache = AuctionTickCache(auction_cache_root, refresh=refresh_auction_cache)
+        records: list[dict[str, object]] = []
+        for path in all_requested_paths:
+            quotes = load_quote_frame(path, cache=cache)
+            if quotes.empty:
+                LOGGER.warning(
+                    "Empty auction quote frame for %s on %s; skipping date",
+                    ts_code,
+                    path.parent.name,
+                )
+                continue
+            records.append(calculate_supplemental_auction_fields(quotes, ts_code))
+        if records:
+            supplement = apply_supplemental_context(
+                pd.DataFrame(records), symbol_context
+            )
+            combined = merge_supplement_output(
+                output_path,
+                supplement,
+                supplement_columns,
+            )
+            if smoothed_columns:
+                combined = apply_report_smoothed_factors(combined).reindex(
+                    columns=OUTPUT_COLUMNS
+                )
+            output_root.mkdir(parents=True, exist_ok=True)
+            combined.to_parquet(output_path, index=False)
+        LOGGER.info(
+            "%s cache: hits=%s rebuilds=%s",
+            ts_code,
+            cache.stats.hits,
+            cache.stats.rebuilds,
+        )
+        return (asset_type, output_path, len(records))
+    replace_existing_dates: set[str] = set()
+    if overwrite or refresh_existing_factors:
         missing_paths = all_requested_paths
+        replace_existing_dates = {
+            pd.Timestamp(path.parent.name).strftime("%Y-%m-%d")
+            for path in all_requested_paths
+        }
+    elif not output_uses_current_schema:
+        missing_paths = all_requested_paths
+        replace_existing_dates = {
+            pd.Timestamp(path.parent.name).strftime("%Y-%m-%d")
+            for path in all_requested_paths
+        }
+        LOGGER.info("%s backfilling current output schema for %s dates", ts_code, len(missing_paths))
     else:
         missing_paths = [
             path
@@ -2122,6 +2900,12 @@ def process_symbol_series(
         len(warmup_paths),
     )
     cache = AuctionTickCache(auction_cache_root, refresh=refresh_auction_cache)
+    qmt_minute_matches: dict[str, dict[str, object]] = {}
+    qmt_tick_matches: dict[str, dict[str, object]] = {}
+    if use_qmt_match_fallback and asset_type == "etf":
+        qmt_minute_matches, qmt_tick_matches = _load_qmt_match_fallbacks(
+            ts_code, qmt_tick_path, qmt_minute_path
+        )
 
     def calculate_path_record(
         path: Path,
@@ -2137,7 +2921,16 @@ def process_symbol_series(
         events, event_ok = load_auction_event_frame(
             path, ts_code, expected_trade_date=path.parent.name, cache=cache
         )
-        daily = calculate_daily_auction_factors(quotes, ts_code, events, event_ok)
+        daily = _calculate_daily_with_match_fallback(
+            quotes,
+            ts_code,
+            events,
+            event_ok,
+            symbol_dir=path,
+            cache=cache,
+            qmt_minute_matches=qmt_minute_matches,
+            qmt_tick_matches=qmt_tick_matches,
+        )
         return daily, events
 
     warmup_records: list[tuple[dict[str, object], pd.DataFrame]] = []
@@ -2179,7 +2972,12 @@ def process_symbol_series(
         requested_frame = pd.DataFrame(columns=OUTPUT_COLUMNS)
 
     if not requested_frame.empty or output_path.exists():
-        combined = merge_symbol_output(output_path, requested_frame, overwrite)
+        combined = merge_symbol_output(
+            output_path,
+            requested_frame,
+            overwrite,
+            replace_existing_dates=replace_existing_dates,
+        )
         output_root.mkdir(parents=True, exist_ok=True)
         combined.to_parquet(output_path, index=False)
     if session_path_output_root is not None:
@@ -2215,6 +3013,149 @@ def process_symbol_series(
     return (asset_type, output_path, len(requested_frame))
 
 
+def run_qmt_auction_generation(
+    args: argparse.Namespace,
+    requested_codes: set[str] | None,
+    date_from: str | None,
+    date_to: str | None,
+) -> int:
+    if args.asset_type not in {"etf", "both"}:
+        raise ValueError("--use-qmt-auction-source supports ETF symbols only")
+    tick_index = build_universe_index(args.qmt_tick_root)
+    minute_index = build_universe_index(args.qmt_minute_root)
+    existing_codes = existing_output_codes(args.etf_output_root)
+    selected_codes = sorted(set(tick_index) & set(minute_index) & existing_codes)
+    if requested_codes is not None:
+        selected_codes = [code for code in selected_codes if code in requested_codes]
+        missing = sorted(requested_codes - set(selected_codes))
+        if missing:
+            raise FileNotFoundError(
+                "Requested QMT ETF symbols need existing auction, tick, and minute files: "
+                + ", ".join(missing[:20])
+            )
+    if args.limit is not None:
+        selected_codes = selected_codes[: args.limit]
+    if not selected_codes:
+        LOGGER.warning("No QMT ETF symbols matched the existing auction universe.")
+        return 0
+    benchmark_ts_code = args.benchmark_ts_code.strip().upper()
+    benchmark_code = numeric_code(benchmark_ts_code)
+    if benchmark_code is None:
+        raise ValueError(f"Invalid --benchmark-ts-code: {args.benchmark_ts_code}")
+    benchmark_tick_path = (
+        args.qmt_tick_root / f"{tick_index[benchmark_code]}.parquet"
+        if benchmark_code in tick_index
+        else None
+    )
+    benchmark_minute_path = (
+        args.qmt_minute_root / f"{minute_index[benchmark_code]}.parquet"
+        if benchmark_code in minute_index
+        else None
+    )
+    task_tick_paths = [
+        args.qmt_tick_root / f"{tick_index[code]}.parquet" for code in selected_codes
+    ]
+    if benchmark_tick_path is not None:
+        task_tick_paths.append(benchmark_tick_path)
+    min_date, max_date = _qmt_date_bounds(task_tick_paths)
+    if date_from is not None:
+        min_date = max(min_date, pd.Timestamp(date_from))
+    if date_to is not None:
+        max_date = min(max_date, pd.Timestamp(date_to))
+    if min_date > max_date:
+        LOGGER.warning("No QMT dates remain after the requested date range.")
+        return 0
+    target_dates = [
+        date.strftime("%Y-%m-%d") for date in pd.bdate_range(min_date, max_date)
+    ]
+    requested_symbols = {tick_index[code] for code in selected_codes}
+    historical_context = build_historical_context(
+        args.etf_daily_path,
+        target_dates,
+        requested_symbols | {benchmark_ts_code},
+    )
+    benchmark_context = build_qmt_benchmark_context(
+        benchmark_ts_code,
+        benchmark_tick_path,
+        benchmark_minute_path,
+        target_dates,
+        historical_context.get(benchmark_ts_code),
+    )
+    tasks = [
+        (
+            tick_index[code],
+            args.qmt_tick_root / f"{tick_index[code]}.parquet",
+            args.qmt_minute_root / f"{minute_index[code]}.parquet",
+        )
+        for code in selected_codes
+    ]
+    LOGGER.info(
+        "Generating QMT auction factors for %s ETF symbols, %s to %s, output=%s",
+        len(tasks),
+        min_date.strftime("%Y-%m-%d"),
+        max_date.strftime("%Y-%m-%d"),
+        args.qmt_output_root,
+    )
+    failures: list[tuple[str, str]] = []
+    written = 0
+    worker_count = max(1, args.workers)
+    if worker_count == 1:
+        for symbol, tick_path, minute_path in tasks:
+            try:
+                _, output_path, row_count = process_qmt_symbol_series(
+                    symbol,
+                    tick_path,
+                    minute_path,
+                    args.qmt_output_root,
+                    date_from,
+                    date_to,
+                    args.overwrite,
+                    historical_context.get(symbol),
+                    benchmark_context,
+                )
+                written += int(row_count > 0)
+                LOGGER.info("Wrote %s QMT rows to %s", row_count, output_path)
+            except Exception as exc:  # noqa: BLE001
+                failures.append((symbol, str(exc)))
+                LOGGER.exception("Failed to process QMT auction factors for %s", symbol)
+    else:
+        with ProcessPoolExecutor(max_workers=worker_count) as executor:
+            futures = {
+                executor.submit(
+                    process_qmt_symbol_series,
+                    symbol,
+                    tick_path,
+                    minute_path,
+                    args.qmt_output_root,
+                    date_from,
+                    date_to,
+                    args.overwrite,
+                    historical_context.get(symbol),
+                    benchmark_context,
+                ): symbol
+                for symbol, tick_path, minute_path in tasks
+            }
+            for future in as_completed(futures):
+                symbol = futures[future]
+                try:
+                    _, output_path, row_count = future.result()
+                    written += int(row_count > 0)
+                    LOGGER.info("Wrote %s QMT rows to %s", row_count, output_path)
+                except Exception as exc:  # noqa: BLE001
+                    failures.append((symbol, str(exc)))
+                    LOGGER.exception("Failed to process QMT auction factors for %s", symbol)
+    LOGGER.info(
+        "Completed QMT auction factors: %s symbol files written, %s failures",
+        written,
+        len(failures),
+    )
+    if failures:
+        for symbol, error in failures[:20]:
+            LOGGER.error("%s: %s", symbol, error)
+        return 1
+    return 0
+
+
 def main() -> int:
     args = parse_args()
     configure_logging()
@@ -2226,12 +3167,22 @@ def main() -> int:
         raise ValueError("--limit must be positive")
 
     requested_codes = load_requested_codes(args.symbols, args.symbols_file)
+    if args.use_qmt_auction_source:
+        return run_qmt_auction_generation(args, requested_codes, date_from, date_to)
     assets = build_asset_universe(
         args.asset_type,
         args.stock_minute_root,
         args.etf_minute_root,
         requested_codes,
     )
+    if args.existing_output_only:
+        existing_by_kind = {
+            "stock": existing_output_codes(args.stock_output_root),
+            "etf": existing_output_codes(args.etf_output_root),
+        }
+        assets = [
+            asset for asset in assets if asset[1] in existing_by_kind[asset[0]]
+        ]
     if args.limit is not None:
         assets = assets[: args.limit]
     if not assets:
@@ -2338,15 +3289,23 @@ def main() -> int:
     ]
     target_dates: set[str] = set()
     pending_symbols: dict[str, set[str]] = {"stock": set(), "etf": set()}
+    requires_full_context_by_kind = {"stock": False, "etf": False}
     for kind, _, symbol, paths in tasks:
         output_path = output_roots[kind] / f"{symbol}.parquet"
         existing_dates = _existing_trade_dates(output_path)
+        output_uses_current_schema = _output_uses_current_schema(output_path)
+        missing_output_columns = _missing_output_columns(output_path)
+        supplement_only = bool(missing_output_columns) and missing_output_columns.issubset(
+            set(SUPPLEMENT_OUTPUT_COLUMNS) | set(REPORT_SMOOTHED_FACTOR_COLUMNS)
+        )
         pending = [
             path
             for path in paths
             if _date_in_requested_range(path.parent.name, date_from, date_to)
             and (
                 args.overwrite
+                or args.refresh_existing_factors
+                or not output_uses_current_schema
                 or pd.Timestamp(path.parent.name).strftime("%Y-%m-%d")
                 not in existing_dates
             )
@@ -2354,6 +3313,11 @@ def main() -> int:
         if pending:
             pending_symbols[kind].add(symbol)
             target_dates.update(path.parent.name for path in pending)
+            requires_full_context_by_kind[kind] |= (
+                args.overwrite
+                or args.refresh_existing_factors
+                or not supplement_only
+            )
     target_dates = sorted(target_dates)
     requested_by_kind = {
         kind: pending_symbols[kind]
@@ -2373,6 +3337,20 @@ def main() -> int:
             requested_by_kind["etf"] | {benchmark_ts_code},
         ),
     }
+    need_etf_qmt_fallback = (
+        args.use_qmt_match_fallback and requires_full_context_by_kind["etf"]
+    )
+    qmt_tick_index: dict[str, str] = {}
+    qmt_minute_index: dict[str, str] = {}
+    if need_etf_qmt_fallback:
+        if args.qmt_tick_root.exists():
+            qmt_tick_index = build_universe_index(args.qmt_tick_root)
+        else:
+            LOGGER.warning("QMT tick root is unavailable: %s", args.qmt_tick_root)
+        if args.qmt_minute_root.exists():
+            qmt_minute_index = build_universe_index(args.qmt_minute_root)
+        else:
+            LOGGER.warning("QMT minute root is unavailable: %s", args.qmt_minute_root)
     benchmark_historical = historical_context_by_kind["etf"].get(
         benchmark_ts_code
     )
@@ -2380,15 +3358,48 @@ def main() -> int:
         benchmark_historical = historical_context_by_kind["stock"].get(
             benchmark_ts_code
         )
-    benchmark_context = build_benchmark_context(
-        benchmark_ts_code,
-        grouped_paths.get(benchmark_numeric_code, []),
-        target_dates,
-        benchmark_historical,
-        cache=AuctionTickCache(
-            args.auction_cache_root, refresh=args.refresh_auction_cache
-        ),
-    )
+    benchmark_context_by_kind = {"stock": pd.DataFrame(), "etf": pd.DataFrame()}
+    if requires_full_context_by_kind["stock"]:
+        benchmark_context_by_kind["stock"] = build_benchmark_context(
+            benchmark_ts_code,
+            grouped_paths.get(benchmark_numeric_code, []),
+            target_dates,
+            benchmark_historical,
+            cache=AuctionTickCache(
+                args.auction_cache_root, refresh=args.refresh_auction_cache
+            ),
+        )
+    if requires_full_context_by_kind["etf"]:
+        benchmark_qmt_minute_matches: dict[str, dict[str, object]] = {}
+        benchmark_qmt_tick_matches: dict[str, dict[str, object]] = {}
+        if need_etf_qmt_fallback:
+            benchmark_tick_path = (
+                args.qmt_tick_root / f"{qmt_tick_index[benchmark_numeric_code]}.parquet"
+                if benchmark_numeric_code in qmt_tick_index
+                else None
+            )
+            benchmark_minute_path = (
+                args.qmt_minute_root
+                / f"{qmt_minute_index[benchmark_numeric_code]}.parquet"
+                if benchmark_numeric_code in qmt_minute_index
+                else None
+            )
+            benchmark_qmt_minute_matches, benchmark_qmt_tick_matches = (
+                _load_qmt_match_fallbacks(
+                    benchmark_ts_code, benchmark_tick_path, benchmark_minute_path
+                )
+            )
+        benchmark_context_by_kind["etf"] = build_benchmark_context(
+            benchmark_ts_code,
+            grouped_paths.get(benchmark_numeric_code, []),
+            target_dates,
+            benchmark_historical,
+            cache=AuctionTickCache(
+                args.auction_cache_root, refresh=args.refresh_auction_cache
+            ),
+            qmt_minute_matches=benchmark_qmt_minute_matches,
+            qmt_tick_matches=benchmark_qmt_tick_matches,
+        )
     LOGGER.info(
         "Processing %s symbols from %s matched stock/ETF universe entries",
         len(tasks),
@@ -2399,7 +3410,7 @@ def main() -> int:
     written = 0
     worker_count = max(1, args.workers)
     if worker_count == 1:
-        for kind, _, symbol, paths in tasks:
+        for kind, code, symbol, paths in tasks:
             try:
                 _, output_path, row_count = process_symbol_series(
                     kind,
@@ -2411,12 +3422,24 @@ def main() -> int:
                     date_to,
                     args.overwrite,
                     historical_context_by_kind[kind].get(symbol),
-                    benchmark_context,
+                    benchmark_context_by_kind[kind],
                     session_path_output_roots[kind]
                     if args.write_session_path_factors
                     else None,
                     args.auction_cache_root,
                     args.refresh_auction_cache,
+                    args.refresh_existing_factors,
+                    args.use_qmt_match_fallback,
+                    (
+                        args.qmt_tick_root / f"{qmt_tick_index[code]}.parquet"
+                        if kind == "etf" and code in qmt_tick_index
+                        else None
+                    ),
+                    (
+                        args.qmt_minute_root / f"{qmt_minute_index[code]}.parquet"
+                        if kind == "etf" and code in qmt_minute_index
+                        else None
+                    ),
                 )
                 written += int(row_count > 0)
                 LOGGER.info("Wrote %s requested rows to %s", row_count, output_path)
@@ -2437,14 +3460,26 @@ def main() -> int:
                     date_to,
                     args.overwrite,
                     historical_context_by_kind[kind].get(symbol),
-                    benchmark_context,
+                    benchmark_context_by_kind[kind],
                     session_path_output_roots[kind]
                     if args.write_session_path_factors
                     else None,
                     args.auction_cache_root,
                     args.refresh_auction_cache,
+                    args.refresh_existing_factors,
+                    args.use_qmt_match_fallback,
+                    (
+                        args.qmt_tick_root / f"{qmt_tick_index[code]}.parquet"
+                        if kind == "etf" and code in qmt_tick_index
+                        else None
+                    ),
+                    (
+                        args.qmt_minute_root / f"{qmt_minute_index[code]}.parquet"
+                        if kind == "etf" and code in qmt_minute_index
+                        else None
+                    ),
                 ): symbol
-                for kind, _, symbol, paths in tasks
+                for kind, code, symbol, paths in tasks
             }
             for future in as_completed(futures):
                 symbol = futures[future]

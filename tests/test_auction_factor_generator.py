@@ -11,23 +11,36 @@ from scripts.generate_auction_factors import (
     CONTEXT_SUPPLEMENT_FACTOR_COLUMNS,
     EVENT_FACTOR_COLUMNS,
     OUTPUT_COLUMNS,
+    REPORT_SMOOTHED_FACTOR_COLUMNS,
+    REPORT_SMOOTHED_SOURCE_COLUMNS,
     REPORT_SUPPLEMENT_FACTOR_COLUMNS,
+    SUPPLEMENT_OUTPUT_COLUMNS,
+    _calculate_daily_with_match_fallback,
     _finalize_event_frame,
     _stage2_slope,
     apply_historical_ratios,
     apply_external_context,
+    apply_report_smoothed_factors,
     build_asset_universe,
     build_benchmark_context,
     build_historical_context,
     build_session_path_factor_frame,
     calculate_daily_auction_factors,
+    calculate_supplemental_auction_fields,
+    existing_output_codes,
     group_symbol_paths,
     load_auction_event_frame,
     load_daily_amount_history,
+    load_open_transaction_match,
+    load_qmt_0925_tick_matches,
+    load_qmt_0930_matches,
+    load_qmt_quote_frame,
     load_quote_frame,
     merge_symbol_output,
+    process_qmt_symbol_series,
     process_symbol_series,
     process_session_path_only,
+    _missing_dates_with_warmup,
 )
 
 
@@ -106,6 +119,40 @@ def _auction_quotes(
     return pd.DataFrame(rows)
 
 
+def _write_qmt_tick(path: Path, timestamps: list[str]) -> None:
+    index = pd.MultiIndex.from_arrays(
+        [pd.to_datetime(timestamps).normalize(), pd.to_datetime(timestamps)],
+        names=["trade_date", "trade_time"],
+    )
+    frame = pd.DataFrame(index=index)
+    frame["last_price"] = [0.0, 0.0, 0.0, 10.05][: len(frame)]
+    frame["previous_close"] = 10.0
+    for level in range(1, 4):
+        frame[f"ask_price{level}"] = 10.01 + level * 0.01
+        frame[f"bid_price{level}"] = 10.00 - (level - 1) * 0.01
+        frame[f"ask_vol{level}"] = 100.0
+        frame[f"bid_vol{level}"] = 120.0
+    frame.to_parquet(path)
+
+
+def _write_qmt_minutes(path: Path, rows: list[tuple[str, float, float, float]]) -> None:
+    timestamps = pd.to_datetime([row[0] for row in rows])
+    index = pd.MultiIndex.from_arrays(
+        [timestamps.normalize(), timestamps], names=["trade_date", "trade_time"]
+    )
+    pd.DataFrame(
+        {
+            "open": [row[1] for row in rows],
+            "high": [row[1] for row in rows],
+            "low": [row[1] for row in rows],
+            "close": [row[1] for row in rows],
+            "vol": [row[2] for row in rows],
+            "amount": [row[3] for row in rows],
+        },
+        index=index,
+    ).to_parquet(path)
+
+
 def _event(
     timestamp: str,
     event_type: str,
@@ -158,6 +205,422 @@ def _auction_events() -> pd.DataFrame:
             _event("2026-03-31 09:25:00", "A", "B", 6, 10.0, 999),
         ]
     )
+
+
+def test_qmt_tick_mapping_and_auction_window(tmp_path: Path) -> None:
+    tick_path = tmp_path / "000001.SZ.parquet"
+    _write_qmt_tick(
+        tick_path,
+        [
+            "2026-03-31 09:14:59",
+            "2026-03-31 09:15:00",
+            "2026-03-31 09:24:59",
+            "2026-03-31 09:25:00",
+        ],
+    )
+
+    result = load_qmt_quote_frame(tick_path)
+
+    assert result["trade_time"].dt.strftime("%H:%M:%S").tolist() == [
+        "09:15:00",
+        "09:24:59",
+    ]
+    assert result.loc[0, "previous_close"] == 10.0
+    assert result.loc[0, "ask_price1"] == 10.02
+    assert result.loc[0, "ask_qty1"] == 100.0
+    assert result.loc[0, "bid_price1"] == 10.0
+    assert result.loc[0, "bid_qty1"] == 120.0
+    assert result["open_price"].isna().all()
+
+
+def test_open_transaction_match_excludes_cancellations_and_selects_dominant_price() -> None:
+    class StubCache:
+        def load_open_transactions(self, _: Path) -> pd.DataFrame:
+            return pd.DataFrame(
+                {
+                    "trade_time": pd.to_datetime(
+                        [
+                            "2026-03-31 09:25:00",
+                            "2026-03-31 09:25:00",
+                            "2026-03-31 09:25:00",
+                        ]
+                    ),
+                    "trade_code": ["0", "C", "nan"],
+                    "bs_flag": ["B", "S", "S"],
+                    "price": [10.05, 10.05, 10.05],
+                    "quantity": [100.0, 999.0, 200.0],
+                }
+            )
+
+    result = load_open_transaction_match(Path("ignored"), cache=StubCache())
+
+    assert result == {
+        "trade_time": pd.Timestamp("2026-03-31 09:25:00"),
+        "open_price": 10.05,
+        "trade_volume": 300.0,
+        "trade_amount": 3015.0,
+    }
+
+
+def test_qmt_0930_match_requires_positive_bar_and_backfills_time(tmp_path: Path) -> None:
+    minute_path = tmp_path / "000001.SZ.parquet"
+    _write_qmt_minutes(
+        minute_path,
+        [
+            ("2026-03-31 09:30:00", 10.05, 1_000.0, 10_050.0),
+            ("2026-04-01 09:30:00", 0.0, 1_000.0, 10_050.0),
+            ("2026-04-02 09:30:00", 10.05, 0.0, 10_050.0),
+            ("2026-04-03 09:30:00", 10.05, 1_000.0, 0.0),
+            ("2026-04-04 09:31:00", 10.05, 1_000.0, 10_050.0),
+        ],
+    )
+
+    result = load_qmt_0930_matches(minute_path)
+
+    assert list(result) == ["2026-03-31"]
+    assert result["2026-03-31"] == {
+        "trade_time": pd.Timestamp("2026-03-31 09:25:00"),
+        "open_price": 10.05,
+        "trade_volume": 1_000.0,
+        "trade_amount": 10_050.0,
+    }
+
+
+def test_qmt_0925_tick_match_uses_last_valid_snapshot_in_stored_share_units(
+    tmp_path: Path,
+) -> None:
+    timestamps = pd.to_datetime(
+        [
+            "2026-03-31 09:24:59",
+            "2026-03-31 09:25:00",
+            "2026-03-31 09:25:30",
+            "2026-03-31 09:25:59",
+            "2026-03-31 09:26:00",
+            "2026-04-01 09:25:30",
+        ]
+    )
+    index = pd.MultiIndex.from_arrays(
+        [timestamps.normalize(), timestamps], names=["trade_date", "trade_time"]
+    )
+    tick_path = tmp_path / "000001.SZ.parquet"
+    pd.DataFrame(
+        {
+            "last_price": [10.0, 10.01, 10.02, 10.03, 10.04, 0.0],
+            "volume": [0.0, 100.0, 110.0, 120.0, 130.0, 0.0],
+            "amount": [0.0, 1001.0, 1102.0, 1203.0, 1304.0, 0.0],
+        },
+        index=index,
+    ).to_parquet(tick_path)
+
+    result = load_qmt_0925_tick_matches(tick_path)
+
+    assert set(result) == {"2026-03-31"}
+    assert result["2026-03-31"] == {
+        "trade_time": pd.Timestamp("2026-03-31 09:25:00"),
+        "open_price": 10.03,
+        "trade_volume": 120.0,
+        "trade_amount": 1203.0,
+    }
+
+
+def test_match_fallback_prefers_qmt_minute_then_tick() -> None:
+    quotes = _auction_quotes(include_match=False)
+    minute_match = {
+        "2026-03-31": {
+            "trade_time": pd.Timestamp("2026-03-31 09:25"),
+            "open_price": 10.05,
+            "trade_volume": 1000.0,
+            "trade_amount": 10050.0,
+        }
+    }
+    tick_match = {
+        "2026-03-31": {
+            "trade_time": pd.Timestamp("2026-03-31 09:25"),
+            "open_price": 10.06,
+            "trade_volume": 1200.0,
+            "trade_amount": 12072.0,
+        }
+    }
+
+    minute_result = _calculate_daily_with_match_fallback(
+        quotes,
+        "000001.SZ",
+        qmt_minute_matches=minute_match,
+        qmt_tick_matches=tick_match,
+    )
+    tick_result = _calculate_daily_with_match_fallback(
+        quotes,
+        "000001.SZ",
+        qmt_minute_matches={"2026-03-31": {"open_price": 0.0}},
+        qmt_tick_matches=tick_match,
+    )
+
+    assert minute_result["auction_match_source"] == "qmt_0930_minute"
+    assert minute_result["auction_open_price"] == 10.05
+    assert tick_result["auction_match_source"] == "qmt_tick_0925"
+    assert tick_result["auction_open_price"] == 10.06
+
+
+def test_match_fallback_keeps_native_transaction_before_qmt(monkeypatch) -> None:
+    native_match = {
+        "trade_time": pd.Timestamp("2026-03-31 09:25"),
+        "open_price": 10.04,
+        "trade_volume": 900.0,
+        "trade_amount": 9036.0,
+    }
+    monkeypatch.setattr(
+        "scripts.generate_auction_factors.load_open_transaction_match",
+        lambda *args, **kwargs: native_match,
+    )
+
+    result = _calculate_daily_with_match_fallback(
+        _auction_quotes(include_match=False),
+        "000001.SZ",
+        symbol_dir=Path("ignored"),
+        qmt_minute_matches={
+            "2026-03-31": {
+                "trade_time": pd.Timestamp("2026-03-31 09:25"),
+                "open_price": 10.05,
+                "trade_volume": 1000.0,
+                "trade_amount": 10050.0,
+            }
+        },
+    )
+
+    assert result["auction_match_source"] == "transaction_0925"
+    assert result["auction_open_price"] == 10.04
+
+
+def test_match_fallback_keeps_native_quote_before_other_sources(monkeypatch) -> None:
+    def fail_transaction_loader(*args, **kwargs):
+        raise AssertionError("native quote match must stop fallback loading")
+
+    monkeypatch.setattr(
+        "scripts.generate_auction_factors.load_open_transaction_match",
+        fail_transaction_loader,
+    )
+    result = _calculate_daily_with_match_fallback(
+        _auction_quotes(),
+        "000001.SZ",
+        symbol_dir=Path("ignored"),
+        qmt_minute_matches={
+            "2026-03-31": {
+                "trade_time": pd.Timestamp("2026-03-31 09:25"),
+                "open_price": 10.06,
+                "trade_volume": 1200.0,
+                "trade_amount": 12072.0,
+            }
+        },
+    )
+
+    assert result["auction_match_source"] == "quote"
+    assert result["auction_open_price"] == 10.05
+
+
+def test_benchmark_uses_qmt_match_fallback(monkeypatch, tmp_path: Path) -> None:
+    benchmark_path = tmp_path / "20260331" / "510300.SH"
+    benchmark_path.mkdir(parents=True)
+    monkeypatch.setattr(
+        "scripts.generate_auction_factors.load_quote_frame",
+        lambda *args, **kwargs: _auction_quotes(include_match=False),
+    )
+
+    result = build_benchmark_context(
+        "510300.SH",
+        [benchmark_path],
+        ["2026-03-31"],
+        qmt_minute_matches={
+            "2026-03-31": {
+                "trade_time": pd.Timestamp("2026-03-31 09:25"),
+                "open_price": 10.05,
+                "trade_volume": 1000.0,
+                "trade_amount": 10050.0,
+            }
+        },
+    ).iloc[0]
+
+    assert bool(result["benchmark_auction_has_match"])
+    assert result["benchmark_available_time"] == pd.Timestamp("2026-03-31 09:25")
+    assert result["market_return_from_prev_close"] == pytest.approx(0.005)
+
+
+def test_process_etf_uses_qmt_minute_fallback_once(monkeypatch, tmp_path: Path) -> None:
+    raw_dir = tmp_path / "2026" / "202603" / "20260331" / "000001.SZ"
+    raw_dir.mkdir(parents=True)
+    qmt_minute_path = tmp_path / "000001.SZ.qmt-minute.parquet"
+    _write_qmt_minutes(
+        qmt_minute_path,
+        [("2026-03-31 09:30:00", 10.05, 1000.0, 10050.0)],
+    )
+    calls = 0
+    original_load_qmt_0930_matches = load_qmt_0930_matches
+
+    def load_minute_matches(path):
+        nonlocal calls
+        calls += 1
+        return original_load_qmt_0930_matches(path)
+
+    monkeypatch.setattr(
+        "scripts.generate_auction_factors.load_quote_frame",
+        lambda *args, **kwargs: _auction_quotes(include_match=False),
+    )
+    monkeypatch.setattr(
+        "scripts.generate_auction_factors.load_auction_event_frame",
+        lambda *args, **kwargs: (pd.DataFrame(), False),
+    )
+    monkeypatch.setattr(
+        "scripts.generate_auction_factors.load_open_transaction_match",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        "scripts.generate_auction_factors.load_daily_amount_history",
+        lambda *args, **kwargs: pd.Series(
+            dtype=float, index=pd.DatetimeIndex([])
+        ),
+    )
+    monkeypatch.setattr(
+        "scripts.generate_auction_factors.load_qmt_0930_matches",
+        load_minute_matches,
+    )
+
+    _, output_path, row_count = process_symbol_series(
+        "etf",
+        "000001.SZ",
+        [raw_dir],
+        tmp_path / "minute.parquet",
+        tmp_path / "auction",
+        "20260331",
+        "20260331",
+        overwrite=True,
+        auction_cache_root=None,
+        use_qmt_match_fallback=True,
+        qmt_tick_path=tmp_path / "missing-tick.parquet",
+        qmt_minute_path=qmt_minute_path,
+    )
+    result = pd.read_parquet(output_path)
+
+    assert row_count == 1
+    assert calls == 1
+    assert result.loc[0, "auction_match_source"] == "qmt_0930_minute"
+    assert result.loc[0, "auction_matched_volume"] == 1000.0
+
+
+def test_process_stock_ignores_qmt_fallback_files(monkeypatch, tmp_path: Path) -> None:
+    raw_dir = tmp_path / "2026" / "202603" / "20260331" / "000001.SZ"
+    raw_dir.mkdir(parents=True)
+    qmt_tick_path = tmp_path / "tick.parquet"
+    qmt_minute_path = tmp_path / "minute-qmt.parquet"
+    qmt_tick_path.touch()
+    qmt_minute_path.touch()
+
+    monkeypatch.setattr(
+        "scripts.generate_auction_factors.load_quote_frame",
+        lambda *args, **kwargs: _auction_quotes(include_match=False),
+    )
+    monkeypatch.setattr(
+        "scripts.generate_auction_factors.load_auction_event_frame",
+        lambda *args, **kwargs: (pd.DataFrame(), False),
+    )
+    monkeypatch.setattr(
+        "scripts.generate_auction_factors.load_open_transaction_match",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        "scripts.generate_auction_factors.load_daily_amount_history",
+        lambda *args, **kwargs: pd.Series(
+            dtype=float, index=pd.DatetimeIndex([])
+        ),
+    )
+
+    def fail_qmt_loader(*args, **kwargs):
+        raise AssertionError("stock processing must not load ETF QMT files")
+
+    monkeypatch.setattr(
+        "scripts.generate_auction_factors.load_qmt_0930_matches", fail_qmt_loader
+    )
+    monkeypatch.setattr(
+        "scripts.generate_auction_factors.load_qmt_0925_tick_matches", fail_qmt_loader
+    )
+
+    _, output_path, _ = process_symbol_series(
+        "stock",
+        "000001.SZ",
+        [raw_dir],
+        tmp_path / "minute.parquet",
+        tmp_path / "auction",
+        "20260331",
+        "20260331",
+        overwrite=True,
+        auction_cache_root=None,
+        use_qmt_match_fallback=True,
+        qmt_tick_path=qmt_tick_path,
+        qmt_minute_path=qmt_minute_path,
+    )
+    result = pd.read_parquet(output_path)
+
+    assert not bool(result.loc[0, "auction_has_match"])
+    assert result.loc[0, "auction_match_source"] == "none"
+
+
+def test_qmt_match_override_preserves_missing_event_factors() -> None:
+    row = calculate_daily_auction_factors(
+        _auction_quotes(include_match=False),
+        "000001.SZ",
+        match_override={
+            "trade_time": pd.Timestamp("2026-03-31 09:25:00"),
+            "open_price": 10.05,
+            "trade_volume": 1_000.0,
+            "trade_amount": 10_050.0,
+        },
+        match_source="qmt_0930_minute",
+    )
+
+    assert row["auction_has_match"] is True
+    assert row["auction_match_source"] == "qmt_0930_minute"
+    assert row["available_time"] == pd.Timestamp("2026-03-31 09:25:00")
+    assert row["auction_event_reconstruction_ok"] is False
+    assert np.isnan(row["auction_bid_cancel_qty_ratio_stage1"])
+
+
+def test_process_qmt_symbol_writes_deduplicated_output(tmp_path: Path) -> None:
+    tick_path = tmp_path / "000001.SZ.tick.parquet"
+    minute_path = tmp_path / "000001.SZ.minute.parquet"
+    output_root = tmp_path / "output"
+    _write_qmt_tick(
+        tick_path,
+        [
+            "2026-03-31 09:15:00",
+            "2026-03-31 09:20:00",
+            "2026-03-31 09:24:59",
+        ],
+    )
+    _write_qmt_minutes(
+        minute_path,
+        [
+            ("2026-03-31 09:30:00", 10.05, 1_000.0, 10_050.0),
+            ("2026-03-31 09:31:00", 10.06, 200.0, 2_012.0),
+        ],
+    )
+
+    _, output_path, row_count = process_qmt_symbol_series(
+        "000001.SZ", tick_path, minute_path, output_root, None, None, False
+    )
+    result = pd.read_parquet(output_path)
+
+    assert row_count == 1
+    assert result["trade_date"].tolist() == ["2026-03-31"]
+    assert result["auction_match_source"].tolist() == ["qmt_0930_minute"]
+    assert bool(result.loc[0, "auction_has_match"])
+    assert not bool(result.loc[0, "auction_event_reconstruction_ok"])
+    assert result["trade_date"].is_unique
+
+
+def test_qmt_warmup_keeps_dates_before_requested_start() -> None:
+    ordered = pd.bdate_range("2026-03-23", periods=8).strftime("%Y-%m-%d").tolist()
+    requested, warmup = _missing_dates_with_warmup(ordered, ordered[5:])
+
+    assert requested == ordered[5:]
+    assert warmup == ordered[:5]
 
 
 def test_daily_factor_formulas_and_output_contract() -> None:
@@ -588,6 +1051,33 @@ def test_history_ratios_use_only_previous_five_valid_days() -> None:
     assert np.isclose(
         base.loc[5, "auction_amount_ratio_5d"],
         changed_future.loc[5, "auction_amount_ratio_5d"],
+    )
+
+
+def test_report_smoothed_factors_use_inclusive_twenty_day_window() -> None:
+    frame = _historical_frame([10.0] * 21)
+    values = np.arange(1.0, 22.0)
+    for column in REPORT_SMOOTHED_SOURCE_COLUMNS:
+        frame[column] = values
+
+    result = apply_report_smoothed_factors(frame)
+
+    assert result[REPORT_SMOOTHED_FACTOR_COLUMNS].iloc[:19].isna().all().all()
+    assert np.isclose(
+        result.loc[19, "auction_snapshot_count_total_mean_20d"],
+        np.mean(values[:20]),
+    )
+    assert np.isclose(
+        result.loc[20, "auction_snapshot_count_total_mean_20d"],
+        np.mean(values[1:21]),
+    )
+
+    changed_future = frame.copy()
+    changed_future.loc[20, REPORT_SMOOTHED_SOURCE_COLUMNS] = 999_999.0
+    changed = apply_report_smoothed_factors(changed_future)
+    assert np.isclose(
+        result.loc[19, "auction_stage2_range_ratio_mean_20d"],
+        changed.loc[19, "auction_stage2_range_ratio_mean_20d"],
     )
 
 
@@ -1356,6 +1846,14 @@ def test_tick_cache_streams_auction_window_and_invalidates_source(tmp_path) -> N
     assert cache.stats.rebuilds == 2
 
 
+def test_existing_output_codes_uses_parquet_stems(tmp_path) -> None:
+    pd.DataFrame({"trade_date": []}).to_parquet(tmp_path / "000001.SZ.parquet")
+    pd.DataFrame({"trade_date": []}).to_parquet(tmp_path / "510300.parquet")
+    (tmp_path / "README.txt").write_text("ignored", encoding="utf-8")
+
+    assert existing_output_codes(tmp_path) == {"000001", "510300"}
+
+
 def test_tick_cache_filters_orders_and_transactions_at_0925(tmp_path) -> None:
     raw_dir = tmp_path / "2026" / "202603" / "20260331" / "000001.SZ"
     raw_dir.mkdir(parents=True)
@@ -1384,7 +1882,9 @@ def test_tick_cache_filters_orders_and_transactions_at_0925(tmp_path) -> None:
 def test_existing_auction_dates_skip_source_reads(tmp_path, monkeypatch) -> None:
     output_root = tmp_path / "auction"
     output_root.mkdir()
-    pd.DataFrame({"trade_date": ["2026-03-31"]}).to_parquet(
+    existing_row = {column: np.nan for column in OUTPUT_COLUMNS}
+    existing_row.update({"trade_date": "2026-03-31", "ts_code": "000001.SZ"})
+    pd.DataFrame([existing_row]).to_parquet(
         output_root / "000001.SZ.parquet", index=False
     )
     raw_dir = tmp_path / "2026" / "202603" / "20260331" / "000001.SZ"
@@ -1409,6 +1909,102 @@ def test_existing_auction_dates_skip_source_reads(tmp_path, monkeypatch) -> None
     )
     assert output_path == output_root / "000001.SZ.parquet"
     assert row_count == 0
+
+
+def test_report_smoothed_backfill_reads_only_existing_output(tmp_path, monkeypatch) -> None:
+    output_root = tmp_path / "auction"
+    output_root.mkdir()
+    existing = _historical_frame([10.0] * 21)
+    existing["auction_snapshot_count_total"] = np.arange(1.0, 22.0)
+    existing = existing.drop(columns=REPORT_SMOOTHED_FACTOR_COLUMNS)
+    output_path = output_root / "000001.SZ.parquet"
+    existing.to_parquet(output_path, index=False)
+    raw_dir = tmp_path / "2026" / "202601" / "20260121" / "000001.SZ"
+    raw_dir.mkdir(parents=True)
+
+    def fail_loader(*args, **kwargs):
+        raise AssertionError("derived-only backfill must not read source data")
+
+    monkeypatch.setattr("scripts.generate_auction_factors.load_quote_frame", fail_loader)
+    monkeypatch.setattr(
+        "scripts.generate_auction_factors.load_auction_event_frame", fail_loader
+    )
+    monkeypatch.setattr(
+        "scripts.generate_auction_factors.load_daily_amount_history", fail_loader
+    )
+    monkeypatch.setattr(
+        "scripts.generate_auction_factors.build_session_path_factor_frame", fail_loader
+    )
+
+    _, written_path, row_count = process_symbol_series(
+        "stock",
+        "000001.SZ",
+        [raw_dir],
+        tmp_path / "minute.parquet",
+        output_root,
+        None,
+        None,
+        overwrite=False,
+    )
+
+    result = pd.read_parquet(written_path)
+    assert row_count == 21
+    assert result["trade_date"].tolist() == existing["trade_date"].tolist()
+    assert result[REPORT_SMOOTHED_FACTOR_COLUMNS].iloc[:19].isna().all().all()
+    assert result.loc[19, "auction_snapshot_count_total_mean_20d"] == pytest.approx(10.5)
+    assert result.loc[20, "auction_snapshot_count_total_mean_20d"] == pytest.approx(11.5)
+
+
+def test_legacy_auction_schema_backfills_existing_date(tmp_path, monkeypatch) -> None:
+    output_root = tmp_path / "auction"
+    output_root.mkdir()
+    legacy_columns = [
+        column for column in OUTPUT_COLUMNS if column not in SUPPLEMENT_OUTPUT_COLUMNS
+    ]
+    legacy_row = {column: np.nan for column in legacy_columns}
+    legacy_row.update({"trade_date": "2026-03-31", "ts_code": "000001.SZ"})
+    pd.DataFrame([legacy_row]).to_parquet(output_root / "000001.SZ.parquet", index=False)
+    raw_dir = tmp_path / "2026" / "202603" / "20260331" / "000001.SZ"
+    raw_dir.mkdir(parents=True)
+    quote = _auction_quotes()
+    monkeypatch.setattr(
+        "scripts.generate_auction_factors.load_quote_frame", lambda *args, **kwargs: quote
+    )
+
+    def fail_full_calculation(*args, **kwargs):
+        raise AssertionError("supplement backfill must not load auction events")
+
+    monkeypatch.setattr(
+        "scripts.generate_auction_factors.load_auction_event_frame",
+        fail_full_calculation,
+    )
+
+    _, output_path, row_count = process_symbol_series(
+        "stock",
+        "000001.SZ",
+        [raw_dir],
+        tmp_path / "minute.parquet",
+        output_root,
+        "20260331",
+        "20260331",
+        overwrite=False,
+        auction_cache_root=None,
+    )
+
+    result = pd.read_parquet(output_path)
+    assert row_count == 1
+    assert set(OUTPUT_COLUMNS).issubset(result.columns)
+    assert result["trade_date"].tolist() == ["2026-03-31"]
+    assert result["auction_range_ratio"].notna().all()
+
+
+def test_supplemental_quote_calculation_matches_full_report_columns() -> None:
+    quote = _auction_quotes()
+    full = calculate_daily_auction_factors(quote, "000001.SZ")
+    supplement = calculate_supplemental_auction_fields(quote, "000001.SZ")
+
+    for column in REPORT_SUPPLEMENT_FACTOR_COLUMNS:
+        assert supplement[column] == pytest.approx(full[column], nan_ok=True)
 
 
 def test_empty_auction_date_is_skipped_without_aborting_symbol(tmp_path, monkeypatch) -> None:

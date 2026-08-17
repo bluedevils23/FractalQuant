@@ -12,7 +12,7 @@ from typing import Callable
 import pandas as pd
 
 
-CACHE_VERSION = 1
+CACHE_VERSION = 2
 DEFAULT_CHUNK_SIZE = 100_000
 DATE_PATTERN = re.compile(r"^\d{8}$")
 
@@ -54,6 +54,8 @@ TRANSACTION_COLUMNS = {
     "自然日": "raw_trade_date",
     "时间": "raw_time",
     "成交代码": "trade_code",
+    "BS标志": "bs_flag",
+    "成交价格": "price",
     "成交数量": "quantity",
     "叫卖序号": "ask_order_id",
     "叫买序号": "bid_order_id",
@@ -71,13 +73,13 @@ def parse_trade_time(trade_date: pd.Series, raw_time: pd.Series) -> pd.Series:
 
 
 def _date_bounds(
-    symbol_dir: Path, end_time: str
+    symbol_dir: Path, start_time: str, end_time: str
 ) -> tuple[pd.Timestamp | None, pd.Timestamp | None]:
     date_text = symbol_dir.parent.name
     if not DATE_PATTERN.fullmatch(date_text):
         return None, None
     day = pd.Timestamp(date_text)
-    start = day + pd.Timedelta(hours=9, minutes=15)
+    start = day + pd.Timedelta(hours=int(start_time[:2]), minutes=int(start_time[3:]))
     return start, day + pd.Timedelta(hours=int(end_time[:2]), minutes=int(end_time[3:]))
 
 
@@ -116,30 +118,41 @@ def _read_csv_chunks(
     transform: Callable[[pd.DataFrame], pd.DataFrame],
     start: pd.Timestamp | None,
     end: pd.Timestamp | None,
+    start_time: str,
     end_time: str,
+    inclusive_end: bool,
     chunksize: int,
 ) -> pd.DataFrame:
     if not path.exists():
         raise FileNotFoundError(f"Missing tick file: {path}")
+    header = pd.read_csv(path, encoding="gbk", nrows=0).columns
+    available_usecols = [column for column in usecols if column in header]
+    if "自然日" not in available_usecols or "时间" not in available_usecols:
+        raise ValueError(f"Tick file is missing date/time columns: {path}")
     pieces: list[pd.DataFrame] = []
     for chunk in pd.read_csv(
         path,
         encoding="gbk",
-        usecols=usecols,
+        usecols=available_usecols,
         dtype=str,
         low_memory=False,
         chunksize=chunksize,
     ):
+        for column in usecols:
+            if column not in chunk:
+                chunk[column] = pd.NA
         trade_time = parse_trade_time(chunk["自然日"], chunk["时间"])
         if start is None or end is None:
             minutes = trade_time.dt.hour * 60 + trade_time.dt.minute
             seconds = trade_time.dt.second + trade_time.dt.microsecond / 1_000_000
             elapsed = minutes + seconds / 60.0
-            mask = elapsed.ge(9 * 60 + 15) & elapsed.lt(
-                int(end_time[:2]) * 60 + int(end_time[3:])
-            )
+            start_minutes = int(start_time[:2]) * 60 + int(start_time[3:])
+            end_minutes = int(end_time[:2]) * 60 + int(end_time[3:])
+            before_end = elapsed.le(end_minutes) if inclusive_end else elapsed.lt(end_minutes)
+            mask = elapsed.ge(start_minutes) & before_end
         else:
-            mask = trade_time.ge(start) & trade_time.lt(end)
+            before_end = trade_time.le(end) if inclusive_end else trade_time.lt(end)
+            mask = trade_time.ge(start) & before_end
         if not mask.any():
             continue
         selected = chunk.loc[mask].copy()
@@ -181,6 +194,8 @@ def _normalize_orders(frame: pd.DataFrame) -> pd.DataFrame:
 def _normalize_transactions(frame: pd.DataFrame) -> pd.DataFrame:
     frame = frame.rename(columns=TRANSACTION_COLUMNS)
     frame["trade_code"] = frame["trade_code"].astype(str).str.strip().str.upper()
+    frame["bs_flag"] = frame["bs_flag"].astype(str).str.strip().str.upper()
+    frame["price"] = pd.to_numeric(frame["price"], errors="coerce") / 10000.0
     frame["quantity"] = pd.to_numeric(frame["quantity"], errors="coerce")
     frame["ask_order_id"] = (
         pd.to_numeric(frame["ask_order_id"], errors="coerce").fillna(0).astype("int64")
@@ -210,14 +225,24 @@ class AuctionTickCache:
         kind: str,
         source_name: str,
         usecols: list[str],
+        start_time: str,
         end_time: str,
+        inclusive_end: bool,
         transform: Callable[[pd.DataFrame], pd.DataFrame],
     ) -> pd.DataFrame:
         source = symbol_dir / source_name
-        start, end = _date_bounds(symbol_dir, end_time)
+        start, end = _date_bounds(symbol_dir, start_time, end_time)
         if self.root is None:
             return _read_csv_chunks(
-                source, usecols, transform, start, end, end_time, self.chunksize
+                source,
+                usecols,
+                transform,
+                start,
+                end,
+                start_time,
+                end_time,
+                inclusive_end,
+                self.chunksize,
             )
 
         cache_dir = self.root / symbol_dir.parent.parent.parent.name / symbol_dir.parent.parent.name / symbol_dir.parent.name / symbol_dir.name
@@ -234,7 +259,15 @@ class AuctionTickCache:
                 pass
 
         frame = _read_csv_chunks(
-            source, usecols, transform, start, end, end_time, self.chunksize
+            source,
+            usecols,
+            transform,
+            start,
+            end,
+            start_time,
+            end_time,
+            inclusive_end,
+            self.chunksize,
         )
         _atomic_write_frame(frame, target)
         _atomic_write_json({"version": CACHE_VERSION, "source": signature}, metadata)
@@ -247,7 +280,9 @@ class AuctionTickCache:
             "quote",
             "行情.csv",
             list(QUOTE_COLUMNS),
+            "09:15",
             "09:30",
+            False,
             _normalize_quote,
         )
 
@@ -257,7 +292,9 @@ class AuctionTickCache:
             "orders",
             "逐笔委托.csv",
             list(ORDER_COLUMNS),
+            "09:15",
             "09:25",
+            False,
             _normalize_orders,
         )
 
@@ -267,6 +304,45 @@ class AuctionTickCache:
             "transactions",
             "逐笔成交.csv",
             list(TRANSACTION_COLUMNS),
+            "09:15",
             "09:25",
+            False,
+            _normalize_transactions,
+        )
+
+    def load_open_transactions(self, symbol_dir: Path) -> pd.DataFrame:
+        """Load the 09:25 opening-match transaction minute separately."""
+        return self._load(
+            symbol_dir,
+            "open_transactions",
+            "逐笔成交.csv",
+            list(TRANSACTION_COLUMNS),
+            "09:25",
+            "09:26",
+            False,
+            _normalize_transactions,
+        )
+
+    def load_close_orders(self, symbol_dir: Path) -> pd.DataFrame:
+        return self._load(
+            symbol_dir,
+            "close_orders",
+            "逐笔委托.csv",
+            list(ORDER_COLUMNS),
+            "14:57",
+            "15:00",
+            False,
+            _normalize_orders,
+        )
+
+    def load_close_transactions(self, symbol_dir: Path) -> pd.DataFrame:
+        return self._load(
+            symbol_dir,
+            "close_transactions",
+            "逐笔成交.csv",
+            list(TRANSACTION_COLUMNS),
+            "14:57",
+            "15:00",
+            True,
             _normalize_transactions,
         )
