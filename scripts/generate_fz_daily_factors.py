@@ -4,12 +4,13 @@ import argparse
 from bisect import bisect_right
 from collections import Counter
 from datetime import datetime, timezone
+import gc
 import json
 import logging
 import os
 import sys
 import tempfile
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, as_completed, wait
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -285,8 +286,12 @@ def parse_args(
     parser.add_argument(
         "--workers",
         type=int,
-        default=os.cpu_count() or 1,
-        help="Number of parallel workers to use for file-based stages.",
+        default=min(os.cpu_count() or 1, 8),
+        help=(
+            "Number of parallel workers to use for file-based stages. "
+            "The default is capped at 8 to avoid duplicating large parquet "
+            "frames in memory."
+        ),
     )
     parser.add_argument(
         "--date-from",
@@ -932,29 +937,58 @@ def calculate_raw_daily_panel(
 ) -> pl.DataFrame:
     date_dirs = sorted(path for path in stage_root.iterdir() if path.is_dir())
     daily_dates, daily_pv_by_date = partition_daily_pv_by_date(daily_pv)
-    date_inputs = [
-        (
-            date_dir,
-            select_daily_pv_window(
-                daily_dates, daily_pv_by_date, pd.Timestamp(date_dir.name)
-            ),
-        )
-        for date_dir in date_dirs
-    ]
+    # Do not materialize every rolling window up front.  For a long history
+    # this creates one 20-day panel per trade date and can consume more memory
+    # than the minute data itself.  Windows are built only as each date is
+    # submitted to the executor.
+    def iter_date_inputs():
+        for date_dir in date_dirs:
+            yield (
+                date_dir,
+                select_daily_pv_window(
+                    daily_dates, daily_pv_by_date, pd.Timestamp(date_dir.name)
+                ),
+            )
+
     if workers == 1:
         daily_frames = [
             calculate_raw_daily_exposure(date_dir, daily_pv_window)
-            for date_dir, daily_pv_window in date_inputs
+            for date_dir, daily_pv_window in iter_date_inputs()
         ]
     else:
         with ProcessPoolExecutor(max_workers=workers) as executor:
-            daily_frames = list(
-                executor.map(
-                    calculate_raw_daily_exposure,
-                    (date_dir for date_dir, _ in date_inputs),
-                    (daily_pv_window for _, daily_pv_window in date_inputs),
+            # Keep at most ``workers`` rolling windows and result frames alive
+            # at once.  ``Executor.map`` eagerly consumes its iterables on
+            # supported Python versions, which would otherwise recreate the
+            # high-memory behavior this stage is intended to avoid.
+            pending = {}
+            date_inputs = iter(iter_date_inputs())
+            for _ in range(workers):
+                try:
+                    date_dir, daily_pv_window = next(date_inputs)
+                except StopIteration:
+                    break
+                future = executor.submit(
+                    calculate_raw_daily_exposure, date_dir, daily_pv_window
                 )
-            )
+                pending[future] = None
+
+            daily_frames = []
+            while pending:
+                completed, _ = wait(
+                    pending, return_when=FIRST_COMPLETED
+                )
+                for future in completed:
+                    del pending[future]
+                    daily_frames.append(future.result())
+                    try:
+                        date_dir, daily_pv_window = next(date_inputs)
+                    except StopIteration:
+                        continue
+                    replacement = executor.submit(
+                        calculate_raw_daily_exposure, date_dir, daily_pv_window
+                    )
+                    pending[replacement] = None
 
     if not daily_frames:
         raise ValueError("No daily minute slices were staged for FZ computation.")
@@ -1287,6 +1321,13 @@ def main(
             final_factor_frame, args.date_from, args.date_to
         )
 
+        # The output writer only needs the final pandas frame.  Release the
+        # Polars panels and staged daily inputs before writing many symbol
+        # files; otherwise all intermediate representations remain reachable
+        # during the longest part of the run.
+        del composed_panel, panel_with_daily, raw_panel, daily_pv, daily_base
+        gc.collect()
+
     failures: list[tuple[Path, str]] = []
     written_count = 0
     skipped_existing_count = 0
@@ -1314,36 +1355,34 @@ def main(
                 failures.append((input_path, str(exc)))
                 LOGGER.exception("Failed to process %s", input_path)
     else:
-        LOGGER.info("Using %s workers for output merge", worker_count)
-        with ProcessPoolExecutor(max_workers=worker_count) as executor:
-            future_map = {
-                executor.submit(
-                    write_daily_factors_for_symbol,
+        # Do not send the full factor panel through a ProcessPoolExecutor for
+        # every symbol.  That pickles and duplicates the same large pandas
+        # object once per worker (and once per submitted future).  Writing is
+        # already atomic and file-oriented, so a bounded single-process merge
+        # keeps memory proportional to one symbol slice.
+        LOGGER.info("Writing output files in the parent process to limit memory use")
+        for input_path in files:
+            try:
+                status, output_path, row_count, column_count = write_daily_factors_for_symbol(
                     input_path,
                     args.output_root,
                     args.overwrite,
                     final_factor_frame,
-                ): input_path
-                for input_path in files
-            }
-            for future in as_completed(future_map):
-                input_path = future_map[future]
-                try:
-                    status, output_path, row_count, column_count = future.result()
-                    if status == "skipped":
-                        skipped_existing_count += 1
-                        LOGGER.info("Skipping existing output: %s", output_path)
-                    else:
-                        written_count += 1
-                        LOGGER.info(
-                            "Wrote %s rows and %s columns to %s",
-                            row_count,
-                            column_count,
-                            output_path,
-                        )
-                except Exception as exc:  # noqa: BLE001
-                    failures.append((input_path, str(exc)))
-                    LOGGER.exception("Failed to process %s", input_path)
+                )
+                if status == "skipped":
+                    skipped_existing_count += 1
+                    LOGGER.info("Skipping existing output: %s", output_path)
+                else:
+                    written_count += 1
+                    LOGGER.info(
+                        "Wrote %s rows and %s columns to %s",
+                        row_count,
+                        column_count,
+                        output_path,
+                    )
+            except Exception as exc:  # noqa: BLE001
+                failures.append((input_path, str(exc)))
+                LOGGER.exception("Failed to process %s", input_path)
 
     if failures:
         LOGGER.error("Completed with %s failures", len(failures))
