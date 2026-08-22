@@ -26,7 +26,6 @@ from typing import Literal, Optional
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import seaborn as sns
 import statsmodels.api as sm
 from scipy import stats
 from tqdm import tqdm

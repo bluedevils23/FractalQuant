@@ -21,7 +21,7 @@ PACKAGE_ROOT = PROJECT_ROOT / "FractalQuant"
 if str(PACKAGE_ROOT) not in sys.path:
     sys.path.insert(0, str(PACKAGE_ROOT))
 
-from factor.single_factor_backtest import (
+from factor.single_factor_backtest import (  # noqa: E402
     FactorBacktestConfig,
     SingleFactorBacktest,
 )
@@ -383,7 +383,7 @@ def summarize_results(
     summary_df.to_csv(summary_file, index=False, encoding='utf-8-sig')
 
     LOGGER.info(f"\nSummary saved to {summary_file}")
-    LOGGER.info(f"\nTop 10 factors by |IC|:")
+    LOGGER.info("\nTop 10 factors by |IC|:")
     print(summary_df.head(10).to_string(index=False))
 
 

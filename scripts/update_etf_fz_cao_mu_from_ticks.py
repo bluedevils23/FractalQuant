@@ -23,7 +23,7 @@ PROJECT_ROOT = SCRIPT_DIR.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from scripts.generate_fz_daily_factors import (
+from scripts.generate_fz_daily_factors import (  # noqa: E402
     CAO_MU_REQUIRED_SOURCE_FIELDS,
     CAO_MU_SOURCE_COLUMNS,
     MANIFEST_NAME,
@@ -32,7 +32,6 @@ from scripts.generate_fz_daily_factors import (
     load_csi_all_share_returns,
     normalize_cao_mu_source_frame,
     normalize_daily_frame,
-    tick_trade_path,
 )
 
 
