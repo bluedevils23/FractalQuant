@@ -130,6 +130,9 @@ def _read_csv_chunks(
     if "自然日" not in available_usecols or "时间" not in available_usecols:
         raise ValueError(f"Tick file is missing date/time columns: {path}")
     pieces: list[pd.DataFrame] = []
+    # Raw tick times use HHMMSSmmm, so HHMM needs five trailing zeroes.
+    start_raw_time = start_time.replace(":", "") + "00000"
+    end_raw_time = end_time.replace(":", "") + "00000"
     for chunk in pd.read_csv(
         path,
         encoding="gbk",
@@ -141,22 +144,24 @@ def _read_csv_chunks(
         for column in usecols:
             if column not in chunk:
                 chunk[column] = pd.NA
-        trade_time = parse_trade_time(chunk["自然日"], chunk["时间"])
-        if start is None or end is None:
-            minutes = trade_time.dt.hour * 60 + trade_time.dt.minute
-            seconds = trade_time.dt.second + trade_time.dt.microsecond / 1_000_000
-            elapsed = minutes + seconds / 60.0
-            start_minutes = int(start_time[:2]) * 60 + int(start_time[3:])
-            end_minutes = int(end_time[:2]) * 60 + int(end_time[3:])
-            before_end = elapsed.le(end_minutes) if inclusive_end else elapsed.lt(end_minutes)
-            mask = elapsed.ge(start_minutes) & before_end
-        else:
-            before_end = trade_time.le(end) if inclusive_end else trade_time.lt(end)
-            mask = trade_time.ge(start) & before_end
-        if not mask.any():
+        # Most tick rows are outside the requested auction window.  Compare
+        # the fixed-width raw HHMMSSmmm value first, then parse timestamps only
+        # for the handful of candidate rows.
+        raw_time = chunk["时间"].astype(str).str.zfill(9)
+        before_end = raw_time.le(end_raw_time) if inclusive_end else raw_time.lt(end_raw_time)
+        raw_mask = raw_time.ge(start_raw_time) & before_end
+        if not raw_mask.any():
             continue
-        selected = chunk.loc[mask].copy()
-        selected["trade_time"] = trade_time.loc[mask]
+        selected = chunk.loc[raw_mask].copy()
+        trade_time = parse_trade_time(selected["自然日"], selected["时间"])
+        if start is not None and end is not None:
+            before_end = trade_time.le(end) if inclusive_end else trade_time.lt(end)
+            time_mask = trade_time.ge(start) & before_end
+            selected = selected.loc[time_mask].copy()
+            trade_time = trade_time.loc[time_mask]
+        if selected.empty:
+            continue
+        selected["trade_time"] = trade_time
         pieces.append(transform(selected))
     if not pieces:
         return transform(pd.DataFrame(columns=usecols + ["trade_time"]))
