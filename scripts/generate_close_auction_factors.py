@@ -442,7 +442,12 @@ def main() -> int:
         path.name: date_dirs[index + 1].name
         for index, path in enumerate(date_dirs[:-1])
     }
-    grouped = group_symbol_paths(date_dirs, {code for _, code, _ in assets})
+    requested_date_dirs = [
+        path
+        for path in date_dirs
+        if _date_in_requested_range(path.name, date_from, date_to)
+    ]
+    grouped = group_symbol_paths(requested_date_dirs, {code for _, code, _ in assets})
     tasks = [
         (kind, symbol, grouped.get(code, []))
         for kind, code, symbol in assets
