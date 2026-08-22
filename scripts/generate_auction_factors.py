@@ -969,11 +969,15 @@ def _calculate_l3_imbalance(frame: pd.DataFrame) -> pd.Series:
 
 
 def _calculate_relative_spread(frame: pd.DataFrame) -> pd.Series:
-    ask = pd.to_numeric(frame["ask_price1"], errors="coerce")
-    bid = pd.to_numeric(frame["bid_price1"], errors="coerce")
-    midpoint = (ask + bid) / 2.0
-    valid = ask.notna() & bid.notna() & (bid > 0) & (ask >= bid)
-    return ((ask - bid) / midpoint).where(valid)
+    """
+    Calculate relative spread during call auction.
+
+    During the opening auction (09:15-09:25), bid_price1 == ask_price1 (virtual
+    matched price), and bid_price2/ask_price2 have no data (0% valid rate in
+    production). Therefore, the spread is always zero and this factor carries no
+    signal. Return NaN to explicitly mark it as unavailable for auction data.
+    """
+    return pd.Series(np.nan, index=frame.index)
 
 
 def _time_weighted_mean(
@@ -1024,8 +1028,10 @@ def _apply_stage2_twap_factors(
     spread_twap, spread_coverage = _time_weighted_mean(
         stage2, "relative_spread", start_time, end_time
     )
+    # During call auction, relative_spread is unavailable (always NaN), so we
+    # exclude spread_coverage from the overall coverage_ratio calculation.
     row["auction_stage2_twap_coverage_ratio"] = float(
-        min(price_coverage, imbalance_coverage, spread_coverage)
+        min(price_coverage, imbalance_coverage)
     )
     row["auction_stage2_twap_price"] = price_twap
     row["auction_l3_imbalance_twap_stage2"] = imbalance_twap

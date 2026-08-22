@@ -680,7 +680,7 @@ def test_daily_factor_formulas_and_output_contract() -> None:
     assert np.isclose(
         row["auction_l3_imbalance_twap_stage2"], expected_imbalance_twap
     )
-    assert row["auction_relative_spread_twap_stage2"] == 0.0
+    assert np.isnan(row["auction_relative_spread_twap_stage2"])
 
     expected_slope = (
         np.polyfit(
