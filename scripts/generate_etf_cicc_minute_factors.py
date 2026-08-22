@@ -1,3 +1,18 @@
+"""
+ETF CICC daily factor generator.
+
+This script reads ETF minute-level OHLCV data and generates daily-level factors
+based on the CICC (China International Capital Corporation) factor methodology.
+
+Key changes from the original implementation:
+- Output is now daily-level factors (one row per trading day per symbol)
+- No longer merges daily factors back to minute-level data
+- Reduces storage footprint and better aligns with daily selection use cases
+- Facilitates downstream 20-day rolling aggregations (e.g., pv_corr_avg_20d)
+
+Input:  ETF minute parquet files with columns [ts_code, open, high, low, close, volume]
+Output: Daily factor parquet files with columns [ts_code, trade_date, factor1, factor2, ...]
+"""
 from __future__ import annotations
 
 import argparse
@@ -25,10 +40,10 @@ if str(REPLICATION_ROOT) not in sys.path:
 import MinuteFrequentFactorCalculateMethodsCICC as cicc_methods  # noqa: E402
 
 
-LOGGER = logging.getLogger("generate_etf_cicc_minute_factors")
+LOGGER = logging.getLogger("generate_etf_cicc_daily_factors")
 
 DEFAULT_INPUT_ROOT = Path(r"D:\workspace\stockdata\etf-data\etf_1min")
-DEFAULT_OUTPUT_ROOT = Path(r"D:\workspace\stockdata\etf-data\etf_1min_cicc_factors")
+DEFAULT_OUTPUT_ROOT = Path(r"D:\workspace\stockdata\etf-data\etf_cicc_daily_factors")
 REQUIRED_COLUMNS = ("open", "high", "low", "close", "volume")
 FACTOR_FUNCTION_NAMES = (
     "cal_mmt_pm",
@@ -94,7 +109,7 @@ FACTOR_FUNCTION_NAMES = (
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Generate ETF CICC minute factors from local parquet files."
+        description="Generate ETF CICC daily factors from local minute parquet files."
     )
     parser.add_argument(
         "--input-root",
@@ -332,23 +347,6 @@ def calculate_daily_factor_exposures(
     return exposure_pd, factor_columns
 
 
-def merge_daily_factors_back(
-    minute_df: pd.DataFrame, daily_exposure: pd.DataFrame
-) -> pd.DataFrame:
-    result = minute_df.copy()
-    result["trade_date"] = pd.to_datetime(result.index).normalize()
-    result = result.reset_index()
-    result = result.merge(
-        daily_exposure.rename(columns={"code": "ts_code", "date": "trade_date"}),
-        on=["ts_code", "trade_date"],
-        how="left",
-        validate="many_to_one",
-    )
-    result = result.set_index("trade_time")
-    result.index.name = "trade_time"
-    return result.drop(columns=["trade_date"])
-
-
 def process_file(
     input_path: Path, output_root: Path, overwrite: bool
 ) -> tuple[str, Path, int | None, int | None]:
@@ -360,13 +358,17 @@ def process_file(
     minute_df = normalize_minute_frame(raw_df)
     cicc_df = build_cicc_input(minute_df)
     daily_exposure, factor_columns = calculate_daily_factor_exposures(cicc_df)
-    result_df = merge_daily_factors_back(minute_df, daily_exposure)
 
-    ordered_columns = [
-        column
-        for column in ("ts_code", "open", "high", "low", "close", "volume", "amount", "adj_factor")
-        if column in result_df.columns
-    ]
+    # Output daily factors directly, no merge back to minute data
+    result_df = daily_exposure.rename(columns={"code": "ts_code", "date": "trade_date"})
+    result_df = result_df.set_index("trade_date")
+    result_df.index.name = "trade_date"
+
+    # Preserve undefined factor values as missing rather than writing infinities
+    # from zero/near-zero denominator edge cases into downstream artifacts.
+    result_df = result_df.replace([float("inf"), float("-inf")], float("nan"))
+
+    ordered_columns = ["ts_code"]
     ordered_columns.extend(
         column for column in factor_columns if column in result_df.columns
     )
@@ -394,7 +396,7 @@ def main() -> int:
         LOGGER.warning("No parquet files matched the requested inputs.")
         return 0
 
-    LOGGER.info("Processing %s ETF minute parquet files", len(files))
+    LOGGER.info("Processing %s ETF files to generate daily factors", len(files))
 
     failures: list[tuple[Path, str]] = []
     worker_count = max(1, args.workers)
