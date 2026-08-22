@@ -1299,8 +1299,6 @@ def test_external_context_applies_benchmark_time_and_excess_returns() -> None:
 
     assert result["available_time"] == pd.Timestamp("2026-01-01 09:25:03")
     assert result["benchmark_ts_code"] == "510300.SH"
-    assert result["prev_2d_return_rank_cs"] == 0.75
-    assert result["market_above_ma20_prevclose"] == 1.0
     assert np.isclose(result["auction_gap_excess_benchmark"], 0.015)
     assert np.isclose(result["auction_stage2_excess_return_benchmark"], 0.006)
     assert len(CONTEXT_SUPPLEMENT_FACTOR_COLUMNS) == 8

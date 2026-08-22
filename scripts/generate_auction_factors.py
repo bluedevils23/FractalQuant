@@ -143,14 +143,7 @@ PRIORITY_REPORT_FACTOR_COLUMNS = [
     "auction_final_vs_stage2_twap",
     "auction_l3_imbalance_twap_stage2",
     "auction_relative_spread_twap_stage2",
-    "prevday_intraday_drawdown_from_session_high",
-    "prevday_intraday_rebound_from_session_low",
-    "prevday_intraday_return_from_prev_close",
-    "prev_2d_return_rank_cs",
-    "prev_20d_return_rank_cs",
     "market_return_from_prev_close",
-    "market_above_ma20_prevclose",
-    "market_momentum_2d_prevclose",
     "auction_gap_excess_benchmark",
     "auction_stage2_excess_return_benchmark",
 ]
@@ -1760,6 +1753,7 @@ def build_historical_context(
     daily_path: Path,
     target_dates: list[str],
     requested_codes: set[str] | None = None,
+    include_daily_factor_fields: bool = True,
 ) -> dict[str, pd.DataFrame]:
     if not target_dates or not daily_path.exists():
         return {}
@@ -1815,11 +1809,16 @@ def build_historical_context(
     work["previous_day_float_market_cap_cny"] = (
         work["circ_mv"].where(work["circ_mv"].gt(0)) * 10000.0
     )
-    work["prevday_intraday_drawdown_from_session_high"] = valid_close / valid_high - 1.0
-    work["prevday_intraday_rebound_from_session_low"] = valid_close / valid_low - 1.0
-    work["prevday_intraday_return_from_prev_close"] = (
-        valid_close / valid_pre_close - 1.0
-    )
+    if include_daily_factor_fields:
+        work["prevday_intraday_drawdown_from_session_high"] = (
+            valid_close / valid_high - 1.0
+        )
+        work["prevday_intraday_rebound_from_session_low"] = (
+            valid_close / valid_low - 1.0
+        )
+        work["prevday_intraday_return_from_prev_close"] = (
+            valid_close / valid_pre_close - 1.0
+        )
 
     available_daily_dates = np.sort(work["trade_date"].dropna().unique())
     session_numbers = {
@@ -1827,17 +1826,18 @@ def build_historical_context(
         for number, trade_date in enumerate(available_daily_dates)
     }
     work["_session_number"] = work["trade_date"].map(session_numbers)
-    lag_lookup = work[["ts_code", "_session_number", "_adj_close"]]
-    for periods, target in [(2, "_prev_2d_return"), (20, "_prev_20d_return")]:
-        lagged = lag_lookup.rename(columns={"_adj_close": "_lagged_adj_close"}).copy()
-        lagged["_session_number"] += periods
-        work = work.merge(
-            lagged,
-            on=["ts_code", "_session_number"],
-            how="left",
-            validate="one_to_one",
-        )
-        work[target] = work["_adj_close"] / work.pop("_lagged_adj_close") - 1.0
+    if include_daily_factor_fields:
+        lag_lookup = work[["ts_code", "_session_number", "_adj_close"]]
+        for periods, target in [(2, "_prev_2d_return"), (20, "_prev_20d_return")]:
+            lagged = lag_lookup.rename(columns={"_adj_close": "_lagged_adj_close"}).copy()
+            lagged["_session_number"] += periods
+            work = work.merge(
+                lagged,
+                on=["ts_code", "_session_number"],
+                how="left",
+                validate="one_to_one",
+            )
+            work[target] = work["_adj_close"] / work.pop("_lagged_adj_close") - 1.0
 
     grouped = work.groupby("ts_code", sort=False)
     rolling_7d_close_max = grouped["close"].transform(
@@ -1848,25 +1848,26 @@ def build_historical_context(
     )
     has_consecutive_7d = work["_session_number"].sub(rolling_first_session_7d).eq(6)
     work["previous_7d_close_max"] = rolling_7d_close_max.where(has_consecutive_7d)
-    rolling_ma20 = grouped["_adj_close"].transform(
-        lambda values: values.rolling(20, min_periods=20).mean()
-    )
-    rolling_first_session = grouped["_session_number"].transform(
-        lambda values: values.rolling(20, min_periods=20).min()
-    )
-    has_consecutive_20d = work["_session_number"].sub(rolling_first_session).eq(19)
-    work["_market_above_ma20"] = (
-        work["_adj_close"]
-        .gt(rolling_ma20)
-        .astype(float)
-        .where(rolling_ma20.notna() & has_consecutive_20d)
-    )
-    work["prev_2d_return_rank_cs"] = work.groupby("trade_date", sort=False)[
-        "_prev_2d_return"
-    ].rank(method="average", pct=True)
-    work["prev_20d_return_rank_cs"] = work.groupby("trade_date", sort=False)[
-        "_prev_20d_return"
-    ].rank(method="average", pct=True)
+    if include_daily_factor_fields:
+        rolling_ma20 = grouped["_adj_close"].transform(
+            lambda values: values.rolling(20, min_periods=20).mean()
+        )
+        rolling_first_session = grouped["_session_number"].transform(
+            lambda values: values.rolling(20, min_periods=20).min()
+        )
+        has_consecutive_20d = work["_session_number"].sub(rolling_first_session).eq(19)
+        work["_market_above_ma20"] = (
+            work["_adj_close"]
+            .gt(rolling_ma20)
+            .astype(float)
+            .where(rolling_ma20.notna() & has_consecutive_20d)
+        )
+        work["prev_2d_return_rank_cs"] = work.groupby("trade_date", sort=False)[
+            "_prev_2d_return"
+        ].rank(method="average", pct=True)
+        work["prev_20d_return_rank_cs"] = work.groupby("trade_date", sort=False)[
+            "_prev_20d_return"
+        ].rank(method="average", pct=True)
 
     target_to_source: list[tuple[pd.Timestamp, pd.Timestamp]] = []
     for target in normalized_targets:
@@ -1880,18 +1881,23 @@ def build_historical_context(
     context_columns = [
         "trade_date",
         "ts_code",
-        "prevday_intraday_drawdown_from_session_high",
-        "prevday_intraday_rebound_from_session_low",
-        "prevday_intraday_return_from_prev_close",
-        "prev_2d_return_rank_cs",
-        "prev_20d_return_rank_cs",
-        "_prev_2d_return",
-        "_market_above_ma20",
         "previous_day_volume_shares",
         "previous_day_high",
         "previous_7d_close_max",
         "previous_day_float_market_cap_cny",
     ]
+    if include_daily_factor_fields:
+        context_columns.extend(
+            [
+                "prevday_intraday_drawdown_from_session_high",
+                "prevday_intraday_rebound_from_session_low",
+                "prevday_intraday_return_from_prev_close",
+                "prev_2d_return_rank_cs",
+                "prev_20d_return_rank_cs",
+                "_prev_2d_return",
+                "_market_above_ma20",
+            ]
+        )
     context = work[context_columns].merge(mappings, on="trade_date", how="inner")
     target_limits = work.loc[
         work["trade_date"].isin(normalized_targets),
@@ -1909,6 +1915,7 @@ def build_historical_context(
         how="left",
         validate="one_to_one",
     )
+    context["source_trade_date"] = context["trade_date"]
     context["trade_date"] = context.pop("target_date").dt.strftime("%Y-%m-%d")
     if requested_codes is not None:
         context = context.loc[context["ts_code"].isin(requested_codes)]
@@ -1928,11 +1935,6 @@ def build_benchmark_context(
     qmt_tick_matches: dict[str, dict[str, object]] | None = None,
 ) -> pd.DataFrame:
     paths_by_date = {path.parent.name: path for path in symbol_paths}
-    historical_by_date = (
-        historical_context.set_index("trade_date", drop=False)
-        if historical_context is not None and not historical_context.empty
-        else pd.DataFrame()
-    )
     records: list[dict[str, object]] = []
     for trade_date in sorted(set(target_dates)):
         record: dict[str, object] = {
@@ -1942,8 +1944,6 @@ def build_benchmark_context(
             "benchmark_auction_has_match": False,
             "market_return_from_prev_close": np.nan,
             "_benchmark_auction_return_stage2": np.nan,
-            "market_above_ma20_prevclose": np.nan,
-            "market_momentum_2d_prevclose": np.nan,
         }
         path = paths_by_date.get(pd.Timestamp(trade_date).strftime("%Y%m%d"))
         if path is not None:
@@ -1974,15 +1974,6 @@ def build_benchmark_context(
                     record["_benchmark_auction_return_stage2"] = benchmark_row[
                         "auction_return_stage2"
                     ]
-        date_key = record["trade_date"]
-        if not historical_by_date.empty and date_key in historical_by_date.index:
-            historical = historical_by_date.loc[date_key]
-            if isinstance(historical, pd.DataFrame):
-                historical = historical.iloc[-1]
-            record["market_above_ma20_prevclose"] = historical[
-                "_market_above_ma20"
-            ]
-            record["market_momentum_2d_prevclose"] = historical["_prev_2d_return"]
         records.append(record)
     return pd.DataFrame(records)
 
@@ -2092,11 +2083,6 @@ def apply_external_context(
         else pd.DataFrame()
     )
     symbol_columns = [
-        "prevday_intraday_drawdown_from_session_high",
-        "prevday_intraday_rebound_from_session_low",
-        "prevday_intraday_return_from_prev_close",
-        "prev_2d_return_rank_cs",
-        "prev_20d_return_rank_cs",
         "previous_day_volume_shares",
         "previous_day_high",
         "previous_7d_close_max",
@@ -2126,8 +2112,6 @@ def apply_external_context(
             "benchmark_available_time",
             "benchmark_auction_has_match",
             "market_return_from_prev_close",
-            "market_above_ma20_prevclose",
-            "market_momentum_2d_prevclose",
         ]:
             result.at[index, column] = benchmark[column]
 
@@ -2720,11 +2704,6 @@ def build_qmt_benchmark_context(
         date: group.drop(columns="trade_date").reset_index(drop=True)
         for date, group in quotes.groupby("trade_date", sort=True)
     }
-    historical_by_date = (
-        historical_context.set_index("trade_date", drop=False)
-        if historical_context is not None and not historical_context.empty
-        else pd.DataFrame()
-    )
     records: list[dict[str, object]] = []
     for date in sorted(set(target_dates)):
         record = {
@@ -2734,8 +2713,6 @@ def build_qmt_benchmark_context(
             "benchmark_auction_has_match": False,
             "market_return_from_prev_close": np.nan,
             "_benchmark_auction_return_stage2": np.nan,
-            "market_above_ma20_prevclose": np.nan,
-            "market_momentum_2d_prevclose": np.nan,
         }
         if date in grouped:
             row = calculate_daily_auction_factors(
@@ -2751,12 +2728,6 @@ def build_qmt_benchmark_context(
             if bool(row["auction_has_match"]):
                 record["market_return_from_prev_close"] = row["auction_overnight_return"]
                 record["_benchmark_auction_return_stage2"] = row["auction_return_stage2"]
-        if not historical_by_date.empty and date in historical_by_date.index:
-            historical = historical_by_date.loc[date]
-            if isinstance(historical, pd.DataFrame):
-                historical = historical.iloc[-1]
-            record["market_above_ma20_prevclose"] = historical["_market_above_ma20"]
-            record["market_momentum_2d_prevclose"] = historical["_prev_2d_return"]
         records.append(record)
     return pd.DataFrame(records)
 
@@ -3073,6 +3044,7 @@ def run_qmt_auction_generation(
         args.etf_daily_path,
         target_dates,
         requested_symbols | {benchmark_ts_code},
+        include_daily_factor_fields=False,
     )
     benchmark_context = build_qmt_benchmark_context(
         benchmark_ts_code,
@@ -3326,7 +3298,10 @@ def main() -> int:
     historical_context_by_kind: dict[str, dict[str, pd.DataFrame]] = {
         "stock": (
             build_historical_context(
-                args.stock_daily_path, target_dates, requested_by_kind["stock"]
+                args.stock_daily_path,
+                target_dates,
+                requested_by_kind["stock"],
+                include_daily_factor_fields=False,
             )
             if requested_by_kind["stock"]
             else {}
@@ -3335,6 +3310,7 @@ def main() -> int:
             args.etf_daily_path,
             target_dates,
             requested_by_kind["etf"] | {benchmark_ts_code},
+            include_daily_factor_fields=False,
         ),
     }
     need_etf_qmt_fallback = (
