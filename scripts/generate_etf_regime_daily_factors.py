@@ -24,7 +24,6 @@ from factor.regime import (  # noqa: E402
 
 LOGGER = logging.getLogger("generate_etf_regime_daily_factors")
 
-DEFAULT_ETF_DAILY_PATH = Path(r"D:\workspace\stockdata\etf-data\etf_daily.parquet")
 DEFAULT_INDEX_DAILY_ROOT = Path(r"D:\workspace\stockdata\指数数据\index_daily")
 DEFAULT_OUTPUT_ROOT = Path(
     r"D:\workspace\stockdata\etf-data\etf_regime_daily_factors"
@@ -38,30 +37,12 @@ DEFAULT_REFERENCE_CODES = (
     "000016.SH",
     "399006.SZ",
 )
+OUTPUT_FILENAME = "market_regime_daily.parquet"
 OUTPUT_COLUMNS = (
     "trade_date",
     "available_time",
     "source_trade_date",
-    "ts_code",
 ) + DAILY_REGIME_OUTPUT_COLUMNS
-
-
-def _normalize_codes(values: list[str] | None) -> set[str] | None:
-    if not values:
-        return None
-    return {str(value).strip().upper() for value in values if str(value).strip()}
-
-
-def _read_daily_frame(path: Path, required: tuple[str, ...]) -> pd.DataFrame:
-    if not path.exists():
-        raise FileNotFoundError(f"Daily file does not exist: {path}")
-    frame = pd.read_parquet(path)
-    if isinstance(frame.index, pd.MultiIndex) or set(required).difference(frame.columns):
-        frame = frame.reset_index()
-    missing = sorted(set(required).difference(frame.columns))
-    if missing:
-        raise ValueError(f"Daily file is missing columns {missing}: {path}")
-    return frame
 
 
 def load_reference_close_panel(
@@ -98,53 +79,34 @@ def load_reference_close_panel(
     return panel
 
 
-def _filter_etf_codes(frame: pd.DataFrame, requested: set[str] | None) -> pd.DataFrame:
-    if requested is None:
-        return frame
-    prefixes = {code.split(".", 1)[0] for code in requested}
-    code_series = frame["ts_code"].astype(str).str.upper()
-    return frame.loc[code_series.isin(requested) | code_series.str.split(".").str[0].isin(prefixes)]
-
-
-def build_etf_regime_daily_frame(
-    etf_daily: pd.DataFrame,
+def build_market_regime_daily_frame(
     regime_by_source_date: pd.DataFrame,
     market_dates: pd.DatetimeIndex,
-    requested_codes: set[str] | None = None,
     date_from: str | None = None,
     date_to: str | None = None,
 ) -> pd.DataFrame:
-    """Map source-date regime values to each ETF's next available trade date."""
-    frame = etf_daily.copy()
-    frame["trade_date"] = pd.to_datetime(frame["trade_date"], errors="coerce").dt.normalize()
-    frame["ts_code"] = frame["ts_code"].astype(str).str.upper()
-    frame = frame.dropna(subset=["trade_date"])
-    frame = _filter_etf_codes(frame, requested_codes)
-    if date_from is not None:
-        frame = frame.loc[frame["trade_date"] >= pd.Timestamp(date_from).normalize()]
-    if date_to is not None:
-        frame = frame.loc[frame["trade_date"] <= pd.Timestamp(date_to).normalize()]
-    if frame.empty:
-        return pd.DataFrame(columns=OUTPUT_COLUMNS)
-
+    """Map each source market date to the next reference-market date."""
     market_dates = pd.DatetimeIndex(market_dates).sort_values().unique()
-    target_dates = pd.DatetimeIndex(frame["trade_date"].unique()).sort_values()
-    positions = market_dates.searchsorted(target_dates, side="left") - 1
-    source_dates = pd.Series(
-        [market_dates[position] if position >= 0 else pd.NaT for position in positions],
-        index=target_dates,
+    if len(market_dates) < 2:
+        return pd.DataFrame(columns=OUTPUT_COLUMNS)
+    source_dates = market_dates[:-1]
+    target_dates = market_dates[1:]
+    output = regime_by_source_date.reindex(source_dates).reset_index(drop=True)
+    output["source_trade_date"] = source_dates
+    output["trade_date"] = target_dates
+    output["available_time"] = output["trade_date"] + pd.Timedelta(
+        hours=9, minutes=15
     )
-    selected = frame[["trade_date", "ts_code"]].drop_duplicates().copy()
-    selected["source_trade_date"] = selected["trade_date"].map(source_dates)
-    selected = selected.dropna(subset=["source_trade_date"])
-    selected = selected.merge(
-        regime_by_source_date.reset_index(names="source_trade_date"),
-        on="source_trade_date",
-        how="left",
-    )
-    selected["available_time"] = selected["trade_date"] + pd.Timedelta(hours=9, minutes=15)
-    selected = selected.reindex(columns=OUTPUT_COLUMNS)
-    return selected.sort_values(["ts_code", "trade_date"], kind="mergesort").reset_index(drop=True)
+    output = output.reindex(columns=OUTPUT_COLUMNS)
+    if date_from is not None:
+        output = output.loc[
+            output["trade_date"] >= pd.Timestamp(date_from).normalize()
+        ]
+    if date_to is not None:
+        output = output.loc[
+            output["trade_date"] <= pd.Timestamp(date_to).normalize()
+        ]
+    return output.sort_values("trade_date", kind="mergesort").reset_index(drop=True)
 
 
 def _merge_output(path: Path, requested: pd.DataFrame, overwrite: bool) -> None:
@@ -159,7 +121,7 @@ def _merge_output(path: Path, requested: pd.DataFrame, overwrite: bool) -> None:
             ~requested["trade_date"].astype(str).isin(set(existing["trade_date"].astype(str)))
         ]
     combined = pd.concat([existing, additions], ignore_index=True)
-    combined = combined.drop_duplicates(["trade_date", "ts_code"], keep="last")
+    combined = combined.drop_duplicates(["trade_date"], keep="last")
     combined["trade_date"] = pd.to_datetime(combined["trade_date"], errors="coerce").dt.normalize()
     combined["source_trade_date"] = pd.to_datetime(
         combined["source_trade_date"], errors="coerce"
@@ -169,14 +131,11 @@ def _merge_output(path: Path, requested: pd.DataFrame, overwrite: bool) -> None:
     combined.to_parquet(path, index=False)
 
 
-def write_outputs(frame: pd.DataFrame, output_root: Path, overwrite: bool) -> list[str]:
+def write_output(frame: pd.DataFrame, output_root: Path, overwrite: bool) -> Path:
     output_root.mkdir(parents=True, exist_ok=True)
-    written: list[str] = []
-    for code, group in frame.groupby("ts_code", sort=True):
-        path = output_root / f"{code}.parquet"
-        _merge_output(path, group, overwrite)
-        written.append(str(path))
-    return written
+    path = output_root / OUTPUT_FILENAME
+    _merge_output(path, frame, overwrite)
+    return path
 
 
 def _write_json(path: Path, payload: dict[str, object]) -> None:
@@ -185,12 +144,9 @@ def _write_json(path: Path, payload: dict[str, object]) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--etf-daily", type=Path, default=DEFAULT_ETF_DAILY_PATH)
     parser.add_argument("--index-daily-root", type=Path, default=DEFAULT_INDEX_DAILY_ROOT)
     parser.add_argument("--reference-codes", nargs="+", default=list(DEFAULT_REFERENCE_CODES))
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
-    parser.add_argument("--symbols", nargs="*", default=None)
-    parser.add_argument("--symbols-file", type=Path, default=None)
     parser.add_argument("--date-from", default=None)
     parser.add_argument("--date-to", default=None)
     parser.add_argument("--training-days", type=int, default=756)
@@ -212,24 +168,13 @@ def main() -> None:
         min_training_days=args.min_training_days,
         refit_days=args.refit_days,
     )
-    etf = _read_daily_frame(args.etf_daily, ("trade_date", "ts_code"))
-    requested = _normalize_codes(args.symbols)
-    if args.symbols_file is not None:
-        file_codes = {
-            line.strip().upper()
-            for line in args.symbols_file.read_text(encoding="utf-8").splitlines()
-            if line.strip()
-        }
-        requested = (requested or set()) | file_codes
-    output = build_etf_regime_daily_frame(
-        etf,
+    output = build_market_regime_daily_frame(
         regime,
         close_panel.index,
-        requested_codes=requested or None,
         date_from=args.date_from,
         date_to=args.date_to,
     )
-    files = write_outputs(output, args.output_root, args.overwrite) if not output.empty else []
+    output_path = write_output(output, args.output_root, args.overwrite)
     null_counts = {
         column: int(output[column].isna().sum()) for column in DAILY_REGIME_OUTPUT_COLUMNS
     }
@@ -245,9 +190,8 @@ def main() -> None:
         "source_date_to": str(close_panel.index.max().date()),
         "target_date_from": str(output["trade_date"].min().date()) if not output.empty else None,
         "target_date_to": str(output["trade_date"].max().date()) if not output.empty else None,
-        "etf_count": int(output["ts_code"].nunique()) if not output.empty else 0,
         "output_rows": int(len(output)),
-        "output_files": files,
+        "output_file": str(output_path),
         "model_fit_failure_dates": regime.attrs.get("model_fit_failure_dates", []),
         "insufficient_history_dates": regime.attrs.get("insufficient_history_dates", []),
     }
@@ -273,7 +217,7 @@ def main() -> None:
     args.output_root.mkdir(parents=True, exist_ok=True)
     _write_json(args.output_root / "_regime_manifest.json", manifest)
     _write_json(args.output_root / "_regime_report.json", report)
-    LOGGER.info("Generated %d regime rows for %d ETFs", len(output), manifest["etf_count"])
+    LOGGER.info("Generated %d shared market regime rows", len(output))
 
 
 if __name__ == "__main__":
