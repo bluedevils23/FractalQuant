@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import warnings
 import weakref
 from typing import Literal
@@ -18,6 +19,31 @@ HMM_RETURN_SCALE = 10_000.0
 HMM_RANDOM_STATE = 42
 HMM_INITIAL_ITERATIONS = 100
 HMM_WARM_START_ITERATIONS = 20
+
+DAILY_REGIME_STATES = ("low", "mid", "high")
+DAILY_REGIME_FEATURE_COLUMNS = (
+    "market_return_1d",
+    "market_breadth_1d",
+    "market_dispersion_1d",
+    "market_vol_5d",
+    "market_vol_20d",
+    "market_drawdown_20d",
+)
+DAILY_REGIME_OUTPUT_COLUMNS = (
+    "regime_state",
+    "regime_next_state",
+    "regime_prob_low",
+    "regime_prob_mid",
+    "regime_prob_high",
+    "regime_next_prob_low",
+    "regime_next_prob_mid",
+    "regime_next_prob_high",
+    "regime_expected_vol",
+    "regime_confidence",
+    "regime_entropy",
+    "regime_transition_score",
+)
+DAILY_REGIME_RANDOM_STATE = 42
 
 _HMM_CACHE: dict[
     int,
@@ -43,6 +69,229 @@ def _state_order_by_variance(model: GaussianHMM) -> np.ndarray:
         model.n_components, -1
     )[:, 0]
     return np.argsort(variances, kind="stable")
+
+
+def build_daily_market_feature_panel(close_panel: pd.DataFrame) -> pd.DataFrame:
+    """Build causal shared-market features from aligned reference closes."""
+    if not isinstance(close_panel.index, pd.DatetimeIndex):
+        raise TypeError("close_panel requires a DatetimeIndex")
+    if close_panel.index.has_duplicates:
+        raise ValueError("close_panel index contains duplicate dates")
+    if close_panel.empty or close_panel.shape[1] == 0:
+        return pd.DataFrame(index=close_panel.index, columns=DAILY_REGIME_FEATURE_COLUMNS)
+
+    closes = close_panel.apply(pd.to_numeric, errors="coerce").sort_index()
+    closes = closes.where(closes > 0)
+    returns = np.log(closes).diff()
+    market_return = returns.mean(axis=1, skipna=True)
+    breadth = returns.gt(0).where(returns.notna()).mean(axis=1, skipna=True)
+    dispersion = returns.std(axis=1, skipna=True, ddof=0)
+    market_vol_5d = market_return.rolling(5, min_periods=5).std(ddof=0)
+    market_vol_20d = market_return.rolling(20, min_periods=20).std(ddof=0)
+    market_level = np.exp(market_return.fillna(0).cumsum())
+    market_drawdown = market_level / market_level.rolling(20, min_periods=20).max() - 1.0
+    return pd.DataFrame(
+        {
+            "market_return_1d": market_return,
+            "market_breadth_1d": breadth,
+            "market_dispersion_1d": dispersion,
+            "market_vol_5d": market_vol_5d,
+            "market_vol_20d": market_vol_20d,
+            "market_drawdown_20d": market_drawdown,
+        },
+        index=closes.index,
+    )
+
+
+def _daily_hmm_fit(
+    values: np.ndarray,
+    random_state: int = DAILY_REGIME_RANDOM_STATE,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None:
+    """Fit a standardized three-state daily HMM and order states by variance."""
+    if len(values) < 3 or not np.isfinite(values).all():
+        return None
+    center = values.mean(axis=0)
+    scale = values.std(axis=0, ddof=0)
+    scale = np.where(np.isfinite(scale) & (scale > 1e-8), scale, 1.0)
+    standardized = (values - center) / scale
+    if np.unique(standardized, axis=0).shape[0] < 3:
+        return None
+    model = GaussianHMM(
+        n_components=len(DAILY_REGIME_STATES),
+        covariance_type="diag",
+        min_covar=1e-4,
+        n_iter=100,
+        tol=1e-3,
+        random_state=random_state,
+        implementation="scaling",
+    )
+    hmm_logger = logging.getLogger("hmmlearn.base")
+    previous_level = hmm_logger.level
+    try:
+        hmm_logger.setLevel(logging.ERROR)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            model.fit(standardized)
+    except (FloatingPointError, ValueError):
+        return None
+    finally:
+        hmm_logger.setLevel(previous_level)
+    raw_covars = np.asarray(model.covars_, dtype=float)
+    covars_diag = (
+        np.diagonal(raw_covars, axis1=1, axis2=2)
+        if raw_covars.ndim == 3
+        else raw_covars
+    )
+    arrays = (
+        np.asarray(model.startprob_, dtype=float),
+        np.asarray(model.transmat_, dtype=float),
+        np.asarray(model.means_, dtype=float),
+        covars_diag,
+    )
+    if not all(np.isfinite(array).all() for array in arrays):
+        return None
+    order = np.argsort(covars_diag.sum(axis=1), kind="stable")
+    start, transition, means, covars = arrays
+    transition = transition[np.ix_(order, order)]
+    return (
+        start[order] / max(start[order].sum(), 1e-12),
+        transition / np.maximum(transition.sum(axis=1, keepdims=True), 1e-12),
+        means[order],
+        covars[order],
+    )
+
+
+def calculate_causal_daily_market_regime_features(
+    reference_panel: pd.DataFrame,
+    training_days: int = 756,
+    min_training_days: int = 252,
+    refit_days: int = 21,
+) -> pd.DataFrame:
+    """Return one causal three-state regime result per source trading day.
+
+    The model for day ``d`` is fitted only on rows strictly before ``d`` and
+    filters the observation on ``d``.  ``regime_next_prob_*`` is the one-step
+    projection for the next trading day.
+    """
+    if not isinstance(reference_panel.index, pd.DatetimeIndex):
+        raise TypeError("reference_panel requires a DatetimeIndex")
+    if reference_panel.index.has_duplicates:
+        raise ValueError("reference_panel index contains duplicate dates")
+    if training_days <= 0 or min_training_days <= 0 or refit_days <= 0:
+        raise ValueError("training_days, min_training_days and refit_days must be positive")
+    missing = [column for column in DAILY_REGIME_FEATURE_COLUMNS if column not in reference_panel]
+    if missing:
+        raise ValueError(f"reference_panel is missing feature columns: {missing}")
+
+    ordered = reference_panel.sort_index().loc[:, DAILY_REGIME_FEATURE_COLUMNS].apply(
+        pd.to_numeric, errors="coerce"
+    )
+    rows: list[dict[str, object]] = []
+    fit_failure_dates: list[str] = []
+    insufficient_history_dates: list[str] = []
+    if ordered.empty:
+        empty = pd.DataFrame(index=ordered.index, columns=DAILY_REGIME_OUTPUT_COLUMNS)
+        empty.attrs["model_fit_failure_dates"] = fit_failure_dates
+        empty.attrs["insufficient_history_dates"] = insufficient_history_dates
+        return empty
+
+    values = ordered.to_numpy(dtype=float)
+    previous_model: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None = None
+    filtered: np.ndarray | None = None
+    previous_probability: np.ndarray | None = None
+    last_fit_position = -refit_days
+
+    for position in range(len(ordered)):
+        start = max(0, position - training_days)
+        training = values[start:position]
+        training = training[np.isfinite(training).all(axis=1)]
+        if len(training) < min_training_days:
+            insufficient_history_dates.append(ordered.index[position].strftime("%Y-%m-%d"))
+            previous_model = None
+            filtered = None
+            previous_probability = None
+            continue
+
+        if previous_model is None or position - last_fit_position >= refit_days:
+            center = training.mean(axis=0)
+            scale = training.std(axis=0, ddof=0)
+            scale = np.where(np.isfinite(scale) & (scale > 1e-8), scale, 1.0)
+            fitted = _daily_hmm_fit(training)
+            if fitted is None:
+                fit_failure_dates.append(ordered.index[position].strftime("%Y-%m-%d"))
+                previous_model = None
+                filtered = None
+                previous_probability = None
+                continue
+            startprob, transition, means, covars = fitted
+            previous_model = (startprob, transition, means, covars, center, scale)
+            filtered = startprob.copy()
+            previous_probability = None
+            last_fit_position = position
+
+        if previous_model is None or filtered is None:
+            continue
+        startprob, transition, means, covars, center, scale = previous_model
+        observation = values[position]
+        if not np.isfinite(observation).all():
+            previous_probability = None
+            continue
+        observation = (observation - center) / scale
+        predicted = filtered @ transition
+        variances = np.maximum(covars, 1e-8)
+        log_likelihood = -0.5 * (
+            np.log(2.0 * np.pi * variances).sum(axis=1)
+            + (np.square(observation - means) / variances).sum(axis=1)
+        )
+        log_posterior = np.log(np.maximum(predicted, 1e-300)) + log_likelihood
+        log_posterior -= np.max(log_posterior)
+        posterior = np.exp(log_posterior)
+        normalizer = posterior.sum()
+        if not np.isfinite(normalizer) or normalizer <= 0:
+            previous_probability = None
+            continue
+        posterior /= normalizer
+        next_probability = posterior @ transition
+        state_vol = np.sqrt(np.maximum(covars[:, 0], 1e-12)) * scale[0]
+        valid_previous = previous_probability is not None
+        entropy = -np.sum(np.clip(posterior, 1e-12, 1.0) * np.log(np.clip(posterior, 1e-12, 1.0))) / np.log(3.0)
+        rows.append(
+            {
+                "_position": position,
+                "regime_state": DAILY_REGIME_STATES[int(np.argmax(posterior))],
+                "regime_next_state": DAILY_REGIME_STATES[int(np.argmax(next_probability))],
+                "regime_prob_low": posterior[0],
+                "regime_prob_mid": posterior[1],
+                "regime_prob_high": posterior[2],
+                "regime_next_prob_low": next_probability[0],
+                "regime_next_prob_mid": next_probability[1],
+                "regime_next_prob_high": next_probability[2],
+                "regime_expected_vol": float(
+                    np.sqrt(np.sum(next_probability * np.square(state_vol)))
+                ),
+                "regime_confidence": float(np.max(posterior)),
+                "regime_entropy": float(entropy),
+                "regime_transition_score": (
+                    float(0.5 * np.abs(posterior - previous_probability).sum())
+                    if valid_previous
+                    else np.nan
+                ),
+            }
+        )
+        filtered = posterior
+        previous_probability = posterior
+    if not rows:
+        empty = pd.DataFrame(index=ordered.index, columns=DAILY_REGIME_OUTPUT_COLUMNS)
+        empty.attrs["model_fit_failure_dates"] = fit_failure_dates
+        empty.attrs["insufficient_history_dates"] = insufficient_history_dates
+        return empty
+    result = pd.DataFrame(rows).set_index("_position")
+    result = result.reindex(range(len(ordered)))
+    result.index = ordered.index
+    result = result.reindex(columns=DAILY_REGIME_OUTPUT_COLUMNS)
+    result.attrs["model_fit_failure_dates"] = fit_failure_dates
+    result.attrs["insufficient_history_dates"] = insufficient_history_dates
+    return result
 
 
 def _fit_hmm(
