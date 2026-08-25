@@ -173,6 +173,49 @@ def test_output_columns_are_unique_and_finite_except_expected_nulls() -> None:
     assert not np.isinf(numeric.to_numpy(dtype=float)).any()
 
 
+def test_minute_state_factor_batch_needs_history_and_preserves_amount_nulls() -> None:
+    source = _minute_frame(days=45, with_amount=True)
+    day_scale = 1.0 + np.arange(len(source), dtype=float) // 241.0 / 100.0
+    source["vol"] = source["vol"] * day_scale
+    source["amount"] = source["close"] * source["vol"]
+    raw = build_daily_raw_features(
+        source.set_index("trade_time"),
+        "510300.SH",
+        factor_window=3,
+        smart_money_window=2,
+    )
+    panel = select_output_columns(
+        add_availability_columns(
+            build_open_source_factor_panel(raw, factor_window=3, min_tgd_cross_section=1)
+        )
+    )
+    state_columns = [
+        "kaiyuan_volume_peak_count_m20",
+        "kaiyuan_volume_ridge_return_m20",
+        "kaiyuan_price_peak_count_m20",
+        "kaiyuan_intraday_amplitude_cut_mean_m10_l20",
+    ]
+    assert panel[state_columns].notna().any().all()
+    assert panel["kaiyuan_ideal_turnover_m20_q25"].notna().any()
+
+    no_amount_source = _minute_frame(days=45, with_amount=False)
+    no_amount_source["vol"] = no_amount_source["vol"] * day_scale
+    no_amount = build_daily_raw_features(
+        no_amount_source.set_index("trade_time"),
+        "510300.SH",
+        factor_window=3,
+        smart_money_window=2,
+    )
+    no_amount_panel = select_output_columns(
+        add_availability_columns(
+            build_open_source_factor_panel(no_amount, factor_window=3, min_tgd_cross_section=1)
+        )
+    )
+    assert no_amount_panel["kaiyuan_volume_peak_count_m20"].notna().any()
+    assert no_amount_panel["kaiyuan_ideal_turnover_m20_q25"].isna().all()
+    assert no_amount_panel["kaiyuan_volume_peak_ridge_amount_ratio_m20"].isna().all()
+
+
 def test_cli_smoke_writes_filtered_symbol_output(tmp_path: Path, monkeypatch) -> None:
     input_root = tmp_path / "minute"
     output_root = tmp_path / "factors"
