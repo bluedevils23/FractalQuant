@@ -15,8 +15,15 @@ import pyarrow.parquet as pq
 
 if __package__:
     from scripts.auction_tick_cache import AuctionTickCache
+    from scripts import session_path_factors as _session_path_factors
 else:
     from auction_tick_cache import AuctionTickCache
+    import session_path_factors as _session_path_factors
+
+SESSION_PATH_OUTPUT_COLUMNS = _session_path_factors.SESSION_PATH_OUTPUT_COLUMNS
+build_session_path_factor_frame = _session_path_factors.build_session_path_factor_frame
+merge_session_path_output = _session_path_factors.merge_session_path_output
+process_session_path_only = _session_path_factors.process_session_path_only
 
 
 LOGGER = logging.getLogger("generate_auction_factors")
@@ -221,16 +228,6 @@ FACTOR_COLUMNS = (
     + REPORT_SMOOTHED_FACTOR_COLUMNS
 )
 OUTPUT_COLUMNS = KEY_COLUMNS + DIAGNOSTIC_COLUMNS + REFERENCE_COLUMNS + FACTOR_COLUMNS
-SESSION_PATH_OUTPUT_COLUMNS = [
-    "trade_date",
-    "bar_time",
-    "available_time",
-    "ts_code",
-    "intraday_drawdown_from_session_high",
-    "intraday_rebound_from_session_low",
-    "intraday_return_from_prev_close",
-]
-
 EVENT_COLUMNS = [
     "trade_time",
     "event_type",
@@ -374,12 +371,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--write-session-path-factors",
         action="store_true",
-        help="Also write causal minute-level session path companion parquets.",
+        help="Deprecated; use generate_etf_minute_factors.py instead.",
     )
     parser.add_argument(
         "--session-path-only",
         action="store_true",
-        help="Generate only causal minute-level session path factors; skip auction factors.",
+        help="Deprecated compatibility entry; use generate_etf_minute_factors.py instead.",
     )
     return parser.parse_args()
 
@@ -2143,145 +2140,6 @@ def apply_external_context(
     return result[OUTPUT_COLUMNS]
 
 
-def build_session_path_factor_frame(
-    minute_path: Path,
-    ts_code: str,
-    requested_dates: set[str] | None = None,
-) -> pd.DataFrame:
-    if not minute_path.exists():
-        raise FileNotFoundError(f"Minute file does not exist: {minute_path}")
-    minute = pd.read_parquet(minute_path, columns=["high", "low", "close"])
-    work = minute.reset_index()
-    if "trade_date" not in work.columns or "trade_time" not in work.columns:
-        raise ValueError(f"Minute file must expose trade_date and trade_time: {minute_path}")
-    work["trade_date"] = pd.to_datetime(work["trade_date"], errors="coerce").dt.normalize()
-    work["bar_time"] = pd.to_datetime(work["trade_time"], errors="coerce")
-    for column in ["high", "low", "close"]:
-        work[column] = pd.to_numeric(work[column], errors="coerce")
-    work = work.dropna(subset=["trade_date", "bar_time"]).sort_values(
-        ["trade_date", "bar_time"], kind="mergesort"
-    )
-    work = work.drop_duplicates(["trade_date", "bar_time"], keep="last")
-
-    daily_close = work.groupby("trade_date", sort=True)["close"].last()
-    previous_close = daily_close.shift(1)
-    work["_previous_close"] = work["trade_date"].map(previous_close)
-    session_groups = work.groupby("trade_date", sort=False)
-    session_high = session_groups["high"].cummax()
-    session_low = session_groups["low"].cummin()
-    valid_close = work["close"].where(work["close"].gt(0))
-    work["intraday_drawdown_from_session_high"] = (
-        valid_close / session_high.where(session_high.gt(0)) - 1.0
-    )
-    work["intraday_rebound_from_session_low"] = (
-        valid_close / session_low.where(session_low.gt(0)) - 1.0
-    )
-    work["intraday_return_from_prev_close"] = (
-        valid_close / work["_previous_close"].where(work["_previous_close"].gt(0))
-        - 1.0
-    )
-    work["available_time"] = work["bar_time"] + pd.Timedelta(minutes=1)
-    work["ts_code"] = ts_code
-    work["trade_date"] = work["trade_date"].dt.strftime("%Y-%m-%d")
-    if requested_dates is not None:
-        normalized_dates = {
-            pd.Timestamp(value).strftime("%Y-%m-%d") for value in requested_dates
-        }
-        work = work.loc[work["trade_date"].isin(normalized_dates)]
-    result = work[SESSION_PATH_OUTPUT_COLUMNS].reset_index(drop=True)
-    factor_columns = [
-        "intraday_drawdown_from_session_high",
-        "intraday_rebound_from_session_low",
-        "intraday_return_from_prev_close",
-    ]
-    numeric = result[factor_columns].to_numpy(dtype=float)
-    infinite_locations = np.argwhere(np.isinf(numeric))
-    if len(infinite_locations) > 0:
-        details = [
-            (
-                f"{result.iloc[row_index]['trade_date']} "
-                f"{result.iloc[row_index]['bar_time']} "
-                f"{factor_columns[column_index]}"
-            )
-            for row_index, column_index in infinite_locations[:10]
-        ]
-        remaining = len(infinite_locations) - len(details)
-        suffix = f"; and {remaining} more" if remaining > 0 else ""
-        raise ValueError(
-            f"Infinite session path factor for {ts_code}: "
-            + "; ".join(details)
-            + suffix
-        )
-    return result
-
-
-def merge_session_path_output(
-    output_path: Path,
-    requested: pd.DataFrame,
-    overwrite: bool,
-) -> pd.DataFrame:
-    if output_path.exists():
-        existing = pd.read_parquet(output_path).reindex(columns=SESSION_PATH_OUTPUT_COLUMNS)
-    else:
-        existing = pd.DataFrame(columns=SESSION_PATH_OUTPUT_COLUMNS)
-    requested_keys = pd.MultiIndex.from_frame(requested[["trade_date", "bar_time"]])
-    existing_keys = pd.MultiIndex.from_frame(existing[["trade_date", "bar_time"]])
-    if overwrite:
-        existing = existing.loc[~existing_keys.isin(requested_keys)]
-        additions = requested
-    else:
-        additions = requested.loc[~requested_keys.isin(existing_keys)]
-    combined = pd.concat([existing, additions], ignore_index=True)
-    if combined.empty:
-        return combined.reindex(columns=SESSION_PATH_OUTPUT_COLUMNS)
-    combined["trade_date"] = pd.to_datetime(combined["trade_date"]).dt.strftime(
-        "%Y-%m-%d"
-    )
-    combined["bar_time"] = pd.to_datetime(combined["bar_time"], errors="coerce")
-    combined["available_time"] = pd.to_datetime(
-        combined["available_time"], errors="coerce"
-    )
-    return combined.sort_values(["trade_date", "bar_time"], kind="mergesort").reset_index(
-        drop=True
-    )[SESSION_PATH_OUTPUT_COLUMNS]
-
-
-def process_session_path_only(
-    ts_code: str,
-    minute_path: Path,
-    output_root: Path,
-    date_from: str | None,
-    date_to: str | None,
-    overwrite: bool,
-) -> tuple[Path, int]:
-    output_path = output_root / f"{ts_code}.parquet"
-    existing_dates = _existing_trade_dates(output_path)
-    if not overwrite and date_from is not None and date_to is not None:
-        expected_dates = set(
-            pd.date_range(date_from, date_to, freq="B").strftime("%Y-%m-%d")
-        )
-        if expected_dates and expected_dates.issubset(existing_dates):
-            LOGGER.info(
-                "%s session-path skipped: requested dates already exist", ts_code
-            )
-            return output_path, 0
-
-    requested = build_session_path_factor_frame(minute_path, ts_code)
-    if date_from is not None:
-        requested = requested.loc[
-            requested["trade_date"].ge(pd.Timestamp(date_from).strftime("%Y-%m-%d"))
-        ]
-    if date_to is not None:
-        requested = requested.loc[
-            requested["trade_date"].le(pd.Timestamp(date_to).strftime("%Y-%m-%d"))
-        ]
-
-    combined = merge_session_path_output(output_path, requested, overwrite)
-    output_root.mkdir(parents=True, exist_ok=True)
-    combined.to_parquet(output_path, index=False)
-    return output_path, len(requested)
-
-
 def apply_historical_ratios(
     frame: pd.DataFrame,
     event_frames: dict[str, pd.DataFrame] | None = None,
@@ -2749,7 +2607,6 @@ def process_symbol_series(
     overwrite: bool,
     symbol_context: pd.DataFrame | None = None,
     benchmark_context: pd.DataFrame | None = None,
-    session_path_output_root: Path | None = None,
     auction_cache_root: Path | None = DEFAULT_AUCTION_CACHE_ROOT,
     refresh_auction_cache: bool = False,
     refresh_existing_factors: bool = False,
@@ -2957,30 +2814,6 @@ def process_symbol_series(
         )
         output_root.mkdir(parents=True, exist_ok=True)
         combined.to_parquet(output_path, index=False)
-    if session_path_output_root is not None:
-        session_path_output = session_path_output_root / f"{ts_code}.parquet"
-        session_existing_dates = _existing_trade_dates(session_path_output)
-        session_dates = (
-            requested_dates
-            if overwrite
-            else requested_dates - session_existing_dates
-        )
-        if session_dates:
-            session_requested = build_session_path_factor_frame(
-                minute_path, ts_code, session_dates
-            )
-            session_combined = merge_session_path_output(
-                session_path_output, session_requested, overwrite
-            )
-            session_path_output_root.mkdir(parents=True, exist_ok=True)
-            session_combined.to_parquet(session_path_output, index=False)
-        else:
-            LOGGER.info(
-                "%s session-path skipped: requested=%s existing=%s missing=0",
-                ts_code,
-                len(requested_dates),
-                len(session_existing_dates),
-            )
     LOGGER.info(
         "%s cache: hits=%s rebuilds=%s",
         ts_code,
@@ -3134,9 +2967,88 @@ def run_qmt_auction_generation(
     return 0
 
 
+def run_legacy_session_path_generation(
+    assets: list[tuple[str, str, str]],
+    args: argparse.Namespace,
+    date_from: str | None,
+    date_to: str | None,
+) -> int:
+    session_path_output_roots = {
+        "stock": args.stock_session_path_output_root,
+        "etf": args.etf_session_path_output_root,
+    }
+    minute_roots = {
+        "stock": args.stock_minute_root,
+        "etf": args.etf_minute_root,
+    }
+    LOGGER.info("Generating session path factors for %s symbols", len(assets))
+    failures: list[tuple[str, str]] = []
+    written = 0
+    worker_count = max(1, args.workers)
+    if worker_count == 1:
+        for kind, _, symbol in assets:
+            try:
+                output_path, row_count = process_session_path_only(
+                    symbol,
+                    minute_roots[kind] / f"{symbol}.parquet",
+                    session_path_output_roots[kind],
+                    date_from,
+                    date_to,
+                    args.overwrite,
+                )
+                written += int(row_count > 0)
+                LOGGER.info("Wrote %s session path rows to %s", row_count, output_path)
+            except Exception as exc:  # noqa: BLE001
+                failures.append((symbol, str(exc)))
+                LOGGER.exception("Failed to process session path factors for %s", symbol)
+    else:
+        with ProcessPoolExecutor(max_workers=worker_count) as executor:
+            futures = {
+                executor.submit(
+                    process_session_path_only,
+                    symbol,
+                    minute_roots[kind] / f"{symbol}.parquet",
+                    session_path_output_roots[kind],
+                    date_from,
+                    date_to,
+                    args.overwrite,
+                ): symbol
+                for kind, _, symbol in assets
+            }
+            for future in as_completed(futures):
+                symbol = futures[future]
+                try:
+                    output_path, row_count = future.result()
+                    written += int(row_count > 0)
+                    LOGGER.info(
+                        "Wrote %s session path rows to %s", row_count, output_path
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    failures.append((symbol, str(exc)))
+                    LOGGER.exception(
+                        "Failed to process session path factors for %s", symbol
+                    )
+
+    LOGGER.info(
+        "Completed session path factors: %s symbol files written, %s failures",
+        written,
+        len(failures),
+    )
+    if failures:
+        for symbol, error in failures[:20]:
+            LOGGER.error("%s: %s", symbol, error)
+        return 1
+    return 0
+
+
 def main() -> int:
     args = parse_args()
     configure_logging()
+    if args.write_session_path_factors or args.session_path_only:
+        LOGGER.warning(
+            "Session-path generation is deprecated in generate_auction_factors.py; "
+            "use generate_etf_minute_factors.py."
+        )
     date_from = normalize_trade_date_arg(args.date_from)
     date_to = normalize_trade_date_arg(args.date_to)
     if date_from and date_to and date_from > date_to:
@@ -3168,76 +3080,11 @@ def main() -> int:
         return 0
 
     if args.session_path_only:
-        session_path_output_roots = {
-            "stock": args.stock_session_path_output_root,
-            "etf": args.etf_session_path_output_root,
-        }
-        LOGGER.info("Generating session path factors for %s symbols", len(assets))
-        failures: list[tuple[str, str]] = []
-        written = 0
-        worker_count = max(1, args.workers)
-        if worker_count == 1:
-            for kind, _, symbol in assets:
-                try:
-                    output_path, row_count = process_session_path_only(
-                        symbol,
-                        {
-                            "stock": args.stock_minute_root,
-                            "etf": args.etf_minute_root,
-                        }[kind]
-                        / f"{symbol}.parquet",
-                        session_path_output_roots[kind],
-                        date_from,
-                        date_to,
-                        args.overwrite,
-                    )
-                    written += int(row_count > 0)
-                    LOGGER.info("Wrote %s session path rows to %s", row_count, output_path)
-                except Exception as exc:  # noqa: BLE001
-                    failures.append((symbol, str(exc)))
-                    LOGGER.exception("Failed to process session path factors for %s", symbol)
-        else:
-            with ProcessPoolExecutor(max_workers=worker_count) as executor:
-                futures = {
-                    executor.submit(
-                        process_session_path_only,
-                        symbol,
-                        {
-                            "stock": args.stock_minute_root,
-                            "etf": args.etf_minute_root,
-                        }[kind]
-                        / f"{symbol}.parquet",
-                        session_path_output_roots[kind],
-                        date_from,
-                        date_to,
-                        args.overwrite,
-                    ): symbol
-                    for kind, _, symbol in assets
-                }
-                for future in as_completed(futures):
-                    symbol = futures[future]
-                    try:
-                        output_path, row_count = future.result()
-                        written += int(row_count > 0)
-                        LOGGER.info(
-                            "Wrote %s session path rows to %s", row_count, output_path
-                        )
-                    except Exception as exc:  # noqa: BLE001
-                        failures.append((symbol, str(exc)))
-                        LOGGER.exception(
-                            "Failed to process session path factors for %s", symbol
-                        )
-
-        LOGGER.info(
-            "Completed session path factors: %s symbol files written, %s failures",
-            written,
-            len(failures),
-        )
-        if failures:
-            for symbol, error in failures[:20]:
-                LOGGER.error("%s: %s", symbol, error)
-            return 1
-        return 0
+        return run_legacy_session_path_generation(assets, args, date_from, date_to)
+    if args.write_session_path_factors:
+        status = run_legacy_session_path_generation(assets, args, date_from, date_to)
+        if status:
+            return status
 
     benchmark_ts_code = args.benchmark_ts_code.strip().upper()
     benchmark_numeric_code = numeric_code(benchmark_ts_code)
@@ -3255,10 +3102,6 @@ def main() -> int:
     minute_roots = {
         "stock": args.stock_minute_root,
         "etf": args.etf_minute_root,
-    }
-    session_path_output_roots = {
-        "stock": args.stock_session_path_output_root,
-        "etf": args.etf_session_path_output_root,
     }
     tasks = [
         (kind, code, symbol, grouped_paths.get(code, []))
@@ -3405,9 +3248,6 @@ def main() -> int:
                     args.overwrite,
                     historical_context_by_kind[kind].get(symbol),
                     benchmark_context_by_kind[kind],
-                    session_path_output_roots[kind]
-                    if args.write_session_path_factors
-                    else None,
                     args.auction_cache_root,
                     args.refresh_auction_cache,
                     args.refresh_existing_factors,
@@ -3443,9 +3283,6 @@ def main() -> int:
                     args.overwrite,
                     historical_context_by_kind[kind].get(symbol),
                     benchmark_context_by_kind[kind],
-                    session_path_output_roots[kind]
-                    if args.write_session_path_factors
-                    else None,
                     args.auction_cache_root,
                     args.refresh_auction_cache,
                     args.refresh_existing_factors,

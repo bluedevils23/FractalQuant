@@ -13,6 +13,15 @@ from sklearn.exceptions import ConvergenceWarning
 from .base import BaseFactor
 
 HMM_REGIME_STATES = ("low", "mid", "high")
+HMM_PROBABILITY_COLUMNS = tuple(
+    f"hmm_regime_prob_{state}_vol" for state in HMM_REGIME_STATES
+)
+HMM_SUMMARY_COLUMNS = (
+    "hmm_regime_confidence",
+    "hmm_regime_entropy",
+    "hmm_regime_transition_score",
+)
+HMM_FEATURE_COLUMNS = HMM_PROBABILITY_COLUMNS + HMM_SUMMARY_COLUMNS
 HMM_TRAINING_DAYS = 5
 HMM_MIN_TRAINING_OBSERVATIONS = 120
 HMM_RETURN_SCALE = 10_000.0
@@ -381,14 +390,52 @@ def _filter_session_probabilities(
     return probabilities
 
 
-def calculate_causal_hmm_regime_probabilities(
+def _add_regime_summary_features(probabilities: pd.DataFrame) -> pd.DataFrame:
+    """Add causal confidence and posterior-shift summaries to HMM outputs."""
+    result = probabilities.copy()
+    ordered_positions = np.argsort(result.index.asi8, kind="stable")
+    ordered = result.iloc[ordered_positions]
+    valid = ordered.notna().all(axis=1)
+
+    confidence = ordered.max(axis=1).where(valid)
+    safe_probabilities = ordered.clip(lower=1e-12)
+    entropy = (
+        -safe_probabilities.mul(np.log(safe_probabilities)).sum(axis=1)
+        / np.log(len(HMM_REGIME_STATES))
+    ).where(valid)
+
+    previous = ordered.shift(1)
+    transition_score = (
+        0.5 * ordered.sub(previous).abs().sum(axis=1)
+    ).where(valid & previous.notna().all(axis=1))
+
+    summary = pd.DataFrame(
+        {
+            "hmm_regime_confidence": confidence,
+            "hmm_regime_entropy": entropy,
+            "hmm_regime_transition_score": transition_score,
+        },
+        index=ordered.index,
+    )
+    result = result.reindex(columns=HMM_PROBABILITY_COLUMNS).copy()
+    result = result.join(summary)
+    return result
+
+
+def calculate_causal_hmm_regime_features(
     df: pd.DataFrame,
     training_days: int = HMM_TRAINING_DAYS,
     min_training_observations: int = HMM_MIN_TRAINING_OBSERVATIONS,
 ) -> pd.DataFrame:
-    """Fit on preceding days and filter each current session without lookahead."""
-    columns = [f"hmm_regime_prob_{state}_vol" for state in HMM_REGIME_STATES]
-    result = pd.DataFrame(np.nan, index=df.index, columns=columns, dtype=float)
+    """Return causal HMM probabilities and strategy-adaptation summaries.
+
+    Training uses only preceding complete sessions. Current-session values are
+    filtered sequentially, so confidence, entropy, and transition score use
+    only observations available at the current bar.
+    """
+    result = pd.DataFrame(
+        np.nan, index=df.index, columns=HMM_PROBABILITY_COLUMNS, dtype=float
+    )
     if df.empty:
         return result
     if training_days <= 0 or min_training_observations <= 0:
@@ -452,7 +499,36 @@ def calculate_causal_hmm_regime_probabilities(
         )
 
     result.iloc[order] = ordered_result
-    return result
+    return _add_regime_summary_features(result)
+
+
+def calculate_causal_hmm_regime_probabilities(
+    df: pd.DataFrame,
+    training_days: int = HMM_TRAINING_DAYS,
+    min_training_observations: int = HMM_MIN_TRAINING_OBSERVATIONS,
+) -> pd.DataFrame:
+    """Fit and filter a causal HMM, returning only state probabilities."""
+    return calculate_causal_hmm_regime_features(
+        df,
+        training_days=training_days,
+        min_training_observations=min_training_observations,
+    ).loc[:, HMM_PROBABILITY_COLUMNS]
+
+
+def _cached_hmm_regime_features(
+    df: pd.DataFrame,
+    training_days: int,
+    min_training_observations: int,
+) -> pd.DataFrame:
+    cache = _regime_cache(df)
+    key = (training_days, min_training_observations)
+    if key not in cache:
+        cache[key] = calculate_causal_hmm_regime_features(
+            df,
+            training_days=training_days,
+            min_training_observations=min_training_observations,
+        )
+    return cache[key]
 
 
 class CausalHMMRegimeProbabilityFactor(BaseFactor):
@@ -472,12 +548,66 @@ class CausalHMMRegimeProbabilityFactor(BaseFactor):
         self.min_training_observations = min_training_observations
 
     def calculate(self, df: pd.DataFrame) -> pd.Series:
-        cache = _regime_cache(df)
-        key = (self.training_days, self.min_training_observations)
-        if key not in cache:
-            cache[key] = calculate_causal_hmm_regime_probabilities(
-                df,
-                training_days=self.training_days,
-                min_training_observations=self.min_training_observations,
-            )
-        return cache[key][self.name]
+        return _cached_hmm_regime_features(
+            df, self.training_days, self.min_training_observations
+        )[self.name]
+
+
+class _CausalHMMRegimeSummaryFactor(BaseFactor):
+    """Base class for causal HMM summaries used by adaptive strategies."""
+
+    def __init__(
+        self,
+        output_name: str,
+        training_days: int = HMM_TRAINING_DAYS,
+        min_training_observations: int = HMM_MIN_TRAINING_OBSERVATIONS,
+    ) -> None:
+        super().__init__(output_name, min_training_observations)
+        self.training_days = training_days
+        self.min_training_observations = min_training_observations
+
+    def calculate(self, df: pd.DataFrame) -> pd.Series:
+        return _cached_hmm_regime_features(
+            df, self.training_days, self.min_training_observations
+        )[self.name]
+
+
+class CausalHMMRegimeConfidenceFactor(_CausalHMMRegimeSummaryFactor):
+    """Highest current-state posterior probability, in [0, 1]."""
+
+    def __init__(
+        self,
+        training_days: int = HMM_TRAINING_DAYS,
+        min_training_observations: int = HMM_MIN_TRAINING_OBSERVATIONS,
+    ) -> None:
+        super().__init__(
+            "hmm_regime_confidence", training_days, min_training_observations
+        )
+
+
+class CausalHMMRegimeEntropyFactor(_CausalHMMRegimeSummaryFactor):
+    """Normalized posterior entropy; lower values indicate clearer states."""
+
+    def __init__(
+        self,
+        training_days: int = HMM_TRAINING_DAYS,
+        min_training_observations: int = HMM_MIN_TRAINING_OBSERVATIONS,
+    ) -> None:
+        super().__init__(
+            "hmm_regime_entropy", training_days, min_training_observations
+        )
+
+
+class CausalHMMRegimeTransitionFactor(_CausalHMMRegimeSummaryFactor):
+    """Causal posterior shift score; 0 means no state-probability movement."""
+
+    def __init__(
+        self,
+        training_days: int = HMM_TRAINING_DAYS,
+        min_training_observations: int = HMM_MIN_TRAINING_OBSERVATIONS,
+    ) -> None:
+        super().__init__(
+            "hmm_regime_transition_score",
+            training_days,
+            min_training_observations,
+        )

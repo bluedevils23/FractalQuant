@@ -46,9 +46,9 @@ def test_factor_profiles_have_expected_unique_columns() -> None:
     base_names = [spec.output_name for spec in build_factor_specs("base")]
     multi_names = [spec.output_name for spec in build_factor_specs("multi")]
 
-    assert len(base_names) == len(set(base_names)) == 55
-    assert len(multi_names) == len(set(multi_names)) == 159
-    assert multi_names[:55] == base_names
+    assert len(base_names) == len(set(base_names)) == 58
+    assert len(multi_names) == len(set(multi_names)) == 162
+    assert multi_names[:58] == base_names
     assert {
         "returns_w3",
         "macd_f6_s13_sig5",
@@ -58,6 +58,9 @@ def test_factor_profiles_have_expected_unique_columns() -> None:
         "hmm_regime_prob_low_vol",
         "hmm_regime_prob_mid_vol",
         "hmm_regime_prob_high_vol",
+        "hmm_regime_confidence",
+        "hmm_regime_entropy",
+        "hmm_regime_transition_score",
     } <= set(multi_names)
 
 
@@ -129,8 +132,8 @@ def test_multi_profile_smoke_preserves_base_columns_and_resets_daily() -> None:
     multi = calculate_factor_frame(frame, "multi")
     base_factor_names = [spec.output_name for spec in build_factor_specs("base")]
 
-    assert len(base.columns) == len(frame.columns) + 55
-    assert len(multi.columns) == len(frame.columns) + 159
+    assert len(base.columns) == len(frame.columns) + 58
+    assert len(multi.columns) == len(frame.columns) + 162
     pd.testing.assert_frame_equal(
         multi[base_factor_names], base[base_factor_names]
     )

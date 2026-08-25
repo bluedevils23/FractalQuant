@@ -13,7 +13,7 @@
 
 | 管线 | 入口脚本 | 资产 | 因子数量 | 默认输出 |
 | --- | --- | --- | ---: | --- |
-| 标准分钟因子 | `generate_etf_minute_factors.py` | ETF | base 52 / multi 156 | `D:\workspace\stockdata\etf-data\etf_1min_factors*` |
+| 标准分钟因子 | `generate_etf_minute_factors.py` | ETF | base 58 / multi 162 | `D:\workspace\stockdata\etf-data\etf_1min_factors*` |
 | FZ 日频因子 | `generate_fz_daily_factors.py` | 股票 + ETF | 38 | 按 `--asset-type` 选择默认目录 |
 | CICC 分钟因子 | `generate_etf_cicc_minute_factors.py` | ETF | 58 | `D:\workspace\stockdata\etf-data\etf_1min_cicc_factors` |
 | Advanced 因子 | `generate_stock_advanced_factor.py` / `generate_etf_advanced_factor.py` | 股票 / ETF | 46 | `stock_advanced_factors` / `etf_1min_advanced_factors` |

@@ -36,7 +36,12 @@ from factor.price import (  # noqa: E402
     VolumePriceTrendFactor,
 )
 from factor.fractional import FractionalDiffLogCloseFactor  # noqa: E402
-from factor.regime import CausalHMMRegimeProbabilityFactor  # noqa: E402
+from factor.regime import (  # noqa: E402
+    CausalHMMRegimeConfidenceFactor,
+    CausalHMMRegimeEntropyFactor,
+    CausalHMMRegimeProbabilityFactor,
+    CausalHMMRegimeTransitionFactor,
+)
 from factor.microstructure import (  # noqa: E402
     LiquidityDepthFactor,
     LiquidityMigrationFactor,
@@ -85,6 +90,12 @@ from factor.volatility import (  # noqa: E402
     VolatilityRegimeFactor,
     VolatilitySkewFactor,
 )
+from scripts.session_path_factors import (  # noqa: E402
+    build_session_path_factor_frame_from_frame,
+    existing_trade_dates,
+    merge_session_path_output,
+    process_session_path_only,
+)
 
 
 LOGGER = logging.getLogger("generate_etf_minute_factors")
@@ -93,6 +104,15 @@ DEFAULT_INPUT_ROOT = Path(r"D:\workspace\stockdata\etf-data\etf_1min")
 DEFAULT_OUTPUT_ROOT = Path(r"D:\workspace\stockdata\etf-data\etf_1min_factors")
 DEFAULT_MULTIWINDOW_OUTPUT_ROOT = Path(
     r"D:\workspace\stockdata\etf-data\etf_1min_factors_multiwindow"
+)
+DEFAULT_STOCK_MINUTE_ROOT = Path(
+    r"D:\workspace\stockdata\stock-data\行情数据\stock_1min"
+)
+DEFAULT_STOCK_SESSION_PATH_OUTPUT_ROOT = Path(
+    r"D:\workspace\stockdata\stock-factors\stock_intraday_session_path_factors"
+)
+DEFAULT_ETF_SESSION_PATH_OUTPUT_ROOT = Path(
+    r"D:\workspace\stockdata\etf-factors\etf_intraday_session_path_factors"
 )
 POSITIVE_PRICE_COLUMNS = ("open", "high", "low", "close")
 REQUIRED_COLUMNS = ("open", "high", "low", "close", "volume")
@@ -172,6 +192,9 @@ def _base_factor_specs() -> list[FactorSpec]:
             CausalHMMRegimeProbabilityFactor("low"),
             CausalHMMRegimeProbabilityFactor("mid"),
             CausalHMMRegimeProbabilityFactor("high"),
+            CausalHMMRegimeConfidenceFactor(),
+            CausalHMMRegimeEntropyFactor(),
+            CausalHMMRegimeTransitionFactor(),
         )
     )
     return specs
@@ -417,6 +440,40 @@ def parse_args() -> argparse.Namespace:
         default=os.cpu_count() or 1,
         help="Number of parallel workers to use.",
     )
+    parser.add_argument(
+        "--write-session-path-factors",
+        action="store_true",
+        help="Also write causal minute-level session path factors.",
+    )
+    parser.add_argument(
+        "--session-path-only",
+        action="store_true",
+        help="Generate only session path factors; skip ordinary minute factors.",
+    )
+    parser.add_argument(
+        "--asset-type",
+        choices=("stock", "etf", "both"),
+        default="etf",
+        help="Asset type for session-path generation; ordinary factors remain ETF by default.",
+    )
+    parser.add_argument(
+        "--stock-minute-root",
+        type=Path,
+        default=DEFAULT_STOCK_MINUTE_ROOT,
+        help="Directory containing stock minute parquet files.",
+    )
+    parser.add_argument(
+        "--stock-session-path-output-root",
+        type=Path,
+        default=DEFAULT_STOCK_SESSION_PATH_OUTPUT_ROOT,
+    )
+    parser.add_argument(
+        "--etf-session-path-output-root",
+        type=Path,
+        default=DEFAULT_ETF_SESSION_PATH_OUTPUT_ROOT,
+    )
+    parser.add_argument("--date-from", type=str, default=None)
+    parser.add_argument("--date-to", type=str, default=None)
     return parser.parse_args()
 
 
@@ -564,12 +621,81 @@ def process_file(
     output_root: Path,
     overwrite: bool,
     window_profile: str = "base",
+    session_path_output_root: Path | None = None,
+    session_path_only: bool = False,
+    date_from: str | None = None,
+    date_to: str | None = None,
 ) -> tuple[str, Path, int | None, int | None]:
     output_path = output_root / input_path.name
-    if output_path.exists() and not overwrite:
+    write_session_path = session_path_output_root is not None
+    if (
+        output_path.exists()
+        and not overwrite
+        and not write_session_path
+        and not session_path_only
+    ):
         return ("skipped", output_path, None, None)
+    if (
+        write_session_path
+        and not overwrite
+        and date_from is not None
+        and date_to is not None
+        and session_path_output_root is not None
+    ):
+        expected_dates = set(
+            pd.date_range(date_from, date_to, freq="B").strftime("%Y-%m-%d")
+        )
+        session_output_path = session_path_output_root / input_path.name
+        if expected_dates and expected_dates.issubset(
+            existing_trade_dates(session_output_path)
+        ):
+            return ("skipped", output_path, None, None)
 
     raw_df = pd.read_parquet(input_path)
+    session_output_path = (
+        session_path_output_root / input_path.name
+        if session_path_output_root is not None
+        else None
+    )
+    if write_session_path or session_path_only:
+        requested = build_session_path_factor_frame_from_frame(
+            raw_df,
+            input_path.stem,
+            minute_path=input_path,
+        )
+        if date_from is not None:
+            requested = requested.loc[
+                requested["trade_date"].ge(
+                    pd.Timestamp(date_from).strftime("%Y-%m-%d")
+                )
+            ]
+        if date_to is not None:
+            requested = requested.loc[
+                requested["trade_date"].le(
+                    pd.Timestamp(date_to).strftime("%Y-%m-%d")
+                )
+            ]
+        if session_output_path is not None:
+            session_existing_dates = existing_trade_dates(session_output_path)
+            if overwrite:
+                session_requested = requested
+            else:
+                session_requested = requested.loc[
+                    ~requested["trade_date"].isin(session_existing_dates)
+                ]
+            if not session_requested.empty or not session_output_path.exists():
+                session_combined = merge_session_path_output(
+                    session_output_path,
+                    session_requested,
+                    overwrite,
+                )
+                session_path_output_root.mkdir(parents=True, exist_ok=True)
+                session_combined.to_parquet(session_output_path, index=False)
+
+    if session_path_only:
+        return ("written", session_output_path or output_path, len(requested), 7)
+    if output_path.exists() and not overwrite:
+        return ("skipped", output_path, None, None)
     df = normalize_minute_frame(raw_df)
     result_df = calculate_factor_frame(df, window_profile)
 
@@ -579,19 +705,141 @@ def process_file(
     return ("written", output_path, len(result_df), len(result_df.columns))
 
 
+def _normalize_date(value: str | None) -> str | None:
+    if value is None:
+        return None
+    parsed = pd.to_datetime(value, errors="raise")
+    return parsed.strftime("%Y-%m-%d")
+
+
+def _session_assets(asset_type: str) -> tuple[str, ...]:
+    if asset_type == "both":
+        return ("stock", "etf")
+    return (asset_type,)
+
+
+def _run_session_path_tasks(
+    tasks: list[tuple[str, Path, Path, str | None, str | None, bool]],
+    workers: int,
+) -> list[tuple[str, str]]:
+    failures: list[tuple[str, str]] = []
+    if workers <= 1:
+        for task in tasks:
+            symbol = task[0]
+            try:
+                output_path, row_count = process_session_path_only(*task)
+                LOGGER.info(
+                    "Wrote %s session-path rows for %s to %s",
+                    row_count,
+                    symbol,
+                    output_path,
+                )
+            except Exception as exc:  # noqa: BLE001
+                failures.append((symbol, str(exc)))
+                LOGGER.exception("Failed to process session-path factors for %s", symbol)
+        return failures
+
+    with ProcessPoolExecutor(max_workers=workers) as executor:
+        future_map = {
+            executor.submit(process_session_path_only, *task): task[0]
+            for task in tasks
+        }
+        for future in as_completed(future_map):
+            symbol = future_map[future]
+            try:
+                output_path, row_count = future.result()
+                LOGGER.info(
+                    "Wrote %s session-path rows for %s to %s",
+                    row_count,
+                    symbol,
+                    output_path,
+                )
+            except Exception as exc:  # noqa: BLE001
+                failures.append((symbol, str(exc)))
+                LOGGER.exception(
+                    "Failed to process session-path factors for %s", symbol
+                )
+    return failures
+
+
 def main() -> int:
     args = parse_args()
     configure_logging()
-    output_root = resolve_output_root(args.output_root, args.window_profile)
+    date_from = _normalize_date(args.date_from)
+    date_to = _normalize_date(args.date_to)
+    if date_from and date_to and date_from > date_to:
+        raise ValueError("--date-from cannot be later than --date-to")
+    if args.limit is not None and args.limit < 1:
+        raise ValueError("--limit must be positive")
+    if args.asset_type != "etf" and not (
+        args.session_path_only or args.write_session_path_factors
+    ):
+        raise ValueError("--asset-type stock/both requires session-path output flags")
 
-    files = discover_input_files(args.input_root, args.symbols)
-    if args.limit is not None:
-        files = files[: args.limit]
+    worker_count = max(1, args.workers)
+    session_roots = {
+        "stock": args.stock_session_path_output_root,
+        "etf": args.etf_session_path_output_root,
+    }
+    minute_roots = {
+        "stock": args.stock_minute_root,
+        "etf": args.input_root,
+    }
+    symbols = args.symbols
 
-    if not files:
-        LOGGER.warning("No parquet files matched the requested inputs.")
+    session_tasks: list[tuple[str, Path, Path, str | None, str | None, bool]] = []
+    for kind in _session_assets(args.asset_type):
+        if kind == "etf" and not (
+            args.session_path_only or args.write_session_path_factors
+        ):
+            continue
+        files = discover_input_files(minute_roots[kind], symbols)
+        if args.limit is not None:
+            files = files[: args.limit]
+        session_tasks.extend(
+            (
+                path.stem,
+                path,
+                session_roots[kind],
+                date_from,
+                date_to,
+                args.overwrite,
+            )
+            for path in files
+            if args.session_path_only or kind == "stock"
+        )
+
+    if args.session_path_only:
+        if not session_tasks:
+            LOGGER.warning("No parquet files matched the requested session-path inputs.")
+            return 0
+        failures = _run_session_path_tasks(session_tasks, worker_count)
+        if failures:
+            LOGGER.error("Completed session-path generation with %s failures", len(failures))
+            for symbol, reason in failures[:10]:
+                LOGGER.error("  %s -> %s", symbol, reason)
+            return 1
+        LOGGER.info("Completed session-path generation")
         return 0
 
+    if args.asset_type == "stock":
+        failures = _run_session_path_tasks(session_tasks, worker_count)
+        if failures:
+            LOGGER.error("Completed session-path generation with %s failures", len(failures))
+            for symbol, reason in failures[:10]:
+                LOGGER.error("  %s -> %s", symbol, reason)
+            return 1
+        LOGGER.info("Completed stock session-path generation")
+        return 0
+
+    files = discover_input_files(args.input_root, symbols)
+    if args.limit is not None:
+        files = files[: args.limit]
+    if not files:
+        LOGGER.warning("No ETF parquet files matched the requested inputs.")
+        return 0
+
+    output_root = resolve_output_root(args.output_root, args.window_profile)
     LOGGER.info("Processing %s ETF minute parquet files", len(files))
     LOGGER.info(
         "Using %s window profile with %s factor columns",
@@ -600,8 +848,11 @@ def main() -> int:
     )
 
     failures: list[tuple[Path, str]] = []
-    worker_count = max(1, args.workers)
-
+    session_output_root = (
+        args.etf_session_path_output_root
+        if args.write_session_path_factors
+        else None
+    )
     if worker_count == 1:
         for input_path in files:
             try:
@@ -610,6 +861,10 @@ def main() -> int:
                     output_root,
                     args.overwrite,
                     args.window_profile,
+                    session_output_root,
+                    False,
+                    date_from,
+                    date_to,
                 )
                 if status == "skipped":
                     LOGGER.info("Skipping existing output: %s", output_path)
@@ -633,6 +888,10 @@ def main() -> int:
                     output_root,
                     args.overwrite,
                     args.window_profile,
+                    session_output_root,
+                    False,
+                    date_from,
+                    date_to,
                 ): input_path
                 for input_path in files
             }
@@ -652,6 +911,17 @@ def main() -> int:
                 except Exception as exc:  # noqa: BLE001
                     failures.append((input_path, str(exc)))
                     LOGGER.exception("Failed to process %s", input_path)
+
+    if args.asset_type == "both" and args.write_session_path_factors:
+        stock_tasks = [
+            task
+            for task in session_tasks
+            if task[2] == args.stock_session_path_output_root
+        ]
+        failures.extend(
+            (Path(symbol), reason)
+            for symbol, reason in _run_session_path_tasks(stock_tasks, worker_count)
+        )
 
     if failures:
         LOGGER.error("Completed with %s failures", len(failures))

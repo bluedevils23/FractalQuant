@@ -24,7 +24,12 @@ from .price import (
     VolumePriceTrendFactor,
 )
 from .fractional import FractionalDiffLogCloseFactor
-from .regime import CausalHMMRegimeProbabilityFactor
+from .regime import (
+    CausalHMMRegimeConfidenceFactor,
+    CausalHMMRegimeEntropyFactor,
+    CausalHMMRegimeProbabilityFactor,
+    CausalHMMRegimeTransitionFactor,
+)
 from .volatility import (
     ATRFactor,
     AnnualizedVolatilityFactor,
@@ -91,6 +96,9 @@ __all__ = [
     "CCIFactor",
     "CMOFactor",
     "CausalHMMRegimeProbabilityFactor",
+    "CausalHMMRegimeConfidenceFactor",
+    "CausalHMMRegimeEntropyFactor",
+    "CausalHMMRegimeTransitionFactor",
     "EMAFactor",
     "FractionalDiffLogCloseFactor",
     "GarmanKlassVolatilityFactor",

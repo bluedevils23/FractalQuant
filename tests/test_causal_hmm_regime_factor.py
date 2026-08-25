@@ -5,9 +5,14 @@ from types import SimpleNamespace
 import numpy as np
 import pandas as pd
 from factor.regime import (
+    HMM_FEATURE_COLUMNS,
     HMM_REGIME_STATES,
+    CausalHMMRegimeConfidenceFactor,
+    CausalHMMRegimeEntropyFactor,
     CausalHMMRegimeProbabilityFactor,
+    CausalHMMRegimeTransitionFactor,
     _state_order_by_variance,
+    calculate_causal_hmm_regime_features,
     calculate_causal_hmm_regime_probabilities,
 )
 
@@ -70,6 +75,26 @@ def test_hmm_probabilities_use_only_preceding_days_and_sum_to_one() -> None:
         assert ((finite >= 0.0) & (finite <= 1.0)).all().all()
 
 
+def test_hmm_summary_features_are_bounded_and_strategy_ready() -> None:
+    frame = _minute_frame()
+    features = calculate_causal_hmm_regime_features(frame)
+
+    assert features.columns.tolist() == list(HMM_FEATURE_COLUMNS)
+    finite = features.dropna()
+    assert not finite.empty
+    assert np.allclose(
+        finite[[f"hmm_regime_prob_{state}_vol" for state in HMM_REGIME_STATES]]
+        .sum(axis=1),
+        1.0,
+    )
+    assert ((finite["hmm_regime_confidence"] >= 1 / 3) &
+            (finite["hmm_regime_confidence"] <= 1.0)).all()
+    assert ((finite["hmm_regime_entropy"] >= 0.0) &
+            (finite["hmm_regime_entropy"] <= 1.0)).all()
+    assert ((finite["hmm_regime_transition_score"] >= 0.0) &
+            (finite["hmm_regime_transition_score"] <= 1.0)).all()
+
+
 def test_hmm_filter_is_causal_within_current_day() -> None:
     frame = _minute_frame()
     changed = frame.copy()
@@ -99,13 +124,17 @@ def test_hmm_factor_cache_and_generator_registration() -> None:
     frame = _minute_frame(days=2)
     factors = [
         CausalHMMRegimeProbabilityFactor(state) for state in HMM_REGIME_STATES
+    ] + [
+        CausalHMMRegimeConfidenceFactor(),
+        CausalHMMRegimeEntropyFactor(),
+        CausalHMMRegimeTransitionFactor(),
     ]
     result = pd.concat([factor.calculate(frame) for factor in factors], axis=1)
     specs = build_factor_specs("base")
-    hmm_specs = [spec for spec in specs if spec.output_name in HMM_COLUMNS]
+    hmm_specs = [spec for spec in specs if spec.output_name in HMM_FEATURE_COLUMNS]
 
-    assert result.columns.tolist() == HMM_COLUMNS
-    assert [spec.output_name for spec in hmm_specs] == HMM_COLUMNS
+    assert result.columns.tolist() == list(HMM_FEATURE_COLUMNS)
+    assert [spec.output_name for spec in hmm_specs] == list(HMM_FEATURE_COLUMNS)
     assert all(not spec.reset_daily for spec in hmm_specs)
 
 
@@ -113,9 +142,15 @@ def test_etf_minute_generator_emits_cross_day_hmm_probabilities() -> None:
     frame = _minute_frame(days=2)
     result = calculate_factor_frame(frame, "base")
     second_day = frame.index.normalize().unique()[1]
-    probabilities = result.loc[frame.index.normalize() == second_day, HMM_COLUMNS]
+    probabilities = result.loc[
+        frame.index.normalize() == second_day, HMM_FEATURE_COLUMNS
+    ]
 
     assert probabilities.iloc[0].isna().all()
     finite = probabilities.dropna()
     assert not finite.empty
-    assert np.allclose(finite.sum(axis=1), 1.0)
+    assert np.allclose(
+        finite[[f"hmm_regime_prob_{state}_vol" for state in HMM_REGIME_STATES]]
+        .sum(axis=1),
+        1.0,
+    )
