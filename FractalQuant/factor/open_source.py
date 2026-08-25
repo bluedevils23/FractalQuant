@@ -2,17 +2,23 @@
 
 The research sources behind these factors use stock-level transaction data in
 some cases.  This module intentionally exposes only minute OHLCV/amount
-proxies that can be calculated from the local ETF data.  No order-book quote or
-bar is treated as a substitute for trade-level size-flow data.
+proxies that can be calculated from the local ETF data.  The module contains
+the original five signals plus state-cut extensions from the later reports.
+No order-book quote or bar is treated as a substitute for trade-level size-flow
+data.
 """
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterable
 from typing import Any
 
 import numpy as np
 import pandas as pd
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 OPEN_SOURCE_FACTOR_COLUMNS = (
@@ -21,6 +27,20 @@ OPEN_SOURCE_FACTOR_COLUMNS = (
     "kaiyuan_ideal_reversal_bar_proxy_m20",
     "kaiyuan_err_m20",
     "kaiyuan_tgd_m20",
+    "kaiyuan_ideal_turnover_m20_q25",
+    "kaiyuan_intraday_amplitude_cut_mean_m10_l20",
+    "kaiyuan_intraday_amplitude_cut_std_m10_l20",
+    "kaiyuan_volume_peak_count_m20",
+    "kaiyuan_volume_ridge_return_m20",
+    "kaiyuan_volume_valley_vwap_rel_m20",
+    "kaiyuan_volume_peak_interval_kurt_m20",
+    "kaiyuan_volume_peak_ridge_amount_ratio_m20",
+    "kaiyuan_volume_eruption_follow_ratio_m20",
+    "kaiyuan_price_peak_count_m20",
+    "kaiyuan_price_ridge_return_m20",
+    "kaiyuan_price_valley_vwap_rel_m20",
+    "kaiyuan_price_ridge_interval_skew_m20",
+    "kaiyuan_price_jump_amount_leadlag_corr_m20",
 )
 
 AUDIT_COLUMNS = (
@@ -55,13 +75,67 @@ RAW_COLUMNS = (
     "overnight_return",
     "valid_session_bars",
     "amount_available",
+    "ideal_turnover_raw",
+    "intraday_amplitude_cut_raw",
+    "volume_peak_count_raw",
+    "volume_ridge_return_raw",
+    "volume_valley_vwap_rel_raw",
+    "volume_peak_interval_kurt_raw",
+    "volume_peak_ridge_amount_ratio_raw",
+    "volume_eruption_follow_ratio_raw",
+    "price_peak_count_raw",
+    "price_ridge_return_raw",
+    "price_valley_vwap_rel_raw",
+    "price_ridge_interval_skew_raw",
+    "price_jump_amount_leadlag_corr_raw",
+)
+
+LEGACY_RAW_COLUMNS = (
+    "trade_date",
+    "ts_code",
+    "daily_close",
+    "daily_return",
+    "daily_amplitude",
+    "daily_amount",
+    "smart_money_vwap_gap_m10",
+    "smart_money_valid_days_m10",
+    "extreme_return_m20",
+    "extreme_prior_return_m20",
+    "gu",
+    "gd",
+    "avg_up_return",
+    "avg_down_return",
+    "r1",
+    "r2",
+    "overnight_return",
+    "valid_session_bars",
+    "amount_available",
 )
 
 SESSION_BAR_COUNT = 240
 SMART_MONEY_WINDOW = 10
 FACTOR_WINDOW = 20
+# The prior-bar extreme return is NaN whenever the extreme minute lands on the
+# first tradable bar of a session (no preceding bar). Requiring a full window of
+# non-NaN values leaves extreme_prior_return_m20 permanently empty, which in turn
+# kills kaiyuan_err_m20. Use a relaxed minimum so isolated NaN days are skipped
+# in the average rather than invalidating the whole window.
+EXTREME_RETURN_MIN_PERIODS = FACTOR_WINDOW // 2
 SMART_MONEY_VOLUME_FRACTION = 0.20
 MIN_TGD_CROSS_SECTION = 20
+STATE_HISTORY_WINDOW = 20
+STATE_FACTOR_WINDOW = 20
+AMPLITUDE_FACTOR_WINDOW = 10
+STATE_FRACTION = 0.20
+# The state/amplitude factors average an event-conditional daily metric (mean
+# return on ridge bars, peak counts, amplitude cut, ...). On many days the event
+# simply does not occur, so the daily raw is legitimately NaN. Requiring a full
+# window of non-NaN values (min_periods == window) means one eventless day blanks
+# the whole rolling window, which drives sparse factors like the ridge metrics to
+# near-zero coverage. Use a relaxed half-window minimum so the factor is the
+# average over the observed events rather than an all-or-nothing window.
+STATE_ROLLING_MIN_PERIODS = STATE_FACTOR_WINDOW // 2
+AMPLITUDE_ROLLING_MIN_PERIODS = AMPLITUDE_FACTOR_WINDOW // 2
 
 
 def normalize_minute_frame(
@@ -220,6 +294,205 @@ def _smart_money_gap_for_sessions(
     return smart_vwap / all_vwap - 1.0, len(rows)
 
 
+def _session_segments(values: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Return the morning and afternoon portions of a 240-bar session."""
+
+    return values[:120], values[120:]
+
+
+def _shift_with_session_boundary(values: np.ndarray, offset: int) -> np.ndarray:
+    """Shift a 240-bar vector without connecting 11:30 to 13:01."""
+
+    result = np.full(values.shape, np.nan, dtype=float)
+    if offset == 0:
+        return values.astype(float, copy=True)
+    for start, end in ((0, 120), (120, 240)):
+        segment = values[start:end]
+        if abs(offset) < len(segment):
+            if offset > 0:
+                result[start + offset : end] = segment[: len(segment) - offset]
+            else:
+                shift = -offset
+                result[start : end - shift] = segment[shift:]
+    return result
+
+
+def _history_zscore(
+    history: list[pd.DataFrame],
+    current: pd.DataFrame,
+    column: str,
+    *,
+    minimum_history: int = STATE_HISTORY_WINDOW,
+) -> np.ndarray:
+    if len(current) != SESSION_BAR_COUNT or len(history) < minimum_history:
+        return np.full(SESSION_BAR_COUNT, np.nan, dtype=float)
+    valid_history = [day for day in history[-minimum_history:] if len(day) == SESSION_BAR_COUNT]
+    if len(valid_history) < minimum_history:
+        return np.full(SESSION_BAR_COUNT, np.nan, dtype=float)
+    matrix = np.vstack(
+        [pd.to_numeric(day[column], errors="coerce").to_numpy(dtype=float) for day in valid_history]
+    )
+    current_values = pd.to_numeric(current[column], errors="coerce").to_numpy(dtype=float)
+    mean = np.nanmean(matrix, axis=0)
+    std = np.nanstd(matrix, axis=0, ddof=1)
+    count = np.sum(np.isfinite(matrix), axis=0)
+    result = np.full(SESSION_BAR_COUNT, np.nan, dtype=float)
+    valid = np.isfinite(current_values) & np.isfinite(mean) & (std > 0) & (count >= minimum_history)
+    result[valid] = (current_values[valid] - mean[valid]) / std[valid]
+    return result
+
+
+def _finite_mean(values: np.ndarray) -> float:
+    valid = values[np.isfinite(values)]
+    return float(valid.mean()) if len(valid) else np.nan
+
+
+def _interval_stat(mask: np.ndarray, statistic: str) -> float:
+    positions: list[np.ndarray] = []
+    for start, end in ((0, 120), (120, 240)):
+        positions.append(np.flatnonzero(mask[start:end]) + start)
+    selected = np.concatenate(positions) if positions else np.array([], dtype=int)
+    if len(selected) < 3:
+        return np.nan
+    gaps = np.diff(selected).astype(float)
+    if len(gaps) < 2:
+        return np.nan
+    series = pd.Series(gaps)
+    value = series.kurt() if statistic == "kurt" else series.skew()
+    return float(value) if pd.notna(value) else np.nan
+
+
+def _safe_array_corr(left: np.ndarray, right: np.ndarray) -> float:
+    valid = np.isfinite(left) & np.isfinite(right)
+    if valid.sum() < 3 or np.unique(left[valid]).size < 2 or np.unique(right[valid]).size < 2:
+        return np.nan
+    return float(np.corrcoef(left[valid], right[valid])[0, 1])
+
+
+def _state_daily_metrics(
+    current: pd.DataFrame,
+    history: list[pd.DataFrame],
+) -> dict[str, float]:
+    """Build daily peak/ridge/valley and amplitude-cut raw metrics."""
+
+    missing = {
+        "ideal_turnover_raw": np.nan,
+        "intraday_amplitude_cut_raw": np.nan,
+        "volume_peak_count_raw": np.nan,
+        "volume_ridge_return_raw": np.nan,
+        "volume_valley_vwap_rel_raw": np.nan,
+        "volume_peak_interval_kurt_raw": np.nan,
+        "volume_peak_ridge_amount_ratio_raw": np.nan,
+        "volume_eruption_follow_ratio_raw": np.nan,
+        "price_peak_count_raw": np.nan,
+        "price_ridge_return_raw": np.nan,
+        "price_valley_vwap_rel_raw": np.nan,
+        "price_ridge_interval_skew_raw": np.nan,
+        "price_jump_amount_leadlag_corr_raw": np.nan,
+    }
+    if len(current) != SESSION_BAR_COUNT:
+        return missing
+    volume_z = _history_zscore(history, current, "volume")
+    amplitude_z = _history_zscore(history, current, "_minute_amplitude")
+    if not np.isfinite(volume_z).any() or not np.isfinite(amplitude_z).any():
+        return missing
+
+    returns = current["_minute_return"].to_numpy(dtype=float)
+    amplitude = current["_minute_amplitude"].to_numpy(dtype=float)
+    if "amount" in current.columns:
+        amount = current["amount"].to_numpy(dtype=float)
+    else:
+        amount = np.full(SESSION_BAR_COUNT, np.nan, dtype=float)
+    close = current["close"].to_numpy(dtype=float)
+    volume = current["volume"].to_numpy(dtype=float)
+    eruption = np.isfinite(volume_z) & (volume_z > 1.0)
+    volume_left = _shift_with_session_boundary(eruption.astype(float), 1) == 1.0
+    volume_right = _shift_with_session_boundary(eruption.astype(float), -1) == 1.0
+    volume_peak = eruption & ~volume_left & ~volume_right
+    volume_ridge = eruption & (volume_left | volume_right)
+    volume_valley = np.isfinite(volume_z) & ~eruption
+
+    def _weighted_vwap(mask: np.ndarray) -> float:
+        valid = mask & np.isfinite(close) & np.isfinite(volume) & (volume > 0)
+        total = volume[valid].sum()
+        return float((close[valid] * volume[valid]).sum() / total) if total > 0 else np.nan
+
+    day_vwap = _weighted_vwap(np.isfinite(close))
+    valley_vwap = _weighted_vwap(volume_valley)
+    amount_safe = np.where(np.isfinite(amount) & (amount > 0), amount, np.nan)
+    ridge_amount = np.nansum(np.where(volume_ridge, amount_safe, np.nan))
+    peak_amount = np.nansum(np.where(volume_peak, amount_safe, np.nan))
+    eruption_amount = np.nansum(np.where(eruption, amount_safe, np.nan))
+    next_amount = _shift_with_session_boundary(amount_safe, -1)
+
+    missing.update(
+        {
+            "volume_peak_count_raw": float(volume_peak.sum()),
+            "volume_ridge_return_raw": _finite_mean(np.where(volume_ridge, returns, np.nan)),
+            "volume_valley_vwap_rel_raw": (
+                valley_vwap / day_vwap - 1.0
+                if np.isfinite(valley_vwap) and np.isfinite(day_vwap) and day_vwap > 0
+                else np.nan
+            ),
+            "volume_peak_interval_kurt_raw": _interval_stat(volume_peak, "kurt"),
+            "volume_peak_ridge_amount_ratio_raw": (
+                float(peak_amount / ridge_amount) if ridge_amount > 0 else np.nan
+            ),
+            "volume_eruption_follow_ratio_raw": (
+                float(np.nansum(np.where(eruption, next_amount, np.nan)) / eruption_amount)
+                if eruption_amount > 0
+                else np.nan
+            ),
+        }
+    )
+
+    local_prev = _shift_with_session_boundary(returns, 1)
+    local_next = _shift_with_session_boundary(returns, -1)
+    jump = np.isfinite(amplitude_z) & (amplitude_z > 1.0)
+    high_local = (local_prev > 0) & (local_next > 0)
+    low_local = (local_prev < 0) & (local_next < 0)
+    previous_low = _shift_with_session_boundary(current["low"].to_numpy(dtype=float), 1)
+    next_low = _shift_with_session_boundary(current["low"].to_numpy(dtype=float), -1)
+    previous_high = _shift_with_session_boundary(current["high"].to_numpy(dtype=float), 1)
+    next_high = _shift_with_session_boundary(current["high"].to_numpy(dtype=float), -1)
+    gap = (np.maximum(previous_low, next_low) > np.minimum(previous_high, next_high))
+    price_peak = jump & high_local & ~gap
+    price_ridge = jump & low_local & gap
+    price_valley = np.isfinite(amplitude_z) & ~jump
+    jump_next_amount = _shift_with_session_boundary(amount_safe, -1)
+    jump_amount = np.where(jump, amount_safe, np.nan)
+    jump_follow_amount = np.where(jump, jump_next_amount, np.nan)
+    price_valley_vwap = _weighted_vwap(price_valley)
+    price_ridge_positions = price_ridge
+    missing.update(
+        {
+            "price_peak_count_raw": float(price_peak.sum()),
+            "price_ridge_return_raw": _finite_mean(np.where(price_ridge, returns, np.nan)),
+            "price_valley_vwap_rel_raw": (
+                price_valley_vwap / day_vwap - 1.0
+                if np.isfinite(price_valley_vwap) and np.isfinite(day_vwap) and day_vwap > 0
+                else np.nan
+            ),
+            "price_ridge_interval_skew_raw": _interval_stat(price_ridge_positions, "skew"),
+            "price_jump_amount_leadlag_corr_raw": _safe_array_corr(jump_amount, jump_follow_amount),
+        }
+    )
+
+    finite_returns = np.isfinite(returns) & np.isfinite(amplitude)
+    if finite_returns.sum() >= 4:
+        count = max(1, int(np.ceil(finite_returns.sum() * STATE_FRACTION)))
+        order = np.argsort(np.where(finite_returns, returns, np.nan))
+        low = order[:count]
+        high = order[-count:]
+        low = low[np.isfinite(returns[low])]
+        high = high[np.isfinite(returns[high])]
+        if len(low) and len(high):
+            missing["intraday_amplitude_cut_raw"] = float(
+                np.mean(amplitude[high]) - np.mean(amplitude[low])
+            )
+    return missing
+
+
 def _rolling_cut_difference(
     values: pd.Series,
     state: pd.Series,
@@ -261,7 +534,9 @@ def build_daily_raw_features(
     dates: list[pd.Timestamp] = []
     for trade_date, raw_day in frame.groupby(frame.index.normalize(), sort=True):
         day = _positive_frame(raw_day)
-        session = _regular_session_frame(day)
+        session = _regular_session_frame(day).copy()
+        session["_minute_return"] = _daily_return_series(session)
+        session["_minute_amplitude"] = session["high"].div(session["low"]).sub(1.0)
         sessions.append(session)
         dates.append(pd.Timestamp(trade_date))
         close = day["close"].dropna()
@@ -311,6 +586,8 @@ def build_daily_raw_features(
                 "r1": r1,
                 "r2": r2,
                 "overnight_return": np.nan,
+                "_extreme_return_raw": extreme_return,
+                "_extreme_prior_return_raw": prior_return,
                 "valid_session_bars": int(len(session)),
                 "amount_available": amount_available,
                 "_session_open": session_open,
@@ -320,24 +597,14 @@ def build_daily_raw_features(
     result = pd.DataFrame(daily_records).sort_values("trade_date").reset_index(drop=True)
     result["daily_return"] = result["daily_close"].div(result["daily_close"].shift(1)).sub(1.0)
     result["overnight_return"] = result["_session_open"].div(result["daily_close"].shift(1)).sub(1.0)
-    raw_extreme: list[float] = []
-    raw_prior: list[float] = []
-    for session in sessions:
-        if len(session) == SESSION_BAR_COUNT:
-            raw_extreme.append(_extreme_returns(_daily_return_series(session))[0])
-            raw_prior.append(_extreme_returns(_daily_return_series(session))[1])
-        else:
-            raw_extreme.append(np.nan)
-            raw_prior.append(np.nan)
-    result["_extreme_return_raw"] = raw_extreme
-    result["_extreme_prior_return_raw"] = raw_prior
+    extreme_min_periods = min(factor_window, max(1, EXTREME_RETURN_MIN_PERIODS))
     result["extreme_return_m20"] = (
         result.groupby("ts_code", sort=False)["_extreme_return_raw"]
-        .transform(lambda series: series.rolling(factor_window, min_periods=factor_window).mean())
+        .transform(lambda series: series.rolling(factor_window, min_periods=extreme_min_periods).mean())
     )
     result["extreme_prior_return_m20"] = (
         result.groupby("ts_code", sort=False)["_extreme_prior_return_raw"]
-        .transform(lambda series: series.rolling(factor_window, min_periods=factor_window).mean())
+        .transform(lambda series: series.rolling(factor_window, min_periods=extreme_min_periods).mean())
     )
 
     ideal_amplitude = _rolling_cut_difference(
@@ -347,6 +614,29 @@ def build_daily_raw_features(
     result["_ideal_reversal"] = _rolling_cut_difference(
         result["daily_return"], result["daily_amount"], factor_window, 0.5
     )
+    result["ideal_turnover_raw"] = _rolling_cut_difference(
+        result["daily_amount"], result["daily_close"], factor_window, 0.25
+    )
+
+    state_metrics = [
+        _state_daily_metrics(session, sessions[:index])
+        for index, session in enumerate(sessions)
+    ]
+    for column in (
+        "intraday_amplitude_cut_raw",
+        "volume_peak_count_raw",
+        "volume_ridge_return_raw",
+        "volume_valley_vwap_rel_raw",
+        "volume_peak_interval_kurt_raw",
+        "volume_peak_ridge_amount_ratio_raw",
+        "volume_eruption_follow_ratio_raw",
+        "price_peak_count_raw",
+        "price_ridge_return_raw",
+        "price_valley_vwap_rel_raw",
+        "price_ridge_interval_skew_raw",
+        "price_jump_amount_leadlag_corr_raw",
+    ):
+        result[column] = [metrics[column] for metrics in state_metrics]
 
     smart_gaps: list[float] = []
     smart_days: list[int] = []
@@ -407,16 +697,49 @@ def build_open_source_factor_panel(
 ) -> pd.DataFrame:
     """Add the five open-source factors to a combined daily raw panel."""
 
-    required = set(RAW_COLUMNS)
+    required = set(LEGACY_RAW_COLUMNS)
     missing = sorted(required - set(raw_panel.columns))
     if missing:
         raise ValueError(f"Missing raw open-source columns: {missing}")
     frame = raw_panel.copy()
+    for column in RAW_COLUMNS:
+        if column not in frame.columns:
+            frame[column] = np.nan
     frame["trade_date"] = pd.to_datetime(frame["trade_date"], errors="coerce").dt.normalize()
     frame = frame.sort_values(["ts_code", "trade_date"], kind="mergesort").reset_index(drop=True)
     frame["kaiyuan_ideal_amplitude_m20_q25"] = frame["_ideal_amplitude"]
     frame["kaiyuan_ideal_reversal_bar_proxy_m20"] = frame["_ideal_reversal"]
     frame["kaiyuan_smart_money_vwap_gap_beta01_m10"] = frame["smart_money_vwap_gap_m10"]
+    frame["kaiyuan_ideal_turnover_m20_q25"] = frame["ideal_turnover_raw"]
+
+    frame["kaiyuan_intraday_amplitude_cut_mean_m10_l20"] = frame.groupby(
+        "ts_code", sort=False
+    )["intraday_amplitude_cut_raw"].transform(
+        lambda s: s.rolling(AMPLITUDE_FACTOR_WINDOW, min_periods=AMPLITUDE_ROLLING_MIN_PERIODS).mean()
+    )
+    frame["kaiyuan_intraday_amplitude_cut_std_m10_l20"] = frame.groupby(
+        "ts_code", sort=False
+    )["intraday_amplitude_cut_raw"].transform(
+        lambda s: s.rolling(AMPLITUDE_FACTOR_WINDOW, min_periods=AMPLITUDE_ROLLING_MIN_PERIODS).std()
+    )
+
+    state_rolling = {
+        "volume_peak_count_raw": "kaiyuan_volume_peak_count_m20",
+        "volume_ridge_return_raw": "kaiyuan_volume_ridge_return_m20",
+        "volume_valley_vwap_rel_raw": "kaiyuan_volume_valley_vwap_rel_m20",
+        "volume_peak_interval_kurt_raw": "kaiyuan_volume_peak_interval_kurt_m20",
+        "volume_peak_ridge_amount_ratio_raw": "kaiyuan_volume_peak_ridge_amount_ratio_m20",
+        "volume_eruption_follow_ratio_raw": "kaiyuan_volume_eruption_follow_ratio_m20",
+        "price_peak_count_raw": "kaiyuan_price_peak_count_m20",
+        "price_ridge_return_raw": "kaiyuan_price_ridge_return_m20",
+        "price_valley_vwap_rel_raw": "kaiyuan_price_valley_vwap_rel_m20",
+        "price_ridge_interval_skew_raw": "kaiyuan_price_ridge_interval_skew_m20",
+        "price_jump_amount_leadlag_corr_raw": "kaiyuan_price_jump_amount_leadlag_corr_m20",
+    }
+    for raw_name, factor_name in state_rolling.items():
+        frame[factor_name] = frame.groupby("ts_code", sort=False)[raw_name].transform(
+            lambda s: s.rolling(STATE_FACTOR_WINDOW, min_periods=STATE_ROLLING_MIN_PERIODS).mean()
+        )
 
     extreme_rank = _cross_section_rank(frame, "extreme_return_m20")
     prior_rank = _cross_section_rank(frame, "extreme_prior_return_m20")
@@ -452,6 +775,29 @@ def build_open_source_factor_panel(
         "_tgd_daily_residual"
     ].transform(lambda s: s.rolling(factor_window, min_periods=factor_window).mean())
     frame.loc[frame["tgd_cross_section_count"] < min_tgd_cross_section, "kaiyuan_tgd_m20"] = np.nan
+
+    max_cross_section = int(frame["tgd_cross_section_count"].max() or 0)
+    if max_cross_section < min_tgd_cross_section:
+        LOGGER.warning(
+            "TGD cross-section never reached the minimum (max=%s, required=%s); "
+            "kaiyuan_tgd_m20 will be entirely NaN. Run more symbols together or "
+            "lower --min-tgd-cross-section.",
+            max_cross_section,
+            min_tgd_cross_section,
+        )
+
+    dead_factors = [
+        column
+        for column in OPEN_SOURCE_FACTOR_COLUMNS
+        if column in frame.columns and not frame[column].notna().any()
+    ]
+    if dead_factors:
+        LOGGER.warning(
+            "The following open-source factors are entirely NaN on this batch: %s. "
+            "This usually means the underlying event is too sparse for the rolling "
+            "window (e.g. price-ridge metrics) or the batch is too small.",
+            ", ".join(dead_factors),
+        )
 
     source_level = frame.get("_source_level", "minute_ohlcv_proxy")
     frame["source_level"] = source_level
