@@ -10,10 +10,25 @@ substitutes quote or OHLCV information for missing lifecycle fields.
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+
+try:
+    from numba import jit
+    HAS_NUMBA = True
+except ImportError:
+    HAS_NUMBA = False
+    def jit(*args, **kwargs):
+        """Fallback decorator when numba is not available."""
+        def decorator(func):
+            return func
+        return decorator if args and callable(args[0]) else decorator
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 TICK_FACTOR_COLUMNS = (
@@ -800,6 +815,88 @@ def build_daily_flow_raw_features(
     return result[columns].sort_values("trade_date").reset_index(drop=True)
 
 
+@jit(nopython=True, cache=True)
+def _rolling_flow_ratio_kernel(
+    buy_values: np.ndarray,
+    sell_values: np.ndarray,
+    window: int,
+    signed_denominator: bool,
+) -> np.ndarray:
+    """Numba-optimized kernel for rolling flow ratio computation."""
+    n = len(buy_values)
+    result = np.full(n, np.nan, dtype=np.float64)
+    for end in range(window - 1, n):
+        start = end - window + 1
+        b = buy_values[start : end + 1]
+        s = sell_values[start : end + 1]
+        # Check all finite
+        all_finite = True
+        for i in range(len(b)):
+            if not np.isfinite(b[i]) or not np.isfinite(s[i]):
+                all_finite = False
+                break
+        if not all_finite:
+            continue
+        net_sum = 0.0
+        if signed_denominator:
+            abs_net_sum = 0.0
+            for i in range(len(b)):
+                net = b[i] - s[i]
+                net_sum += net
+                abs_net_sum += abs(net)
+            if abs_net_sum > 0:
+                result[end] = net_sum / abs_net_sum
+        else:
+            total_sum = 0.0
+            for i in range(len(b)):
+                net_sum += b[i] - s[i]
+                total_sum += b[i] + s[i]
+            if total_sum > 0:
+                result[end] = net_sum / total_sum
+    return result
+
+
+@jit(nopython=True, cache=True)
+def _rolling_conditional_act_kernel(
+    buy_values: np.ndarray,
+    sell_values: np.ndarray,
+    return_values: np.ndarray,
+    window: int,
+    fraction: float,
+) -> np.ndarray:
+    """Numba-optimized kernel for rolling conditional ACT computation."""
+    n = len(buy_values)
+    result = np.full(n, np.nan, dtype=np.float64)
+    group_size = max(1, int(np.ceil(window * fraction)))
+    for end in range(window - 1, n):
+        start = end - window + 1
+        b = buy_values[start : end + 1]
+        s = sell_values[start : end + 1]
+        r = return_values[start : end + 1]
+        # Check all finite
+        all_finite = True
+        for i in range(len(b)):
+            if not (np.isfinite(b[i]) and np.isfinite(s[i]) and np.isfinite(r[i])):
+                all_finite = False
+                break
+        if not all_finite:
+            continue
+        # Use argpartition for O(n) top-k instead of full sort
+        if group_size >= len(r):
+            selected = np.arange(len(r))
+        else:
+            # argpartition not available in numba nopython, use argsort
+            selected = np.argsort(r)[-group_size:]
+        numerator = 0.0
+        denominator = 0.0
+        for i in selected:
+            numerator += b[i] - s[i]
+            denominator += b[i] + s[i]
+        if denominator > 0:
+            result[end] = numerator / denominator
+    return result
+
+
 def _rolling_flow_ratio(
     buy: pd.Series,
     sell: pd.Series,
@@ -807,9 +904,15 @@ def _rolling_flow_ratio(
     *,
     signed_denominator: bool = False,
 ) -> pd.Series:
-    result = np.full(len(buy), np.nan, dtype=float)
     buy_values = pd.to_numeric(buy, errors="coerce").to_numpy(dtype=float)
     sell_values = pd.to_numeric(sell, errors="coerce").to_numpy(dtype=float)
+
+    if HAS_NUMBA:
+        result = _rolling_flow_ratio_kernel(buy_values, sell_values, window, signed_denominator)
+        return pd.Series(result, index=buy.index)
+
+    # Fallback: manual loop (pandas rolling.apply doesn't work well for multi-column logic)
+    result = np.full(len(buy_values), np.nan, dtype=float)
     for end in range(window - 1, len(buy_values)):
         start = end - window + 1
         b = buy_values[start : end + 1]
@@ -817,9 +920,13 @@ def _rolling_flow_ratio(
         if not (np.isfinite(b).all() and np.isfinite(s).all()):
             continue
         net = b - s
-        denominator = np.abs(net).sum() if signed_denominator else (b + s).sum()
+        net_sum = net.sum()
+        if signed_denominator:
+            denominator = np.abs(net).sum()
+        else:
+            denominator = (b + s).sum()
         if denominator > 0:
-            result[end] = float(net.sum() / denominator)
+            result[end] = float(net_sum / denominator)
     return pd.Series(result, index=buy.index)
 
 
@@ -831,10 +938,16 @@ def _rolling_conditional_act(
     window: int,
     fraction: float,
 ) -> pd.Series:
-    result = np.full(len(frame), np.nan, dtype=float)
     b_values = pd.to_numeric(buy, errors="coerce").to_numpy(dtype=float)
     s_values = pd.to_numeric(sell, errors="coerce").to_numpy(dtype=float)
     r_values = pd.to_numeric(returns, errors="coerce").to_numpy(dtype=float)
+
+    if HAS_NUMBA:
+        result = _rolling_conditional_act_kernel(b_values, s_values, r_values, window, fraction)
+        return pd.Series(result, index=frame.index)
+
+    # Fallback: manual loop
+    result = np.full(len(frame), np.nan, dtype=float)
     group_size = max(1, int(np.ceil(window * fraction)))
     for end in range(window - 1, len(frame)):
         start = end - window + 1
@@ -843,10 +956,11 @@ def _rolling_conditional_act(
         r = r_values[start : end + 1]
         if not (np.isfinite(b).all() and np.isfinite(s).all() and np.isfinite(r).all()):
             continue
-        selected = np.argsort(r, kind="mergesort")[-group_size:]
+        selected = np.argsort(r)[-group_size:]
+        numerator = (b[selected] - s[selected]).sum()
         denominator = (b[selected] + s[selected]).sum()
         if denominator > 0:
-            result[end] = float((b[selected] - s[selected]).sum() / denominator)
+            result[end] = float(numerator / denominator)
     return pd.Series(result, index=frame.index)
 
 
@@ -1019,8 +1133,11 @@ def build_open_source_tick_factor_panel(
     frame["kaiyuan_trade_notional_return_corr_m20"] = np.nan
     for factor_name in TICK_FACTOR_COLUMNS[12:]:
         frame[factor_name] = np.nan
+
+    # Merged groupby loop: compute all per-symbol rolling factors in one pass
     for _, group in frame.groupby("ts_code", sort=False):
         indices = group.index
+        # Block 1: ideal reversal and correlation factors
         frame.loc[indices, "kaiyuan_ideal_reversal_tick_notional_m20"] = (
             _rolling_cut_difference(
                 group["daily_return"],
@@ -1040,28 +1157,8 @@ def build_open_source_tick_factor_panel(
         frame.loc[indices, "kaiyuan_trade_notional_return_corr_m20"] = _rolling_corr(
             group["daily_return"], group["daily_mean_trade_notional"], window
         ).to_numpy()
-    for column in (
-        "daily_order_lms",
-        "daily_order_memo",
-        "daily_order_island_mean",
-        "daily_order_island_std",
-        "valid_order_events",
-        "order_side_coverage",
-        "order_id_available",
-    ):
-        if column not in frame.columns:
-            frame[column] = np.nan
-    for raw_name, factor_name in {
-        "daily_order_lms": "kaiyuan_order_lms_m20",
-        "daily_order_memo": "kaiyuan_order_memo_m20",
-        "daily_order_island_mean": "kaiyuan_order_island_mean_m20",
-        "daily_order_island_std": "kaiyuan_order_island_std_m20",
-    }.items():
-        frame[factor_name] = frame.groupby("ts_code", sort=False)[raw_name].transform(
-            lambda values: values.rolling(window, min_periods=window).mean()
-        )
-    for _, group in frame.groupby("ts_code", sort=False):
-        indices = group.index
+
+        # Block 2: flow ratio factors (originally second loop)
         frame.loc[indices, "kaiyuan_large_flow_s3_m20"] = _rolling_flow_ratio(
             group["daily_flow_large_buy"],
             group["daily_flow_large_sell"],
@@ -1103,6 +1200,30 @@ def build_open_source_tick_factor_panel(
                 window,
                 0.10,
             ).to_numpy()
+        )
+
+        # Block 3: modified flow factors (originally third loop, executed after cross-section ops below)
+        # These depend on _mod_ge20k_buy/sell and _mod_power_buy/sell computed later
+        # Will be filled in a separate minimal loop after cross-section operations
+    for column in (
+        "daily_order_lms",
+        "daily_order_memo",
+        "daily_order_island_mean",
+        "daily_order_island_std",
+        "valid_order_events",
+        "order_side_coverage",
+        "order_id_available",
+    ):
+        if column not in frame.columns:
+            frame[column] = np.nan
+    for raw_name, factor_name in {
+        "daily_order_lms": "kaiyuan_order_lms_m20",
+        "daily_order_memo": "kaiyuan_order_memo_m20",
+        "daily_order_island_mean": "kaiyuan_order_island_mean_m20",
+        "daily_order_island_std": "kaiyuan_order_island_std_m20",
+    }.items():
+        frame[factor_name] = frame.groupby("ts_code", sort=False)[raw_name].transform(
+            lambda values: values.rolling(window, min_periods=window).mean()
         )
 
     conditional_specs = (
@@ -1194,6 +1315,10 @@ def build_open_source_tick_factor_panel(
     frame["_mod_ge20k_sell"] = ge20_sell
     frame["_mod_power_buy"] = power_buy
     frame["_mod_power_sell"] = power_sell
+
+    # Separate minimal loop for modified flow factors: these depend on cross-section
+    # residuals computed above (_mod_ge20k_*, _mod_power_*), so cannot be merged
+    # into the main per-symbol loop earlier
     for _, group in frame.groupby("ts_code", sort=False):
         indices = group.index
         frame.loc[indices, "kaiyuan_nir_mod_ge20k_cs_m20"] = _rolling_flow_ratio(
@@ -1206,6 +1331,7 @@ def build_open_source_tick_factor_panel(
             group["_mod_power_sell"],
             window,
         ).to_numpy()
+
     frame["flow_cross_section_count"] = np.maximum.reduce(
         [
             mod_count.to_numpy(dtype=float),
@@ -1217,6 +1343,15 @@ def build_open_source_tick_factor_panel(
             evs_count.to_numpy(dtype=float),
         ]
     )
+    max_cross_section = float(frame["flow_cross_section_count"].max())
+    if max_cross_section < 10:
+        LOGGER.warning(
+            "Cross-section sample count for flow residual factors is very low "
+            "(max = %.0f). These factors may be unreliable. Consider running with "
+            "more symbols or a longer date range.",
+            max_cross_section,
+        )
+
     frame["flow_s3_resid_r2"] = large_r2
     frame["flow_nir_mod_r2"] = mod_r2
     frame["flow_cnir_r2"] = cnir_r2
