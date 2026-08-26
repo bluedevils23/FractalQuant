@@ -885,8 +885,10 @@ def _rolling_conditional_act_kernel(
         if group_size >= len(r):
             selected = np.arange(len(r))
         else:
-            # argpartition not available in numba nopython, use argsort
-            selected = np.argsort(r)[-group_size:]
+            # Keep the historical stable tie-breaking semantics. Numba supports
+            # the mergesort kind in nopython mode, so equal returns select the
+            # same observations as the pre-optimization implementation.
+            selected = np.argsort(r, kind="mergesort")[-group_size:]
         numerator = 0.0
         denominator = 0.0
         for i in selected:
@@ -956,7 +958,7 @@ def _rolling_conditional_act(
         r = r_values[start : end + 1]
         if not (np.isfinite(b).all() and np.isfinite(s).all() and np.isfinite(r).all()):
             continue
-        selected = np.argsort(r)[-group_size:]
+        selected = np.argsort(r, kind="mergesort")[-group_size:]
         numerator = (b[selected] - s[selected]).sum()
         denominator = (b[selected] + s[selected]).sum()
         if denominator > 0:
