@@ -1381,7 +1381,8 @@ def _apply_event_factors(
 
     # Apply transaction/order ratio factors
     _apply_transaction_order_ratio_factors(
-        row, trade_day, events, stage1_adds, stage1_cancels, stage2_adds
+        row, trade_day, events, stage1_adds, stage1_cancels, stage2_adds,
+        reconstruction_ok,
     )
 
     if not reconstruction_ok:
@@ -1454,8 +1455,12 @@ def _apply_transaction_order_ratio_factors(
     stage1_adds: pd.DataFrame,
     stage1_cancels: pd.DataFrame,
     stage2_adds: pd.DataFrame,
+    reconstruction_ok: bool = True,
 ) -> None:
     """Calculate transaction/order ratio factors based on events data."""
+
+    if not reconstruction_ok:
+        return
 
     # Get matched volume (final transaction volume)
     matched_volume = row.get("auction_matched_volume", np.nan)
@@ -1479,7 +1484,6 @@ def _apply_transaction_order_ratio_factors(
 
     # Calculate total order volumes
     total_add_qty = float(stage1_adds["quantity"].sum() + stage2_adds["quantity"].sum())
-    total_cancel_qty = float(stage1_cancels["quantity"].sum())
     stage1_net_buy = stage1_buy_qty - stage1_buy_cancel_qty
     stage1_net_sell = stage1_sell_qty - stage1_sell_cancel_qty
     stage1_net_qty = stage1_net_buy + stage1_net_sell
@@ -1642,6 +1646,14 @@ def calculate_daily_auction_factors(
         row["auction_overnight_return"] = _safe_return(
             float(match_row["open_price"]), previous_close
         )
+        if event_reconstruction_ok and events is not None:
+            stage1_events = _event_slice(events, "A", start_time, split_time)
+            stage1_cancels = _event_slice(events, "C", start_time, split_time)
+            stage2_events = _event_slice(events, "A", split_time, nominal_end_time)
+            _apply_transaction_order_ratio_factors(
+                row, trade_day, events, stage1_events, stage1_cancels,
+                stage2_events, True,
+            )
     elif not auction.empty or (events is not None and not events.empty):
         row["available_time"] = nominal_end_time
 
@@ -1882,7 +1894,8 @@ def _apply_large_order_factors(
 
 def load_daily_amount_history(minute_path: Path) -> pd.Series:
     if not minute_path.exists():
-        raise FileNotFoundError(f"Minute file does not exist: {minute_path}")
+        LOGGER.warning("Minute history is unavailable: %s", minute_path)
+        return pd.Series(dtype=float, index=pd.DatetimeIndex([]))
     frame = pd.read_parquet(minute_path, columns=["amount"])
     if isinstance(frame.index, pd.MultiIndex):
         level = "trade_date" if "trade_date" in frame.index.names else 0
@@ -1904,7 +1917,8 @@ def load_daily_amount_history(minute_path: Path) -> pd.Series:
 def load_daily_volume_history(minute_path: Path) -> pd.Series:
     """Load historical daily volume series (in shares)."""
     if not minute_path.exists():
-        raise FileNotFoundError(f"Minute file does not exist: {minute_path}")
+        LOGGER.warning("Minute volume history is unavailable: %s", minute_path)
+        return pd.Series(dtype=float, index=pd.DatetimeIndex([]))
 
     frame = pd.read_parquet(minute_path, columns=["vol"])
 
@@ -1921,14 +1935,8 @@ def load_daily_volume_history(minute_path: Path) -> pd.Series:
             f"Minute file has no trade_date index or column: {minute_path}"
         )
 
-    # Convert volume to shares (multiply by 100 if in lots)
+    # Minute parquet volume is stored in shares (the adapter unit contract).
     volumes = pd.to_numeric(frame["vol"], errors="coerce")
-
-    # Check if unit is in lots (手) by examining median value
-    # If median < 1,000,000, likely in lots, need to multiply by 100
-    median_vol = volumes.median()
-    if median_vol > 0 and median_vol < 1e6:
-        volumes = volumes * 100
 
     # Aggregate by date
     daily = volumes.groupby(trade_dates.normalize()).sum(min_count=1).sort_index()
@@ -1995,8 +2003,9 @@ def build_historical_context(
     work["previous_day_float_market_cap_cny"] = (
         work["circ_mv"].where(work["circ_mv"].gt(0)) * 10000.0
     )
-    work["previous_day_float_share"] = work["float_share"].where(work["float_share"].gt(0))
-    work["previous_day_free_share"] = work["free_share"].where(work["free_share"].gt(0))
+    # float_share and free_share are in 万股 (10k shares), convert to shares
+    work["previous_day_float_share"] = work["float_share"].where(work["float_share"].gt(0)) * 10000.0
+    work["previous_day_free_share"] = work["free_share"].where(work["free_share"].gt(0)) * 10000.0
     if include_daily_factor_fields:
         work["prevday_intraday_drawdown_from_session_high"] = (
             valid_close / valid_high - 1.0
@@ -2291,8 +2300,8 @@ def _apply_turnover_rate_factors(result: pd.DataFrame, index: int) -> None:
     auction_turnover_rate_free = auction_matched_volume / free_share * 100
     """
     auction_volume = result.at[index, "auction_matched_volume"]
-    float_share = result.at[index, "previous_day_float_share"]
-    free_share = result.at[index, "previous_day_free_share"]
+    float_share = result.get("previous_day_float_share", pd.Series(dtype=float)).get(index, np.nan)
+    free_share = result.get("previous_day_free_share", pd.Series(dtype=float)).get(index, np.nan)
 
     # Initialize columns
     result.at[index, "auction_turnover_rate"] = np.nan
@@ -2377,6 +2386,8 @@ def apply_external_context(
         "previous_day_float_market_cap_cny",
         "auction_limit_up_price",
         "auction_limit_down_price",
+        "previous_day_float_share",
+        "previous_day_free_share",
     ]
     for index, row in result.iterrows():
         trade_date = pd.Timestamp(row["trade_date"]).strftime("%Y-%m-%d")
@@ -2615,8 +2626,11 @@ def merge_symbol_output(
 def _date_in_requested_range(
     date_text: str, date_from: str | None, date_to: str | None
 ) -> bool:
-    return (date_from is None or date_text >= date_from) and (
-        date_to is None or date_text <= date_to
+    normalized = re.sub(r"\D", "", str(date_text))
+    start = re.sub(r"\D", "", str(date_from)) if date_from is not None else None
+    end = re.sub(r"\D", "", str(date_to)) if date_to is not None else None
+    return (start is None or normalized >= start) and (
+        end is None or normalized <= end
     )
 
 
@@ -3086,7 +3100,12 @@ def process_symbol_series(
         if record is not None:
             requested_records.append(record)
 
-    all_records = list(reversed(warmup_records)) + requested_records
+    # Keep chronological order for rolling histories and remove overlap between
+    # adjacent missing-date blocks before calculating history-dependent factors.
+    unique_records: dict[str, tuple[dict[str, object], pd.DataFrame]] = {}
+    for record in warmup_records + requested_records:
+        unique_records[str(record[0]["trade_date"])] = record
+    all_records = [unique_records[date] for date in sorted(unique_records)]
     if not all_records:
         LOGGER.warning("%s skipped: no valid auction quote dates", ts_code)
     requested_dates = {
