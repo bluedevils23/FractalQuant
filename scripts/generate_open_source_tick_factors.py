@@ -7,6 +7,7 @@ import logging
 import os
 import re
 import sys
+import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
@@ -38,14 +39,55 @@ DEFAULT_OUTPUT_ROOT = Path(
 SYMBOL_PATTERN = re.compile(r"^\d{6}\.[A-Z]{2}$")
 TRANSACTION_NAMES = ("逐笔成交.csv", "transactions.parquet")
 ORDER_NAMES = ("逐笔委托.csv", "orders.parquet")
+PROGRESS_EVERY = 25
+WRITE_PROGRESS_EVERY = 50
+
+
+def _format_duration(seconds: float) -> str:
+    seconds = max(0.0, float(seconds))
+    hours, remainder = divmod(int(seconds), 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h{minutes:02d}m"
+    if minutes:
+        return f"{minutes}m{seconds:02d}s"
+    return f"{seconds}s"
+
+
+def _log_extraction_progress(
+    completed: int,
+    total: int,
+    failures: int,
+    started: float,
+) -> None:
+    if completed not in {1, total} and completed % PROGRESS_EVERY:
+        return
+    elapsed = time.monotonic() - started
+    rate = completed / elapsed if elapsed > 0 else 0.0
+    remaining = (total - completed) / rate if rate > 0 else None
+    eta = _format_duration(remaining) if remaining is not None else "unknown"
+    LOGGER.info(
+        "Raw extraction progress: %s/%s (%.1f%%), failures=%s, elapsed=%s, ETA=%s",
+        completed,
+        total,
+        completed / total * 100.0 if total else 100.0,
+        failures,
+        _format_duration(elapsed),
+        eta,
+    )
 
 
 def normalize_symbol(value: str) -> str:
-    symbol = str(value).strip()
+    symbol = str(value).strip().upper()
     for suffix in (".parquet", ".csv"):
         if symbol.lower().endswith(suffix):
             symbol = symbol[: -len(suffix)]
     return symbol
+
+
+def numeric_code(value: str) -> str | None:
+    match = re.match(r"^(\d{6})", str(value).strip())
+    return match.group(1) if match else None
 
 
 def normalize_trade_date(value: str | None) -> str | None:
@@ -78,8 +120,23 @@ def discover_symbol_files(
 ) -> dict[str, dict[str, list[Path]]]:
     if not input_root.exists():
         raise FileNotFoundError(f"Input directory does not exist: {input_root}")
-    grouped: dict[str, dict[str, list[Path]]] = {}
-    requested_set = set(symbols or [])
+    requested_symbols = list(dict.fromkeys(normalize_symbol(symbol) for symbol in (symbols or [])))
+    requested_by_code: dict[str, str] = {}
+    for symbol in requested_symbols:
+        if not SYMBOL_PATTERN.fullmatch(symbol):
+            raise ValueError(f"Invalid symbol: {symbol}")
+        code = numeric_code(symbol)
+        if code is None:
+            raise ValueError(f"Invalid symbol: {symbol}")
+        previous = requested_by_code.setdefault(code, symbol)
+        if previous != symbol:
+            raise ValueError(
+                f"Multiple requested names share numeric code {code}: {previous}, {symbol}"
+            )
+    grouped: dict[str, dict[str, list[Path]]] = {
+        symbol: {"transactions": [], "orders": []} for symbol in requested_symbols
+    }
+    requested_codes = set(requested_by_code)
     date_dirs: list[Path] = []
     for year_dir in input_root.iterdir():
         if not year_dir.is_dir() or not re.fullmatch(r"\d{4}", year_dir.name):
@@ -96,22 +153,54 @@ def discover_symbol_files(
                     continue
                 date_dirs.append(date_dir)
     for date_dir in sorted(date_dirs):
-        symbol_dirs = (
-            [date_dir / symbol for symbol in sorted(requested_set)]
-            if requested_set
-            else sorted(path for path in date_dir.iterdir() if path.is_dir())
-        )
-        for symbol_dir in symbol_dirs:
-            symbol = normalize_symbol(symbol_dir.name)
-            if not SYMBOL_PATTERN.fullmatch(symbol):
+        if requested_codes:
+            # The requested universe already carries canonical exchange suffixes
+            # (ETF lists use .SH/.SZ).  Probe those paths directly instead of
+            # enumerating every symbol directory on the archive volume.
+            for code, requested_symbol in requested_by_code.items():
+                suffixes = [requested_symbol[6:]] + [
+                    suffix for suffix in (".SH", ".SZ", ".BJ")
+                    if suffix != requested_symbol[6:]
+                ]
+                candidates = [
+                    date_dir / f"{code}{suffix}"
+                    for suffix in suffixes
+                    if (date_dir / f"{code}{suffix}").is_dir()
+                ]
+                if not candidates:
+                    continue
+                symbol_dir = sorted(candidates)[0]
+                symbol = requested_symbol
+                for name in (*TRANSACTION_NAMES, *ORDER_NAMES):
+                    path = symbol_dir / name
+                    if path.is_file():
+                        kind = "transactions" if name in TRANSACTION_NAMES else "orders"
+                        grouped[symbol][kind].append(path)
+            continue
+        matches_by_code: dict[str, list[Path]] = {}
+        for symbol_dir in date_dir.iterdir():
+            if not symbol_dir.is_dir():
                 continue
+            code = numeric_code(symbol_dir.name)
+            if code is None or (requested_codes and code not in requested_codes):
+                continue
+            matches_by_code.setdefault(code, []).append(symbol_dir)
+        for code, candidates in matches_by_code.items():
+            # Match auction-factor discovery: select one deterministic directory
+            # for a numeric code, regardless of the source exchange suffix.
+            symbol_dir = sorted(candidates)[0]
+            symbol = requested_by_code.get(code, normalize_symbol(symbol_dir.name))
             for name in (*TRANSACTION_NAMES, *ORDER_NAMES):
                 path = symbol_dir / name
                 if path.is_file():
                     kind = "transactions" if name in TRANSACTION_NAMES else "orders"
                     grouped.setdefault(symbol, {"transactions": [], "orders": []})[kind].append(path)
-    selected = list(symbols or sorted(grouped))
-    missing = [symbol for symbol in selected if symbol not in grouped]
+    selected = requested_symbols or sorted(grouped)
+    missing = [
+        symbol
+        for symbol in selected
+        if not grouped[symbol]["transactions"] and not grouped[symbol]["orders"]
+    ]
     if missing:
         raise FileNotFoundError("Missing tick files for: " + ", ".join(missing[:10]))
     if limit is not None:
@@ -124,26 +213,57 @@ def discover_symbol_files(
 
 def _extract_one(item: tuple[str, dict[str, list[Path]]]) -> pd.DataFrame:
     symbol, paths = item
-    transaction_frames = [load_tick_file(path, symbol) for path in paths["transactions"]]
-    transaction_frames = [frame for frame in transaction_frames if not frame.empty]
-    order_frames = [load_order_file(path, symbol) for path in paths["orders"]]
-    order_frames = [frame for frame in order_frames if not frame.empty]
-    if not transaction_frames and not order_frames:
+    # Raw archives are organized as one symbol directory per trading date.
+    # Process one directory at a time so a two-year symbol never occupies the
+    # worker's memory as a single concatenated tick table.
+    by_day: dict[Path, dict[str, list[Path]]] = {}
+    for kind in ("transactions", "orders"):
+        for path in paths[kind]:
+            by_day.setdefault(path.parent, {"transactions": [], "orders": []})[kind].append(path)
+
+    daily_results: list[pd.DataFrame] = []
+    for day_dir in sorted(by_day):
+        transaction_frames = []
+        for path in by_day[day_dir]["transactions"]:
+            frame = load_tick_file(path, symbol)
+            if not frame.empty:
+                # The universe name is canonical.  Source CSVs may contain a
+                # stale or exchange-mismatched code in their first column.
+                frame["ts_code"] = symbol
+                transaction_frames.append(frame)
+        order_frames = []
+        for path in by_day[day_dir]["orders"]:
+            frame = load_order_file(path, symbol)
+            if not frame.empty:
+                frame["ts_code"] = symbol
+                order_frames.append(frame)
+        if not transaction_frames and not order_frames:
+            continue
+
+        if transaction_frames:
+            transactions = pd.concat(transaction_frames, ignore_index=True)
+            result = build_daily_tick_raw_features(transactions, symbol, normalized=True)
+        else:
+            transactions = pd.DataFrame()
+            result = pd.DataFrame(columns=["trade_date", "ts_code"])
+
+        if order_frames:
+            orders = pd.concat(order_frames, ignore_index=True)
+            order_result = build_daily_order_raw_features(orders, symbol, normalized=True)
+            result = result.merge(order_result, on=["trade_date", "ts_code"], how="outer")
+            if not transactions.empty:
+                flow_result = build_daily_flow_raw_features(
+                    transactions, orders, symbol, normalized=True
+                )
+                result = result.merge(flow_result, on=["trade_date", "ts_code"], how="left")
+        if not result.empty:
+            daily_results.append(result)
+
+    if not daily_results:
         return pd.DataFrame()
-    if transaction_frames:
-        transactions = pd.concat(transaction_frames, ignore_index=True)
-        result = build_daily_tick_raw_features(transactions, symbol)
-    else:
-        transactions = pd.DataFrame()
-        result = pd.DataFrame(columns=["trade_date", "ts_code"])
-    if order_frames:
-        orders = pd.concat(order_frames, ignore_index=True)
-        order_result = build_daily_order_raw_features(orders, symbol)
-        result = result.merge(order_result, on=["trade_date", "ts_code"], how="outer")
-        if not transactions.empty:
-            flow_result = build_daily_flow_raw_features(transactions, orders, symbol)
-            result = result.merge(flow_result, on=["trade_date", "ts_code"], how="left")
-    return result.sort_values("trade_date").reset_index(drop=True)
+    return pd.concat(daily_results, ignore_index=True).sort_values(
+        "trade_date", kind="mergesort"
+    ).reset_index(drop=True)
 
 
 def build_raw_panel(
@@ -152,13 +272,19 @@ def build_raw_panel(
     frames: list[pd.DataFrame] = []
     failures: list[tuple[str, str]] = []
     items = list(files.items())
+    started = time.monotonic()
+    completed = 0
+    total = len(items)
+    LOGGER.info("Raw extraction started: %s symbols, workers=%s", total, workers)
     if workers <= 1:
         iterator = ((item, _extract_one(item)) for item in items)
         for (symbol, _), result in iterator:
+            completed += 1
             if result.empty:
                 failures.append((symbol, "no valid transaction rows"))
             else:
                 frames.append(result)
+            _log_extraction_progress(completed, total, len(failures), started)
     else:
         with ProcessPoolExecutor(max_workers=workers) as executor:
             futures = {executor.submit(_extract_one, item): item[0] for item in items}
@@ -173,6 +299,8 @@ def build_raw_panel(
                 except Exception as exc:  # noqa: BLE001
                     LOGGER.exception("Failed to extract %s", symbol)
                     failures.append((symbol, str(exc)))
+                completed += 1
+                _log_extraction_progress(completed, total, len(failures), started)
     if not frames:
         raise RuntimeError("No symbol produced daily transaction features")
     return pd.concat(frames, ignore_index=True), failures
@@ -192,14 +320,29 @@ def write_outputs(
     if date_to:
         selected = selected.loc[selected["trade_date"].dt.strftime("%Y%m%d").le(date_to)]
     written: list[Path] = []
-    for symbol, frame in selected.groupby("ts_code", sort=True):
+    total_symbols = int(selected["ts_code"].nunique())
+    started = time.monotonic()
+    for completed, (symbol, frame) in enumerate(
+        selected.groupby("ts_code", sort=True), start=1
+    ):
         output_path = output_root / f"{symbol}.parquet"
         if output_path.exists() and not overwrite:
             LOGGER.info("Skipping existing output: %s", output_path)
-            continue
-        output_root.mkdir(parents=True, exist_ok=True)
-        frame.to_parquet(output_path, index=False)
-        written.append(output_path)
+            written_count = len(written)
+        else:
+            output_root.mkdir(parents=True, exist_ok=True)
+            frame.to_parquet(output_path, index=False)
+            written.append(output_path)
+            written_count = len(written)
+        if completed == 1 or completed == total_symbols or completed % WRITE_PROGRESS_EVERY == 0:
+            LOGGER.info(
+                "Output progress: %s/%s symbols (%.1f%%), files_written=%s, elapsed=%s",
+                completed,
+                total_symbols,
+                completed / total_symbols * 100.0 if total_symbols else 100.0,
+                written_count,
+                _format_duration(time.monotonic() - started),
+            )
     return written
 
 
@@ -235,15 +378,41 @@ def main() -> int:
     # Keep history before --date-from so the 20-day rolling factors retain a
     # causal warm-up window; date_from is applied only when writing outputs.
     files = discover_symbol_files(args.input_root, symbols, args.limit, None, date_to)
+    LOGGER.info(
+        "Discovered %s symbols, %s transaction files, %s order files",
+        len(files),
+        sum(len(paths["transactions"]) for paths in files.values()),
+        sum(len(paths["orders"]) for paths in files.values()),
+    )
     LOGGER.info("Extracting transaction factors for %s symbols", len(files))
+    raw_started = time.monotonic()
     raw_panel, failures = build_raw_panel(files, max(1, int(args.workers)))
+    LOGGER.info(
+        "Raw extraction complete: %s rows, %s failures, elapsed=%s",
+        len(raw_panel),
+        len(failures),
+        _format_duration(time.monotonic() - raw_started),
+    )
+    factor_started = time.monotonic()
+    LOGGER.info("Building cross-sectional tick factors")
     factor_panel = add_availability_columns(build_open_source_tick_factor_panel(raw_panel))
+    LOGGER.info(
+        "Cross-sectional factor build complete: %s rows, elapsed=%s",
+        len(factor_panel),
+        _format_duration(time.monotonic() - factor_started),
+    )
+    output_started = time.monotonic()
     written = write_outputs(
         factor_panel,
         args.output_root,
         date_from=date_from,
         date_to=date_to,
         overwrite=args.overwrite,
+    )
+    LOGGER.info(
+        "Output write complete: %s files, elapsed=%s",
+        len(written),
+        _format_duration(time.monotonic() - output_started),
     )
     LOGGER.info("Completed: %s files written, %s failures", len(written), len(failures))
     return 1 if failures else 0

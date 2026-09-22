@@ -329,10 +329,10 @@ def normalize_tick_transactions(
     if "ts_code" not in frame.columns:
         frame["ts_code"] = ts_code_hint
     frame["ts_code"] = frame["ts_code"].astype("string")
-    clock = frame["trade_time"].dt.strftime("%H:%M:%S")
+    clock_minutes = frame["trade_time"].dt.hour * 60 + frame["trade_time"].dt.minute
     session_mask = (
-        (clock.ge("09:30:00") & clock.lt("11:30:00"))
-        | (clock.ge("13:00:00") & clock.lt("15:00:00"))
+        (clock_minutes.ge(9 * 60 + 30) & clock_minutes.lt(11 * 60 + 30))
+        | (clock_minutes.ge(13 * 60) & clock_minutes.lt(15 * 60))
     )
     frame = frame.loc[session_mask].copy()
     frame["trade_date"] = frame["trade_time"].dt.normalize()
@@ -345,7 +345,13 @@ def load_tick_file(path: Path, ts_code_hint: str | None = None) -> pd.DataFrame:
     if path.suffix.lower() == ".parquet":
         return normalize_tick_transactions(pd.read_parquet(path), ts_code_hint)
     try:
-        header = pd.read_csv(path, encoding="gb18030", nrows=0).columns.tolist()
+        frame = pd.read_csv(path, encoding="gb18030", low_memory=False)
+        csv_encoding = "gb18030"
+    except UnicodeDecodeError:
+        frame = pd.read_csv(path, encoding="gbk", low_memory=False)
+        csv_encoding = "gbk"
+    header = frame.columns.tolist()
+    try:
         known = {"trade_time", "price", "quantity", "volume", "成交价格", "成交数量"}
         if not known.intersection(map(str, header)) and len(header) >= 10:
             positional_names = _RAW_POSITIONAL_COLUMNS + [
@@ -353,15 +359,19 @@ def load_tick_file(path: Path, ts_code_hint: str | None = None) -> pd.DataFrame:
             ]
             frame = pd.read_csv(
                 path,
-                encoding="gb18030",
+                encoding=csv_encoding,
                 header=0,
                 names=positional_names[: len(header)],
                 low_memory=False,
             )
-        else:
-            frame = pd.read_csv(path, encoding="gb18030", low_memory=False)
     except UnicodeDecodeError:
-        frame = pd.read_csv(path, encoding="gbk", low_memory=False)
+        frame = pd.read_csv(
+            path,
+            encoding="gbk",
+            header=0,
+            names=positional_names[: len(header)],
+            low_memory=False,
+        )
     return normalize_tick_transactions(frame, ts_code_hint)
 
 
@@ -406,10 +416,10 @@ def normalize_tick_orders(
     if "ts_code" not in frame.columns:
         frame["ts_code"] = ts_code_hint
     frame["ts_code"] = frame["ts_code"].astype("string")
-    clock = frame["trade_time"].dt.strftime("%H:%M:%S")
+    clock_minutes = frame["trade_time"].dt.hour * 60 + frame["trade_time"].dt.minute
     session_mask = (
-        (clock.ge("09:30:00") & clock.lt("11:30:00"))
-        | (clock.ge("13:00:00") & clock.lt("15:00:00"))
+        (clock_minutes.ge(9 * 60 + 30) & clock_minutes.lt(11 * 60 + 30))
+        | (clock_minutes.ge(13 * 60) & clock_minutes.lt(15 * 60))
     )
     frame = frame.loc[session_mask].copy()
     frame["trade_date"] = frame["trade_time"].dt.normalize()
@@ -421,21 +431,36 @@ def normalize_tick_orders(
 def load_order_file(path: Path, ts_code_hint: str | None = None) -> pd.DataFrame:
     if path.suffix.lower() == ".parquet":
         return normalize_tick_orders(pd.read_parquet(path), ts_code_hint)
-    header = pd.read_csv(path, encoding="gb18030", nrows=0).columns.tolist()
+    try:
+        frame = pd.read_csv(
+            path,
+            encoding="gb18030",
+            low_memory=False,
+        )
+    except UnicodeDecodeError:
+        frame = pd.read_csv(path, encoding="gbk", low_memory=False)
+    header = frame.columns.tolist()
     known = {"trade_time", "side", "quantity", "委托代码", "委托数量"}
     if not known.intersection(map(str, header)) and len(header) >= 8:
         positional_names = _ORDER_POSITIONAL_COLUMNS + [
             f"extra_{i}" for i in range(max(0, len(header) - len(_ORDER_POSITIONAL_COLUMNS)))
         ]
-        frame = pd.read_csv(
-            path,
-            encoding="gb18030",
-            header=0,
-            names=positional_names[: len(header)],
-            low_memory=False,
-        )
-    else:
-        frame = pd.read_csv(path, encoding="gb18030", low_memory=False)
+        try:
+            frame = pd.read_csv(
+                path,
+                encoding="gb18030",
+                header=0,
+                names=positional_names[: len(header)],
+                low_memory=False,
+            )
+        except UnicodeDecodeError:
+            frame = pd.read_csv(
+                path,
+                encoding="gbk",
+                header=0,
+                names=positional_names[: len(header)],
+                low_memory=False,
+            )
     return normalize_tick_orders(frame, ts_code_hint)
 
 
@@ -447,7 +472,11 @@ def _safe_corr(left: pd.Series, right: pd.Series) -> float:
 
 
 def _daily_metrics(day: pd.DataFrame, symbol: str) -> dict[str, object]:
-    minute = day.set_index("trade_time").resample("1min").agg(
+    # The input is already session-filtered and sorted. Flooring timestamps
+    # and grouping avoids rebuilding a DatetimeIndex/resampler for every day.
+    minute = day.assign(_minute=day["trade_time"].dt.floor("min")).groupby(
+        "_minute", sort=True
+    ).agg(
         minute_close=("price", "last"),
         minute_amount=("amount", "sum"),
         trade_count=("price", "size"),
@@ -495,9 +524,12 @@ def _daily_metrics(day: pd.DataFrame, symbol: str) -> dict[str, object]:
 
 
 def build_daily_tick_raw_features(
-    transactions: pd.DataFrame, ts_code: str | None = None
+    transactions: pd.DataFrame,
+    ts_code: str | None = None,
+    *,
+    normalized: bool = False,
 ) -> pd.DataFrame:
-    frame = normalize_tick_transactions(transactions, ts_code)
+    frame = transactions if normalized else normalize_tick_transactions(transactions, ts_code)
     if frame.empty:
         return pd.DataFrame(columns=RAW_TICK_COLUMNS)
     symbol = str(frame["ts_code"].dropna().iloc[0]) if frame["ts_code"].notna().any() else str(ts_code)
@@ -564,9 +596,15 @@ def _order_daily_metrics(day: pd.DataFrame, symbol: str) -> dict[str, object]:
     for lag in range(1, max_lag + 1):
         left = signs[lag:]
         right = signs[:-lag]
-        if np.unique(left).size < 2 or np.unique(right).size < 2:
+        n = len(left)
+        left_sum = float(left.sum())
+        right_sum = float(right.sum())
+        left_var = n - left_sum * left_sum / n
+        right_var = n - right_sum * right_sum / n
+        if left_var <= 0.0 or right_var <= 0.0:
             continue
-        correlations.append(float(np.corrcoef(left, right)[0, 1]))
+        cross = float(np.dot(left, right)) - left_sum * right_sum / n
+        correlations.append(cross / float(np.sqrt(left_var * right_var)))
     if len(correlations) >= 3:
         lags = np.arange(1, len(correlations) + 1, dtype=float)
         x = np.column_stack([np.ones(len(lags)), np.log(lags)])
@@ -592,9 +630,12 @@ def _order_daily_metrics(day: pd.DataFrame, symbol: str) -> dict[str, object]:
 
 
 def build_daily_order_raw_features(
-    orders: pd.DataFrame, ts_code: str | None = None
+    orders: pd.DataFrame,
+    ts_code: str | None = None,
+    *,
+    normalized: bool = False,
 ) -> pd.DataFrame:
-    frame = normalize_tick_orders(orders, ts_code)
+    frame = orders if normalized else normalize_tick_orders(orders, ts_code)
     if frame.empty:
         return pd.DataFrame(
             columns=[
@@ -649,7 +690,11 @@ def _empty_flow_row(trade_date: object, symbol: str) -> dict[str, object]:
 
 
 def _flow_daily_metrics(
-    trades: pd.DataFrame, orders: pd.DataFrame, symbol: str
+    trades: pd.DataFrame,
+    orders: pd.DataFrame,
+    symbol: str,
+    *,
+    order_notional_map: dict[float, float] | None = None,
 ) -> dict[str, object]:
     trade_date = trades["trade_date"].iloc[0]
     result = _empty_flow_row(trade_date, symbol)
@@ -683,33 +728,34 @@ def _flow_daily_metrics(
     id_amount = float(amount.where(directional & active_id.notna(), 0.0).sum())
     result["active_order_id_coverage"] = id_amount / directional_amount
 
-    order_frame = orders.copy()
-    if "order_id" not in order_frame.columns or "price" not in order_frame.columns:
-        return result
-    order_frame["order_id"] = pd.to_numeric(order_frame["order_id"], errors="coerce")
-    order_frame["price"] = pd.to_numeric(order_frame["price"], errors="coerce")
-    order_frame["quantity"] = pd.to_numeric(order_frame["quantity"], errors="coerce")
-    order_frame = order_frame.loc[
-        order_frame["order_id"].gt(0)
-        & order_frame["price"].gt(0)
-        & order_frame["quantity"].gt(0)
-    ].copy()
-    if order_frame.empty:
-        return result
-    duplicate_ids = order_frame.loc[
-        order_frame["order_id"].duplicated(keep=False), "order_id"
-    ]
-    if not duplicate_ids.empty:
+    if order_notional_map is None:
+        if "order_id" not in orders.columns or "price" not in orders.columns:
+            return result
+        order_frame = orders.copy()
+        order_frame["order_id"] = pd.to_numeric(order_frame["order_id"], errors="coerce")
+        order_frame["price"] = pd.to_numeric(order_frame["price"], errors="coerce")
+        order_frame["quantity"] = pd.to_numeric(order_frame["quantity"], errors="coerce")
         order_frame = order_frame.loc[
-            ~order_frame["order_id"].isin(set(duplicate_ids))
+            order_frame["order_id"].gt(0)
+            & order_frame["price"].gt(0)
+            & order_frame["quantity"].gt(0)
         ].copy()
-    if order_frame.empty:
-        return result
-    order_notional_map = (
-        order_frame.assign(order_notional=order_frame["price"] * order_frame["quantity"])
-        .set_index("order_id")["order_notional"]
-        .to_dict()
-    )
+        if order_frame.empty:
+            return result
+        duplicate_ids = order_frame.loc[
+            order_frame["order_id"].duplicated(keep=False), "order_id"
+        ]
+        if not duplicate_ids.empty:
+            order_frame = order_frame.loc[
+                ~order_frame["order_id"].isin(set(duplicate_ids))
+            ].copy()
+        if order_frame.empty:
+            return result
+        order_notional_map = (
+            order_frame.assign(order_notional=order_frame["price"] * order_frame["quantity"])
+            .set_index("order_id")["order_notional"]
+            .to_dict()
+        )
     matched_notional = active_id.map(order_notional_map)
     matched = directional & matched_notional.gt(0) & matched_notional.notna()
     matched_amount = float(amount.where(matched, 0.0).sum())
@@ -759,10 +805,11 @@ def _flow_daily_metrics(
         if len(minute_stats) >= 2:
             cutoff = float(minute_stats["amplitude"].quantile(0.50))
             high_amp_minutes = set(minute_stats.index[minute_stats["amplitude"].ge(cutoff)])
-        open30_mask = (
-            matched_rows["trade_time"].dt.strftime("%H:%M:%S").ge("09:30:00")
-            & matched_rows["trade_time"].dt.strftime("%H:%M:%S").lt("10:00:00")
+        matched_minutes = (
+            matched_rows["trade_time"].dt.hour * 60
+            + matched_rows["trade_time"].dt.minute
         )
+        open30_mask = matched_minutes.ge(9 * 60 + 30) & matched_minutes.lt(10 * 60)
         high_amp_mask = matched_rows["_minute"].isin(high_amp_minutes)
         for name, condition in (
             ("high_amp", high_amp_mask),
@@ -785,6 +832,8 @@ def build_daily_flow_raw_features(
     transactions: pd.DataFrame,
     orders: pd.DataFrame,
     ts_code: str | None = None,
+    *,
+    normalized: bool = False,
 ) -> pd.DataFrame:
     """Build strict order-notional flow inputs from matched tick data.
 
@@ -793,8 +842,8 @@ def build_daily_flow_raw_features(
     multiplying an order's notional and preserves nulls for unmatched data.
     """
 
-    trade_frame = normalize_tick_transactions(transactions, ts_code)
-    order_frame = normalize_tick_orders(orders, ts_code)
+    trade_frame = transactions if normalized else normalize_tick_transactions(transactions, ts_code)
+    order_frame = orders if normalized else normalize_tick_orders(orders, ts_code)
     if trade_frame.empty:
         return pd.DataFrame(columns=["trade_date", "ts_code", *FLOW_RAW_COLUMNS])
     symbol = (
@@ -802,11 +851,48 @@ def build_daily_flow_raw_features(
         if trade_frame["ts_code"].notna().any()
         else str(ts_code)
     )
-    order_frame = order_frame.copy()
+    order_groups = {
+        trade_date: day
+        for trade_date, day in order_frame.groupby("trade_date", sort=True)
+    }
+    order_maps: dict[object, dict[float, float]] = {}
+    for trade_date, same_day_orders in order_groups.items():
+        if "order_id" not in same_day_orders.columns or "price" not in same_day_orders.columns:
+            order_maps[trade_date] = {}
+            continue
+        clean_orders = same_day_orders.loc[
+            same_day_orders["order_id"].gt(0)
+            & same_day_orders["price"].gt(0)
+            & same_day_orders["quantity"].gt(0)
+        ]
+        if clean_orders.empty:
+            order_maps[trade_date] = {}
+            continue
+        duplicate_ids = clean_orders.loc[
+            clean_orders["order_id"].duplicated(keep=False), "order_id"
+        ]
+        if not duplicate_ids.empty:
+            clean_orders = clean_orders.loc[
+                ~clean_orders["order_id"].isin(set(duplicate_ids))
+            ]
+        order_maps[trade_date] = (
+            clean_orders.assign(order_notional=clean_orders["price"] * clean_orders["quantity"])
+            .set_index("order_id")["order_notional"]
+            .to_dict()
+        )
     rows = []
     for trade_date, day in trade_frame.groupby("trade_date", sort=True):
-        same_day_orders = order_frame.loc[order_frame["trade_date"].eq(trade_date)]
-        rows.append(_flow_daily_metrics(day, same_day_orders, symbol))
+        same_day_orders = order_groups.get(trade_date)
+        if same_day_orders is None:
+            same_day_orders = order_frame.iloc[0:0]
+        rows.append(
+            _flow_daily_metrics(
+                day,
+                same_day_orders,
+                symbol,
+                order_notional_map=order_maps.get(trade_date, {}),
+            )
+        )
     result = pd.DataFrame(rows)
     columns = ["trade_date", "ts_code", *FLOW_RAW_COLUMNS]
     for column in columns:
