@@ -59,6 +59,9 @@ DEFAULT_ETF_ROOT = Path(r"D:\workspace\stockdata\etf-data\etf_1min")
 DEFAULT_ETF_DAILY_PATH = Path(
     r"D:\workspace\stockdata\etf-data\etf_daily.parquet"
 )
+DEFAULT_ETF_DAILY_STATE_PATH = Path(
+    r"D:\workspace\stockdata\etf-data\etf_daily_states.parquet"
+)
 DEFAULT_INDEX_ROOT = Path(
     r"D:\workspace\stockdata\指数数据\index_1min_rqdata"
 )
@@ -405,6 +408,35 @@ def load_etf_daily_histories(
         history = history.sort_values("trade_date", kind="mergesort")
         history = history.drop_duplicates("trade_date", keep="last")
         histories[fund_code] = history.set_index("trade_date")
+    return histories
+
+
+def load_etf_daily_states(
+    state_path: Path,
+    member_paths: dict[str, Path],
+) -> dict[str, pd.DataFrame]:
+    """Load precomputed previous-day states produced by generate_etf_daily_states."""
+    if not state_path.exists():
+        raise FileNotFoundError(f"ETF daily state parquet does not exist: {state_path}")
+    symbols = sorted(member_paths)
+    raw = pd.read_parquet(
+        state_path,
+        columns=["ts_code", "trade_date", *DAILY_STATE_COLUMNS],
+        filters=[("ts_code", "in", symbols)],
+    )
+    required = ("ts_code", "trade_date", *DAILY_STATE_COLUMNS)
+    missing = [column for column in required if column not in raw.columns]
+    if missing:
+        raise ValueError(f"ETF daily state frame is missing columns: {missing}")
+    raw["ts_code"] = raw["ts_code"].astype(str).str.strip().str.upper()
+    raw["trade_date"] = pd.to_datetime(raw["trade_date"], errors="coerce").dt.normalize()
+    for column in DAILY_STATE_COLUMNS:
+        raw[column] = pd.to_numeric(raw[column], errors="coerce")
+    histories: dict[str, pd.DataFrame] = {}
+    for symbol in member_paths:
+        rows = raw.loc[raw["ts_code"].eq(symbol), ["trade_date", *DAILY_STATE_COLUMNS]]
+        rows = rows.dropna(subset=["trade_date"]).drop_duplicates("trade_date", keep="last")
+        histories[symbol] = rows.set_index("trade_date").sort_index()
     return histories
 
 
@@ -905,6 +937,7 @@ def process_mapping_record(
     date_to: str | None,
     overwrite: bool,
     etf_daily_path: Path | None = None,
+    etf_daily_state_path: Path | None = None,
 ) -> dict[str, object]:
     output_path = output_root / etf_path.name
     if output_path.exists() and not overwrite:
@@ -931,14 +964,22 @@ def process_mapping_record(
     if etf_frame.empty:
         return no_overlap_result(etf_path, output_path, overwrite)
     fund_code = normalize_fund_code(etf_path.name)
-    daily_history = None
-    if etf_daily_path is not None:
-        daily_history = load_etf_daily_histories(
-            etf_daily_path, {fund_code: etf_path}
-        )[fund_code]
-    daily_state_frame = align_previous_daily_state(
-        etf_frame.index, daily_history, raw_etf_frame.index
-    )
+    if etf_daily_state_path is not None and etf_daily_state_path.exists():
+        state = load_etf_daily_states(etf_daily_state_path, {fund_code: etf_path})[
+            fund_code
+        ]
+        daily_state_frame = state.reindex(
+            pd.DatetimeIndex(etf_frame.index.normalize())
+        ).set_axis(etf_frame.index)
+    else:
+        daily_history = None
+        if etf_daily_path is not None:
+            daily_history = load_etf_daily_histories(
+                etf_daily_path, {fund_code: etf_path}
+            )[fund_code]
+        daily_state_frame = align_previous_daily_state(
+            etf_frame.index, daily_history, raw_etf_frame.index
+        )
 
     factor_frame = calculate_crossmarket_factor_frame(
         etf_frame, reference_frame, daily_state_frame
@@ -976,6 +1017,7 @@ def process_mapping_group(
     date_from: str | None,
     date_to: str | None,
     overwrite: bool,
+    etf_daily_state_path: Path | None = None,
 ) -> list[dict[str, object]]:
     writable_targets: list[str] = []
     results: list[dict[str, object]] = []
@@ -1040,21 +1082,29 @@ def process_mapping_group(
             )
             for fund_code in writable_targets
         ]
-    daily_histories = load_etf_daily_histories(
-        etf_daily_path,
-        {
-            fund_code: member_paths[fund_code]
-            for fund_code in member_frames
-        },
-    )
-    daily_state_frames = {
-        fund_code: align_previous_daily_state(
-            frame.index,
-            daily_histories.get(fund_code),
-            raw_member_frames[fund_code].index,
-        )
-        for fund_code, frame in member_frames.items()
+    state_members = {
+        fund_code: member_paths[fund_code]
+        for fund_code in member_frames
     }
+    if etf_daily_state_path is not None and etf_daily_state_path.exists():
+        daily_histories = load_etf_daily_states(etf_daily_state_path, state_members)
+        # Precomputed rows are keyed by the current trade date, so align directly.
+        daily_state_frames = {
+            fund_code: daily_histories[fund_code]
+            .reindex(pd.DatetimeIndex(frame.index.normalize()))
+            .set_axis(frame.index)
+            for fund_code, frame in member_frames.items()
+        }
+    else:
+        daily_histories = load_etf_daily_histories(etf_daily_path, state_members)
+        daily_state_frames = {
+            fund_code: align_previous_daily_state(
+                frame.index,
+                daily_histories.get(fund_code),
+                raw_member_frames[fund_code].index,
+            )
+            for fund_code, frame in member_frames.items()
+        }
     related_frames = calculate_related_etf_factor_frames(
         member_frames, daily_state_frames
     )
@@ -1113,6 +1163,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--etf-root", type=Path, default=DEFAULT_ETF_ROOT)
     parser.add_argument(
         "--etf-daily", type=Path, default=DEFAULT_ETF_DAILY_PATH
+    )
+    parser.add_argument(
+        "--etf-daily-state", type=Path, default=DEFAULT_ETF_DAILY_STATE_PATH,
+        help="Precomputed previous-day state parquet; generated by generate_etf_daily_states.py.",
     )
     parser.add_argument("--index-root", type=Path, default=DEFAULT_INDEX_ROOT)
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
@@ -1228,6 +1282,7 @@ def main() -> int:
             str | None,
             str | None,
             bool,
+            Path | None,
         ]
     ] = []
     for reference_code, targets in selected_by_reference.items():
@@ -1250,6 +1305,7 @@ def main() -> int:
                 date_from,
                 date_to,
                 args.overwrite,
+                args.etf_daily_state,
             )
         )
 
