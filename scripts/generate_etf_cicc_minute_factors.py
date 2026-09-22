@@ -279,11 +279,69 @@ def normalize_minute_frame(raw_df: pd.DataFrame) -> pd.DataFrame:
 def build_factor_registry() -> list[tuple[str, Callable[[pl.DataFrame], pl.DataFrame]]]:
     registry: list[tuple[str, Callable[[pl.DataFrame], pl.DataFrame]]] = []
     for function_name in FACTOR_FUNCTION_NAMES:
-        function = getattr(cicc_methods, function_name, None)
+        function = CICC_FACTOR_OVERRIDES.get(
+            function_name, getattr(cicc_methods, function_name, None)
+        )
         if function is None:
             raise AttributeError(f"Missing CICC factor function: {function_name}")
         registry.append((function_name.removeprefix("cal_"), function))
     return registry
+
+
+def _cal_liq_amihud_1min(df: pl.DataFrame) -> pl.DataFrame:
+    """Calculate intraday Amihud without linking adjacent trading days."""
+    return (
+        df.lazy()
+        .select(
+            pl.col("code"),
+            pl.col("date"),
+            pl.col("volume").fill_null(0),
+            pl.col("close")
+            .pct_change()
+            .over(["code", "date"])
+            .abs()
+            .fill_null(0)
+            .alias("pct_change_abs"),
+        )
+        .with_columns(
+            pl.when(pl.col("volume") > 0)
+            .then(pl.col("pct_change_abs") / pl.col("volume"))
+            .otherwise(0)
+            .alias("amihud")
+        )
+        .group_by(["code", "date"])
+        .agg(pl.col("amihud").sum().alias("liq_amihud_1min"))
+        .collect()
+    )
+
+
+def _cal_corr_prvr(df: pl.DataFrame) -> pl.DataFrame:
+    """Correlate intraday returns and volume changes with a daily reset."""
+    return (
+        df.lazy()
+        .filter(pl.col("volume") != 0)
+        .select(
+            pl.col("code"),
+            pl.col("date"),
+            pl.col("close")
+            .pct_change()
+            .over(["code", "date"])
+            .alias("close_change"),
+            pl.col("volume")
+            .pct_change()
+            .over(["code", "date"])
+            .alias("volume_change"),
+        )
+        .group_by(["code", "date"])
+        .agg(pl.corr("close_change", "volume_change").alias("corr_prvr"))
+        .collect()
+    )
+
+
+CICC_FACTOR_OVERRIDES: dict[str, Callable[[pl.DataFrame], pl.DataFrame]] = {
+    "cal_liq_amihud_1min": _cal_liq_amihud_1min,
+    "cal_corr_prvr": _cal_corr_prvr,
+}
 
 
 def convert_time_to_cicc_int(index: pd.DatetimeIndex) -> pd.Series:
