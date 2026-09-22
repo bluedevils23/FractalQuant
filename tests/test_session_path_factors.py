@@ -33,6 +33,7 @@ def _minute_frame() -> pd.DataFrame:
             "low": [99.0, 100.0, 101.0],
             "close": [100.0, 102.0, 102.5],
             "volume": [1000.0, 1100.0, 1200.0],
+            "adj_factor": [1.0, 1.0, 1.0],
         },
         index=index,
     )
@@ -64,6 +65,19 @@ def test_session_path_preserves_causal_time_and_cross_day_previous_close() -> No
             ]
         ]
     ).all().all()
+
+
+def test_session_path_uses_adjusted_prices_across_factor_change() -> None:
+    frame = _minute_frame()
+    frame.loc[("2026-01-05", slice(None)), ["open", "high", "low", "close"]] *= 2.0
+    frame.loc[("2026-01-06", slice(None)), "adj_factor"] = 2.0
+
+    result = build_session_path_factor_frame_from_frame(frame, "510300.SH")
+
+    assert np.isclose(
+        result.loc[2, "intraday_return_from_prev_close"],
+        102.5 * 2.0 / (102.0 * 2.0) - 1.0,
+    )
 
 
 def test_minute_factor_process_reuses_loaded_frame_for_session_path(

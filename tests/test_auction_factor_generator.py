@@ -1454,6 +1454,7 @@ def test_session_path_companion_is_minute_causal_and_cumulative_across_lunch(tmp
             "high": [10.0, 10.5, 11.0, 10.3],
             "low": [9.8, 10.0, 10.2, 10.1],
             "close": [10.0, 10.4, 10.3, 10.2],
+            "adj_factor": [1.0, 1.0, 1.0, 1.0],
         },
         index=index,
     ).to_parquet(minute_path)

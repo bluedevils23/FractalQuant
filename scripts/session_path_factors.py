@@ -6,6 +6,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq
 
 
 SESSION_PATH_OUTPUT_COLUMNS = [
@@ -46,6 +47,9 @@ def _build_work_frame(minute: pd.DataFrame, minute_path: Path | None = None) -> 
         if column not in work.columns:
             raise ValueError(f"Minute file is missing required column: {column}")
         work[column] = pd.to_numeric(work[column], errors="coerce")
+    if "adj_factor" not in work.columns:
+        work["adj_factor"] = np.nan
+    work["adj_factor"] = pd.to_numeric(work["adj_factor"], errors="coerce")
     work = work.dropna(subset=["trade_date", "bar_time"]).sort_values(
         ["trade_date", "bar_time"], kind="mergesort"
     )
@@ -59,8 +63,12 @@ def build_session_path_factor_frame_from_frame(
     minute_path: Path | None = None,
 ) -> pd.DataFrame:
     work = _build_work_frame(minute, minute_path)
-    daily_close = work.groupby("trade_date", sort=True)["close"].last()
-    work["_previous_close"] = work["trade_date"].map(daily_close.shift(1))
+    valid_adj_factor = work["adj_factor"].where(work["adj_factor"].gt(0))
+    work["_adjusted_close"] = work["close"].where(work["close"].gt(0)) * valid_adj_factor
+    daily_adjusted_close = work.groupby("trade_date", sort=True)["_adjusted_close"].last()
+    work["_previous_adjusted_close"] = work["trade_date"].map(
+        daily_adjusted_close.shift(1)
+    )
     session_groups = work.groupby("trade_date", sort=False)
     session_high = session_groups["high"].cummax()
     session_low = session_groups["low"].cummin()
@@ -72,7 +80,10 @@ def build_session_path_factor_frame_from_frame(
         valid_close / session_low.where(session_low.gt(0)) - 1.0
     )
     work["intraday_return_from_prev_close"] = (
-        valid_close / work["_previous_close"].where(work["_previous_close"].gt(0))
+        work["_adjusted_close"]
+        / work["_previous_adjusted_close"].where(
+            work["_previous_adjusted_close"].gt(0)
+        )
         - 1.0
     )
     work["available_time"] = work["bar_time"] + pd.Timedelta(minutes=1)
@@ -114,7 +125,10 @@ def build_session_path_factor_frame(
 ) -> pd.DataFrame:
     if not minute_path.exists():
         raise FileNotFoundError(f"Minute file does not exist: {minute_path}")
-    minute = pd.read_parquet(minute_path, columns=["high", "low", "close"])
+    columns = ["high", "low", "close"]
+    if "adj_factor" in pq.read_schema(minute_path).names:
+        columns.append("adj_factor")
+    minute = pd.read_parquet(minute_path, columns=columns)
     return build_session_path_factor_frame_from_frame(
         minute, ts_code, requested_dates, minute_path
     )
