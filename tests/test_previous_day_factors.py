@@ -52,6 +52,10 @@ def test_previous_day_factors_use_prior_daily_session_and_benchmark(tmp_path: Pa
     assert np.isclose(row["prevday_intraday_drawdown_from_session_high"], 121 / 131 - 1)
     assert np.isclose(row["prevday_intraday_rebound_from_session_low"], 121 / 111 - 1)
     assert np.isclose(row["prevday_intraday_return_from_prev_close"], 121 / 120 - 1)
+    assert not np.isnan(row["prev_skew_long_60d"])
+    assert not np.isnan(row["prev_skew_short_10d"])
+    assert np.isclose(row["prev_rel_skew_60_10"], row["prev_skew_long_60d"] - row["prev_skew_short_10d"])
+    assert 0.0 <= row["prev_rel_skew_rank_cs"] <= 1.0
     assert set(DAILY_FACTOR_COLUMNS).issubset(result.columns)
     assert not set(DAILY_FACTOR_COLUMNS) & set(OUTPUT_COLUMNS)
 
@@ -69,3 +73,62 @@ def test_previous_day_factor_outputs_merge_without_duplicate_dates(tmp_path: Pat
     written = pd.read_parquet(output_root / "000001.SZ.parquet")
     assert written[["trade_date", "ts_code"]].duplicated().sum() == 0
     assert len(written) == len(result)
+
+
+def test_previous_day_factors_fallback_to_etf_daily_benchmark(tmp_path: Path) -> None:
+    stock_path = tmp_path / "stock_daily.parquet"
+    etf_path = tmp_path / "etf_daily.parquet"
+
+    # Stock daily without benchmark 510300.SH
+    stock_rows = []
+    for code, multiplier in (("000001.SZ", 1.0), ("000002.SZ", 2.0)):
+        for index, trade_date in enumerate(pd.date_range("2026-01-01", periods=23)):
+            close = 100.0 + index * multiplier
+            stock_rows.append(
+                {
+                    "trade_date": trade_date,
+                    "ts_code": code,
+                    "close": close,
+                    "high": close + 10.0,
+                    "low": close - 10.0,
+                    "pre_close": close - 1.0,
+                    "adj_factor": 1.0,
+                    "vol": 100.0,
+                    "circ_mv": 1000.0,
+                }
+            )
+    pd.DataFrame(stock_rows).set_index(["trade_date", "ts_code"]).to_parquet(stock_path)
+
+    # ETF daily containing benchmark 510300.SH
+    etf_rows = []
+    for index, trade_date in enumerate(pd.date_range("2026-01-01", periods=23)):
+        close = 100.0 + index * 1.5
+        etf_rows.append(
+            {
+                "trade_date": trade_date,
+                "ts_code": "510300.SH",
+                "close": close,
+                "high": close + 5.0,
+                "low": close - 5.0,
+                "pre_close": close - 1.0,
+                "adj_factor": 1.0,
+                "vol": 100.0,
+                "circ_mv": 1000.0,
+            }
+        )
+    pd.DataFrame(etf_rows).set_index(["trade_date", "ts_code"]).to_parquet(etf_path)
+
+    result = calculate_previous_day_factors(
+        stock_path,
+        requested_codes={"000001.SZ"},
+        date_from="2026-01-23",
+        benchmark_ts_code="510300.SH",
+        etf_daily_path=etf_path,
+    )
+
+    row = result.iloc[0]
+    assert row["trade_date"] == "2026-01-23"
+    assert row["ts_code"] == "000001.SZ"
+    assert not np.isnan(row["market_above_ma20_prevclose"])
+    assert not np.isnan(row["market_momentum_2d_prevclose"])
+    assert row["market_above_ma20_prevclose"] == 1.0

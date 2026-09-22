@@ -1,4 +1,4 @@
-"""Generate the seven pre-auction daily-context factors independently.
+"""Generate the registered pre-auction daily-context factors independently.
 
 The factors in this file are calculated from the latest completed daily bar
 before each target trade date.  They are deliberately kept out of the
@@ -43,6 +43,10 @@ DAILY_FACTOR_COLUMNS = [
     "prevday_intraday_return_from_prev_close",
     "prev_2d_return_rank_cs",
     "prev_20d_return_rank_cs",
+    "prev_skew_long_60d",
+    "prev_skew_short_10d",
+    "prev_rel_skew_60_10",
+    "prev_rel_skew_rank_cs",
     "market_above_ma20_prevclose",
     "market_momentum_2d_prevclose",
 ]
@@ -79,6 +83,7 @@ def calculate_previous_day_factors(
     date_from: str | None = None,
     date_to: str | None = None,
     benchmark_ts_code: str = DEFAULT_BENCHMARK_TS_CODE,
+    etf_daily_path: Path = DEFAULT_ETF_DAILY_PATH,
 ) -> pd.DataFrame:
     """Return one row per available symbol and target date.
 
@@ -89,7 +94,10 @@ def calculate_previous_day_factors(
     """
     if not daily_path.exists():
         raise FileNotFoundError(f"Daily file does not exist: {daily_path}")
-    daily = pd.read_parquet(daily_path)
+    try:
+        daily = pd.read_parquet(daily_path, columns=["trade_date", "ts_code"])
+    except (KeyError, ValueError, TypeError):
+        daily = pd.read_parquet(daily_path)
     if isinstance(daily.index, pd.MultiIndex) or {
         "trade_date",
         "ts_code",
@@ -123,7 +131,18 @@ def calculate_previous_day_factors(
         include_daily_factor_fields=True,
     )
     rows: list[pd.DataFrame] = []
-    benchmark_context = contexts.get(benchmark, pd.DataFrame())
+    if benchmark_present:
+        benchmark_context = contexts.get(benchmark, pd.DataFrame())
+    elif etf_daily_path.exists():
+        benchmark_contexts = build_historical_context(
+            etf_daily_path,
+            target_dates,
+            {benchmark},
+            include_daily_factor_fields=True,
+        )
+        benchmark_context = benchmark_contexts.get(benchmark, pd.DataFrame())
+    else:
+        benchmark_context = pd.DataFrame()
     benchmark_by_date = (
         benchmark_context.set_index("trade_date")
         if not benchmark_context.empty
@@ -134,8 +153,18 @@ def calculate_previous_day_factors(
             continue
         factor_frame = context[["trade_date", "source_trade_date"]].copy()
         factor_frame["ts_code"] = code
-        for column in DAILY_FACTOR_COLUMNS[:5]:
-            factor_frame[column] = context[column]
+        for column in (
+            "prevday_intraday_drawdown_from_session_high",
+            "prevday_intraday_rebound_from_session_low",
+            "prevday_intraday_return_from_prev_close",
+            "prev_2d_return_rank_cs",
+            "prev_20d_return_rank_cs",
+            "prev_skew_long_60d",
+            "prev_skew_short_10d",
+            "prev_rel_skew_60_10",
+            "prev_rel_skew_rank_cs",
+        ):
+            factor_frame[column] = context[column] if column in context.columns else np.nan
         factor_frame["market_above_ma20_prevclose"] = np.nan
         factor_frame["market_momentum_2d_prevclose"] = np.nan
         if not benchmark_by_date.empty:
@@ -148,8 +177,6 @@ def calculate_previous_day_factors(
         factor_frame["available_time"] = pd.to_datetime(
             factor_frame["trade_date"] + " 09:15:00"
         )
-        factor_frame = factor_frame.rename(columns={"trade_date": "target_trade_date"})
-        factor_frame["trade_date"] = factor_frame.pop("target_trade_date")
         factor_frame["source_trade_date"] = pd.to_datetime(
             factor_frame["source_trade_date"], errors="coerce"
         ).dt.strftime("%Y-%m-%d")
@@ -162,18 +189,21 @@ def calculate_previous_day_factors(
 
 
 def _merge_output(path: Path, requested: pd.DataFrame, overwrite: bool) -> None:
-    existing = pd.read_parquet(path) if path.exists() else pd.DataFrame(columns=OUTPUT_COLUMNS)
-    existing = existing.reindex(columns=OUTPUT_COLUMNS)
-    dates = set(requested["trade_date"].astype(str))
-    if overwrite:
-        existing = existing.loc[~existing["trade_date"].astype(str).isin(dates)]
-        combined = pd.concat([existing, requested], ignore_index=True)
+    if not path.exists():
+        combined = requested.copy()
     else:
-        existing_dates = set(existing["trade_date"].astype(str))
-        combined = pd.concat(
-            [existing, requested.loc[~requested["trade_date"].astype(str).isin(existing_dates)]],
-            ignore_index=True,
-        )
+        existing = pd.read_parquet(path)
+        existing = existing.reindex(columns=OUTPUT_COLUMNS)
+        dates = set(requested["trade_date"].astype(str))
+        if overwrite:
+            existing = existing.loc[~existing["trade_date"].astype(str).isin(dates)]
+            combined = pd.concat([existing, requested], ignore_index=True)
+        else:
+            existing_dates = set(existing["trade_date"].astype(str))
+            combined = pd.concat(
+                [existing, requested.loc[~requested["trade_date"].astype(str).isin(existing_dates)]],
+                ignore_index=True,
+            )
     combined = combined.drop_duplicates(["trade_date", "ts_code"], keep="last")
     combined = combined.sort_values("trade_date", kind="mergesort")
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -225,6 +255,7 @@ def main() -> None:
             date_from=args.date_from,
             date_to=args.date_to,
             benchmark_ts_code=args.benchmark_ts_code,
+            etf_daily_path=args.etf_daily_path,
         )
         count = write_outputs(frame, output_root, args.overwrite)
         LOGGER.info(

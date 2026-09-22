@@ -15,7 +15,7 @@ from scripts.generate_auction_factors import (
     REPORT_SMOOTHED_SOURCE_COLUMNS,
     REPORT_SUPPLEMENT_FACTOR_COLUMNS,
     SUPPLEMENT_OUTPUT_COLUMNS,
-    _calculate_daily_with_match_fallback,
+    _calculate_daily_with_transaction_fallback,
     _finalize_event_frame,
     _stage2_slope,
     apply_historical_ratios,
@@ -323,45 +323,7 @@ def test_qmt_0925_tick_match_uses_last_valid_snapshot_in_stored_share_units(
     }
 
 
-def test_match_fallback_prefers_qmt_minute_then_tick() -> None:
-    quotes = _auction_quotes(include_match=False)
-    minute_match = {
-        "2026-03-31": {
-            "trade_time": pd.Timestamp("2026-03-31 09:25"),
-            "open_price": 10.05,
-            "trade_volume": 1000.0,
-            "trade_amount": 10050.0,
-        }
-    }
-    tick_match = {
-        "2026-03-31": {
-            "trade_time": pd.Timestamp("2026-03-31 09:25"),
-            "open_price": 10.06,
-            "trade_volume": 1200.0,
-            "trade_amount": 12072.0,
-        }
-    }
-
-    minute_result = _calculate_daily_with_match_fallback(
-        quotes,
-        "000001.SZ",
-        qmt_minute_matches=minute_match,
-        qmt_tick_matches=tick_match,
-    )
-    tick_result = _calculate_daily_with_match_fallback(
-        quotes,
-        "000001.SZ",
-        qmt_minute_matches={"2026-03-31": {"open_price": 0.0}},
-        qmt_tick_matches=tick_match,
-    )
-
-    assert minute_result["auction_match_source"] == "qmt_0930_minute"
-    assert minute_result["auction_open_price"] == 10.05
-    assert tick_result["auction_match_source"] == "qmt_tick_0925"
-    assert tick_result["auction_open_price"] == 10.06
-
-
-def test_match_fallback_keeps_native_transaction_before_qmt(monkeypatch) -> None:
+def test_match_fallback_uses_native_transaction_only(monkeypatch) -> None:
     native_match = {
         "trade_time": pd.Timestamp("2026-03-31 09:25"),
         "open_price": 10.04,
@@ -373,18 +335,10 @@ def test_match_fallback_keeps_native_transaction_before_qmt(monkeypatch) -> None
         lambda *args, **kwargs: native_match,
     )
 
-    result = _calculate_daily_with_match_fallback(
+    result = _calculate_daily_with_transaction_fallback(
         _auction_quotes(include_match=False),
         "000001.SZ",
         symbol_dir=Path("ignored"),
-        qmt_minute_matches={
-            "2026-03-31": {
-                "trade_time": pd.Timestamp("2026-03-31 09:25"),
-                "open_price": 10.05,
-                "trade_volume": 1000.0,
-                "trade_amount": 10050.0,
-            }
-        },
     )
 
     assert result["auction_match_source"] == "transaction_0925"
@@ -399,25 +353,17 @@ def test_match_fallback_keeps_native_quote_before_other_sources(monkeypatch) -> 
         "scripts.generate_auction_factors.load_open_transaction_match",
         fail_transaction_loader,
     )
-    result = _calculate_daily_with_match_fallback(
+    result = _calculate_daily_with_transaction_fallback(
         _auction_quotes(),
         "000001.SZ",
         symbol_dir=Path("ignored"),
-        qmt_minute_matches={
-            "2026-03-31": {
-                "trade_time": pd.Timestamp("2026-03-31 09:25"),
-                "open_price": 10.06,
-                "trade_volume": 1200.0,
-                "trade_amount": 12072.0,
-            }
-        },
     )
 
     assert result["auction_match_source"] == "quote"
     assert result["auction_open_price"] == 10.05
 
 
-def test_benchmark_uses_qmt_match_fallback(monkeypatch, tmp_path: Path) -> None:
+def test_benchmark_does_not_use_qmt_match_fallback(monkeypatch, tmp_path: Path) -> None:
     benchmark_path = tmp_path / "20260331" / "510300.SH"
     benchmark_path.mkdir(parents=True)
     monkeypatch.setattr(
@@ -429,37 +375,16 @@ def test_benchmark_uses_qmt_match_fallback(monkeypatch, tmp_path: Path) -> None:
         "510300.SH",
         [benchmark_path],
         ["2026-03-31"],
-        qmt_minute_matches={
-            "2026-03-31": {
-                "trade_time": pd.Timestamp("2026-03-31 09:25"),
-                "open_price": 10.05,
-                "trade_volume": 1000.0,
-                "trade_amount": 10050.0,
-            }
-        },
     ).iloc[0]
 
-    assert bool(result["benchmark_auction_has_match"])
+    assert not bool(result["benchmark_auction_has_match"])
     assert result["benchmark_available_time"] == pd.Timestamp("2026-03-31 09:25")
-    assert result["market_return_from_prev_close"] == pytest.approx(0.005)
+    assert pd.isna(result["market_return_from_prev_close"])
 
 
-def test_process_etf_uses_qmt_minute_fallback_once(monkeypatch, tmp_path: Path) -> None:
+def test_process_etf_does_not_use_qmt_match_fallback(monkeypatch, tmp_path: Path) -> None:
     raw_dir = tmp_path / "2026" / "202603" / "20260331" / "000001.SZ"
     raw_dir.mkdir(parents=True)
-    qmt_minute_path = tmp_path / "000001.SZ.qmt-minute.parquet"
-    _write_qmt_minutes(
-        qmt_minute_path,
-        [("2026-03-31 09:30:00", 10.05, 1000.0, 10050.0)],
-    )
-    calls = 0
-    original_load_qmt_0930_matches = load_qmt_0930_matches
-
-    def load_minute_matches(path):
-        nonlocal calls
-        calls += 1
-        return original_load_qmt_0930_matches(path)
-
     monkeypatch.setattr(
         "scripts.generate_auction_factors.load_quote_frame",
         lambda *args, **kwargs: _auction_quotes(include_match=False),
@@ -480,7 +405,7 @@ def test_process_etf_uses_qmt_minute_fallback_once(monkeypatch, tmp_path: Path) 
     )
     monkeypatch.setattr(
         "scripts.generate_auction_factors.load_qmt_0930_matches",
-        load_minute_matches,
+        lambda *args, **kwargs: pytest.fail("standard ETF processing must not load QMT matches"),
     )
 
     _, output_path, row_count = process_symbol_series(
@@ -493,16 +418,12 @@ def test_process_etf_uses_qmt_minute_fallback_once(monkeypatch, tmp_path: Path) 
         "20260331",
         overwrite=True,
         auction_cache_root=None,
-        use_qmt_match_fallback=True,
-        qmt_tick_path=tmp_path / "missing-tick.parquet",
-        qmt_minute_path=qmt_minute_path,
     )
     result = pd.read_parquet(output_path)
 
     assert row_count == 1
-    assert calls == 1
-    assert result.loc[0, "auction_match_source"] == "qmt_0930_minute"
-    assert result.loc[0, "auction_matched_volume"] == 1000.0
+    assert result.loc[0, "auction_match_source"] == "none"
+    assert pd.isna(result.loc[0, "auction_matched_volume"])
 
 
 def test_process_stock_ignores_qmt_fallback_files(monkeypatch, tmp_path: Path) -> None:
@@ -552,9 +473,6 @@ def test_process_stock_ignores_qmt_fallback_files(monkeypatch, tmp_path: Path) -
         "20260331",
         overwrite=True,
         auction_cache_root=None,
-        use_qmt_match_fallback=True,
-        qmt_tick_path=qmt_tick_path,
-        qmt_minute_path=qmt_minute_path,
     )
     result = pd.read_parquet(output_path)
 
@@ -654,7 +572,7 @@ def test_daily_factor_formulas_and_output_contract() -> None:
     assert row["auction_up_step_ratio"] == 4 / 4
     assert row["auction_down_step_ratio"] == 0.0
     assert row["auction_snapshot_count_total"] == 5
-    assert row["auction_l3_buy_share_final"] == 0.9
+    assert row["auction_l3_buy_share_final"] == pytest.approx((0.8 + 0.6 + 0.9) / 3)
     assert row["auction_l3_buy_share_stage1_end"] == 0.7
     assert np.isclose(row["auction_l3_buy_share_change_stage2"], 0.2)
     assert np.isclose(
@@ -691,6 +609,65 @@ def test_daily_factor_formulas_and_output_contract() -> None:
         * 10000.0
     )
     assert np.isclose(row["auction_stage2_slope_bps_per_min"], expected_slope)
+
+
+def test_stage2_imbalance_changes_use_smoothed_end_windows() -> None:
+    rows = [
+        _quote_row("2026-03-31 09:15:00", 10.00, 600, 400),
+        _quote_row("2026-03-31 09:18:00", 10.01, 700, 300),
+    ]
+    imbalance_values = [1.0, 0.6] + [0.0] * 16 + [-0.6, -1.0]
+    for index, imbalance in enumerate(imbalance_values):
+        timestamp = pd.Timestamp("2026-03-31 09:20:00") + pd.Timedelta(
+            seconds=15 * index
+        )
+        rows.append(
+            _quote_row(
+                timestamp,
+                10.02,
+                100.0 * (1.0 + imbalance),
+                100.0 * (1.0 - imbalance),
+            )
+        )
+    rows.append(
+        _quote_row(
+            "2026-03-31 09:25:03",
+            10.05,
+            500,
+            500,
+            open_price=10.05,
+            trade_volume=1000,
+            trade_amount=10050,
+        )
+    )
+
+    row = calculate_daily_auction_factors(pd.DataFrame(rows), "000001.SZ")
+
+    assert np.isclose(row["auction_imbalance_change_stage2"], -1.6)
+    assert np.isclose(row["auction_imbalance_relative_change_stage2"], -2.0)
+    assert np.isclose(
+        row["auction_imbalance_fisher_change_stage2"],
+        np.arctanh(-0.8) - np.arctanh(0.8),
+    )
+    assert row["auction_imbalance_change_stage2"] != row[
+        "auction_imbalance_relative_change_stage2"
+    ]
+    assert row["auction_imbalance_relative_change_stage2"] != row[
+        "auction_imbalance_fisher_change_stage2"
+    ]
+
+
+def test_stage2_imbalance_changes_are_missing_with_fewer_than_two_valid_l3_values() -> None:
+    quotes = _auction_quotes()
+    quotes[["bid_qty2", "bid_qty3", "ask_qty2", "ask_qty3"]] = quotes[
+        ["bid_qty2", "bid_qty3", "ask_qty2", "ask_qty3"]
+    ].astype(float)
+    quotes.loc[:, ["bid_qty2", "bid_qty3", "ask_qty2", "ask_qty3"]] = np.nan
+    row = calculate_daily_auction_factors(quotes, "000001.SZ")
+
+    assert np.isnan(row["auction_imbalance_change_stage2"])
+    assert np.isnan(row["auction_imbalance_relative_change_stage2"])
+    assert np.isnan(row["auction_imbalance_fisher_change_stage2"])
 
 
 def test_stage2_twap_does_not_carry_values_across_invalid_snapshots() -> None:
@@ -767,6 +744,38 @@ def test_unmatched_imbalance_is_missing_when_final_quantities_are_nan() -> None:
     row = calculate_daily_auction_factors(quotes, "000001.SZ")
 
     assert np.isnan(row["auction_unmatched_imbalance"])
+
+
+def test_zero_final_l3_depth_is_missing_for_both_factors() -> None:
+    quotes = _auction_quotes()
+    final_index = quotes.index[-2]
+    quotes.loc[
+        final_index, ["bid_qty2", "bid_qty3", "ask_qty2", "ask_qty3"]
+    ] = 0.0
+
+    row = calculate_daily_auction_factors(quotes, "000001.SZ")
+
+    assert np.isnan(row["auction_unmatched_imbalance"])
+    assert np.isnan(row["auction_l3_buy_share_final"])
+
+
+def test_l3_buy_share_final_uses_the_last_minute_when_three_quotes_exist() -> None:
+    rows = [
+        _quote_row("2026-03-31 09:15:00", 10.00, 600, 400),
+        _quote_row("2026-03-31 09:18:00", 10.01, 700, 300),
+        _quote_row("2026-03-31 09:20:00", 10.02, 100, 900),
+        _quote_row("2026-03-31 09:23:59", 10.03, 900, 100),
+        _quote_row("2026-03-31 09:24:10", 10.04, 200, 800),
+        _quote_row("2026-03-31 09:24:30", 10.04, 400, 600),
+        _quote_row("2026-03-31 09:24:59", 10.04, 600, 400),
+    ]
+    row = calculate_daily_auction_factors(pd.DataFrame(rows), "000001.SZ")
+
+    assert row["auction_l3_buy_share_final"] == pytest.approx((0.2 + 0.4 + 0.6) / 3)
+    assert row["auction_unmatched_imbalance"] == pytest.approx(0.2)
+    assert row["auction_l3_buy_share_final"] != pytest.approx(
+        (row["auction_unmatched_imbalance"] + 1.0) / 2.0
+    )
 
 
 def test_l3_imbalance_excludes_equal_virtual_level1_quantity() -> None:
@@ -1062,7 +1071,8 @@ def test_report_smoothed_factors_use_inclusive_twenty_day_window() -> None:
 
     result = apply_report_smoothed_factors(frame)
 
-    assert result[REPORT_SMOOTHED_FACTOR_COLUMNS].iloc[:19].isna().all().all()
+    assert result[REPORT_SMOOTHED_FACTOR_COLUMNS].iloc[:4].isna().all().all()
+    assert result[REPORT_SMOOTHED_FACTOR_COLUMNS].iloc[4:].notna().all().all()
     assert np.isclose(
         result.loc[19, "auction_snapshot_count_total_mean_20d"],
         np.mean(values[:20]),
@@ -1230,7 +1240,10 @@ def test_historical_context_uses_prior_day_and_full_universe_ranks(tmp_path) -> 
     assert np.isclose(context["_prev_2d_return"], 121 / 119 - 1)
     assert context["previous_day_volume_shares"] == 1210 * 100
     assert context["previous_day_high"] == 131.0
+    assert context["_previous_day_high_adjusted"] == 131.0
     assert context["previous_7d_close_max"] == 121.0
+    assert context["_previous_7d_close_max_adjusted"] == 121.0
+    assert context["_target_adj_factor"] == 1.0
     assert context["previous_day_float_market_cap_cny"] == 121000 * 10000
     assert context["auction_limit_up_price"] == 142.0
     assert context["auction_limit_down_price"] == 102.0
@@ -1249,6 +1262,57 @@ def test_historical_context_uses_prior_day_and_full_universe_ranks(tmp_path) -> 
     assert np.isnan(suspended_context["_prev_2d_return"])
     assert np.isnan(suspended_context["prev_2d_return_rank_cs"])
     assert np.isnan(suspended_context["_market_above_ma20"])
+
+
+def test_cross_day_price_factors_use_adjusted_context_without_changing_raw_references(
+    tmp_path,
+) -> None:
+    dates = pd.date_range("2026-01-01", periods=8, freq="D")
+    closes = [100.0, 60.0, 61.0, 62.0, 63.0, 64.0, 65.0, 65.0]
+    adjustment_factors = [1.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0]
+    daily_path = tmp_path / "daily_adjusted.parquet"
+    pd.DataFrame(
+        {
+            "trade_date": dates,
+            "ts_code": "000001.SZ",
+            "close": closes,
+            "high": np.asarray(closes) + 1.0,
+            "low": np.asarray(closes) - 1.0,
+            "pre_close": closes,
+            "adj_factor": adjustment_factors,
+        }
+    ).set_index(["trade_date", "ts_code"]).to_parquet(daily_path)
+
+    context = build_historical_context(
+        daily_path, ["2026-01-08"], {"000001.SZ"}
+    )["000001.SZ"]
+    context_row = context.iloc[0]
+    frame = _historical_frame([100.0])
+    frame.loc[0, "trade_date"] = "2026-01-08"
+    frame.loc[0, "auction_open_price"] = 65.0
+
+    result = apply_external_context(frame, context).iloc[0]
+
+    assert context_row["previous_day_high"] == 66.0
+    assert context_row["previous_7d_close_max"] == 100.0
+    assert context_row["_previous_day_high_adjusted"] == 132.0
+    assert context_row["_previous_7d_close_max_adjusted"] == 130.0
+    assert context_row["_target_adj_factor"] == 2.0
+    assert result["previous_day_high"] == 66.0
+    assert result["previous_7d_close_max"] == 100.0
+    assert np.isclose(result["auction_open_to_prev_high"], 130.0 / 132.0 - 1.0)
+    assert result["auction_open_to_prev7d_close_max"] == 0.0
+
+    missing_adjustment = context.drop(
+        columns=[
+            "_previous_day_high_adjusted",
+            "_previous_7d_close_max_adjusted",
+            "_target_adj_factor",
+        ]
+    )
+    missing_result = apply_external_context(frame, missing_adjustment).iloc[0]
+    assert np.isnan(missing_result["auction_open_to_prev_high"])
+    assert np.isnan(missing_result["auction_open_to_prev7d_close_max"])
 
 
 def test_external_context_applies_benchmark_time_and_excess_returns() -> None:
@@ -1274,6 +1338,9 @@ def test_external_context_applies_benchmark_time_and_excess_returns() -> None:
                 "previous_day_volume_shares": 100000.0,
                 "previous_day_high": 10.2,
                 "previous_7d_close_max": 10.5,
+                "_previous_day_high_adjusted": 15.3,
+                "_previous_7d_close_max_adjusted": 15.75,
+                "_target_adj_factor": 2.0,
                 "previous_day_float_market_cap_cny": 1_000_000_000.0,
                 "auction_limit_up_price": 11.0,
                 "auction_limit_down_price": 9.0,
@@ -1306,9 +1373,9 @@ def test_external_context_applies_benchmark_time_and_excess_returns() -> None:
     assert np.isclose(
         result["auction_amount_to_float_mcap_prevclose"], 10050 / 1_000_000_000
     )
-    assert np.isclose(result["auction_open_to_prev_high"], 10.05 / 10.2 - 1.0)
+    assert np.isclose(result["auction_open_to_prev_high"], 10.05 * 2.0 / 15.3 - 1.0)
     assert np.isclose(
-        result["auction_open_to_prev7d_close_max"], 10.05 / 10.5 - 1.0
+        result["auction_open_to_prev7d_close_max"], 10.05 * 2.0 / 15.75 - 1.0
     )
     assert result["auction_stage1_touched_limit_up"] == 1.0
     assert result["auction_stage1_touched_limit_down"] == 1.0
@@ -1829,7 +1896,7 @@ def test_tick_cache_streams_auction_window_and_invalidates_source(tmp_path) -> N
     ).to_csv(quote_path, index=False, encoding="gbk")
 
     uncached = load_quote_frame(raw_dir)
-    cache = AuctionTickCache(tmp_path / "cache")
+    cache = AuctionTickCache(tmp_path / "cache", validate_source=True)
     cached = load_quote_frame(raw_dir, cache=cache)
     assert cached["trade_time"].tolist() == uncached["trade_time"].tolist()
     assert cached["trade_time"].min() == pd.Timestamp("2026-03-31 09:15:00")
@@ -1948,7 +2015,8 @@ def test_report_smoothed_backfill_reads_only_existing_output(tmp_path, monkeypat
     result = pd.read_parquet(written_path)
     assert row_count == 21
     assert result["trade_date"].tolist() == existing["trade_date"].tolist()
-    assert result[REPORT_SMOOTHED_FACTOR_COLUMNS].iloc[:19].isna().all().all()
+    assert result["auction_snapshot_count_total_mean_20d"].iloc[:4].isna().all()
+    assert result["auction_snapshot_count_total_mean_20d"].iloc[4:].notna().all()
     assert result.loc[19, "auction_snapshot_count_total_mean_20d"] == pytest.approx(10.5)
     assert result.loc[20, "auction_snapshot_count_total_mean_20d"] == pytest.approx(11.5)
 

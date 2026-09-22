@@ -218,10 +218,17 @@ class CacheStats:
 
 
 class AuctionTickCache:
-    def __init__(self, root: Path | None, refresh: bool = False, chunksize: int = DEFAULT_CHUNK_SIZE):
+    def __init__(
+        self,
+        root: Path | None,
+        refresh: bool = False,
+        chunksize: int = DEFAULT_CHUNK_SIZE,
+        validate_source: bool = False,
+    ):
         self.root = Path(root) if root is not None else None
         self.refresh = refresh
         self.chunksize = chunksize
+        self.validate_source = validate_source
         self.stats = CacheStats()
 
     def _load(
@@ -253,15 +260,28 @@ class AuctionTickCache:
         cache_dir = self.root / symbol_dir.parent.parent.parent.name / symbol_dir.parent.parent.name / symbol_dir.parent.name / symbol_dir.name
         target = cache_dir / f"{kind}.parquet"
         metadata = target.with_suffix(".json")
-        signature = _source_signature(source)
-        if not self.refresh and target.exists() and metadata.exists():
-            try:
-                cached = json.loads(metadata.read_text(encoding="utf-8"))
-                if cached.get("version") == CACHE_VERSION and cached.get("source") == signature:
+        # Fast path: If cache exists and not refreshing, directly return cached parquet!
+        # Completely bypasses slow external disk stat() and eliminates millions of JSON reads/parses.
+        if not self.refresh and target.exists():
+            if not self.validate_source:
+                try:
+                    frame = pd.read_parquet(target)
                     self.stats.hits += 1
-                    return pd.read_parquet(target)
-            except (OSError, ValueError, TypeError):
-                pass
+                    return frame
+                except (OSError, ValueError, TypeError):
+                    # Corrupted cache fallback: will rebuild below
+                    pass
+            elif metadata.exists():
+                signature = _source_signature(source)
+                try:
+                    cached = json.loads(metadata.read_text(encoding="utf-8"))
+                    if cached.get("version") == CACHE_VERSION and cached.get("source") == signature:
+                        self.stats.hits += 1
+                        return pd.read_parquet(target)
+                except (OSError, ValueError, TypeError):
+                    pass
+
+        signature = _source_signature(source)
 
         frame = _read_csv_chunks(
             source,
