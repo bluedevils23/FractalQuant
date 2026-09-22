@@ -442,6 +442,8 @@ def normalize_minute_frame(raw_df: pd.DataFrame) -> pd.DataFrame:
     ]
     for column in numeric_columns:
         df[column] = pd.to_numeric(df[column], errors="coerce")
+    if "adj_factor" not in df.columns:
+        df["adj_factor"] = float("nan")
 
     df["ts_code"] = df["ts_code"].astype(str)
     return df
@@ -464,7 +466,7 @@ def normalize_daily_frame(raw_df: pd.DataFrame) -> pd.DataFrame:
         for column in (
             "open", "high", "low", "close", "volume", "amount",
             "total_size", "total_share", "retail_trade_ratio",
-            "csi_all_share_return",
+            "csi_all_share_return", "adj_factor",
         )
         if column in df.columns
     ]
@@ -478,6 +480,11 @@ def normalize_daily_frame(raw_df: pd.DataFrame) -> pd.DataFrame:
     if "total_share" in df.columns and "close" in df.columns:
         cmc = cmc.fillna(df["total_share"] * df["close"])
     df["cmc"] = cmc
+    valid_factor = df["adj_factor"]
+    valid_factor = valid_factor.where(valid_factor.gt(0))
+    for column in ("open", "high", "low", "close"):
+        if column in df.columns:
+            df[f"adj_{column}"] = df[column] * valid_factor
     return df
 
 
@@ -585,6 +592,7 @@ def load_daily_inputs(
 
     daily_base_columns = [
         "ts_code", "trade_date", "open", "high", "low", "close",
+        "adj_open", "adj_high", "adj_low", "adj_close", "adj_factor",
         "volume", "amount", "cmc",
     ]
     daily_base_columns.extend(
@@ -592,7 +600,9 @@ def load_daily_inputs(
     )
     daily_base = daily_df[daily_base_columns].copy()
 
-    daily_pv = daily_df[["ts_code", "trade_date", "open", "close", "cmc"]].copy()
+    daily_pv = daily_df[
+        ["ts_code", "trade_date", "open", "close", "cmc", "adj_factor"]
+    ].copy()
     daily_pv = daily_pv.rename(
         columns={
             "ts_code": "Stkcd",
@@ -600,6 +610,7 @@ def load_daily_inputs(
             "open": "Opnprc",
             "close": "Clsprc",
             "cmc": "Dsmvosd",
+            "adj_factor": "AdjFactor",
         }
     )
     daily_pv["Trddt"] = pd.to_datetime(daily_pv["Trddt"]).dt.strftime("%Y-%m-%d")
@@ -1007,6 +1018,7 @@ def enrich_with_daily_base(
     )
     daily_columns = [
         "code", "date", "open", "high", "low", "close",
+        "adj_open", "adj_high", "adj_low", "adj_close", "adj_factor",
         "volume", "amount", "cmc",
     ]
     daily_columns.extend(

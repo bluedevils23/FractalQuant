@@ -429,6 +429,7 @@ def test_all_raw_factors_accept_a_complete_multi_symbol_day() -> None:
             "Opnprc": 99.0 + code_index,
             "Clsprc": 100.0 + code_index,
             "Dsmvosd": 1_000.0,
+            "AdjFactor": 1.0,
         }
         for code_index, code in enumerate(codes)
         for value in daily_dates
@@ -476,6 +477,7 @@ def test_cao_mu_jie_bing_matches_report_formula_and_five_observation_minimum() -
             "code": ["A"] * len(dates),
             "date": [value.date() for value in dates],
             "close": closes,
+            "adj_close": closes,
             "RiBoDongLv": [0.02] * len(dates),
             "retail_trade_ratio": [0.4] * len(dates),
             "csi_all_share_return": [0.0] * len(dates),
@@ -505,6 +507,17 @@ def test_cao_mu_jie_bing_matches_report_formula_and_five_observation_minimum() -
     )
     assert result["CaoMuJieBing"].first_valid_index() == 7
 
+    split_panel = panel.with_columns(
+        pl.when(pl.col("date") == dates[-1].date())
+        .then(pl.col("close") / 2.0)
+        .otherwise(pl.col("close"))
+        .alias("close")
+    )
+    adjusted = fz_methods.cal_CaoMuJieBing(split_panel).to_pandas()
+    np.testing.assert_allclose(
+        adjusted["CaoMuJieBing"], result["CaoMuJieBing"], equal_nan=True
+    )
+
 
 def test_xie_tong_jia_cha_uses_daily_previous_close() -> None:
     rows = []
@@ -529,6 +542,7 @@ def test_xie_tong_jia_cha_uses_daily_previous_close() -> None:
             "Stkcd": ["A", "B", "A", "B"],
             "Trddt": ["2024-01-01", "2024-01-01", "2024-01-02", "2024-01-02"],
             "Clsprc": [100.0, 100.0, 109.0, 104.5],
+            "AdjFactor": [1.0, 1.0, 1.0, 1.0],
         }
     )
 
@@ -540,4 +554,26 @@ def test_xie_tong_jia_cha_uses_daily_previous_close() -> None:
     np.testing.assert_allclose(
         result["XieTongJiaCha"].to_numpy(),
         [0.045, -0.045],
+    )
+
+    split_minute = minute.with_columns(
+        pl.when(pl.col("code") == "A")
+        .then(pl.col("close") / 2.0)
+        .otherwise(pl.col("close"))
+        .alias("close")
+    )
+    split_daily = daily.with_columns(
+        pl.when((pl.col("Stkcd") == "A") & (pl.col("Trddt") == "2024-01-02"))
+        .then(pl.col("Clsprc") / 2.0)
+        .otherwise(pl.col("Clsprc"))
+        .alias("Clsprc"),
+        pl.when((pl.col("Stkcd") == "A") & (pl.col("Trddt") == "2024-01-02"))
+        .then(2.0)
+        .otherwise(pl.col("AdjFactor"))
+        .alias("AdjFactor"),
+    )
+    adjusted = fz_methods.cal_XieTongJiaCha(split_minute, split_daily).sort("code")
+    np.testing.assert_allclose(
+        adjusted["XieTongJiaCha"].to_numpy(),
+        result["XieTongJiaCha"].to_numpy(),
     )

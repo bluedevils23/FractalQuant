@@ -4,6 +4,7 @@ from datetime import date
 import json
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import polars as pl
 import pytest
@@ -167,6 +168,7 @@ def test_daily_normalization_preserves_cao_mu_source_fields() -> None:
             "ts_code": ["000001.SZ"],
             "open": [10.0],
             "close": [10.1],
+            "adj_factor": [1.5],
             "total_share": [100.0],
             "retail_trade_ratio": ["0.25"],
             "csi_all_share_return": ["0.01"],
@@ -177,6 +179,56 @@ def test_daily_normalization_preserves_cao_mu_source_fields() -> None:
 
     assert result.loc[0, "retail_trade_ratio"] == 0.25
     assert result.loc[0, "csi_all_share_return"] == 0.01
+    assert result.loc[0, "adj_close"] == pytest.approx(15.15)
+
+
+def test_fei_pu_huo_is_invariant_to_split_adjustment() -> None:
+    dates = pd.bdate_range("2025-01-02", periods=25)
+    rows = []
+    for code_index, code in enumerate(("A", "B", "C")):
+        for day_index, trade_date in enumerate(dates):
+            close = 100.0 + code_index * 5.0 + day_index
+            rows.append(
+                {
+                    "trade_date": trade_date,
+                    "ts_code": code,
+                    "open": close - 0.5,
+                    "high": close + 1.0 + code_index * 0.1,
+                    "low": close - 1.0,
+                    "close": close,
+                    "adj_factor": 1.0,
+                }
+            )
+    source = pd.DataFrame(rows)
+
+    def calculate(frame: pd.DataFrame) -> pl.DataFrame:
+        normalized = fz.normalize_daily_frame(frame)
+        panel = normalized.rename(
+            columns={"ts_code": "code", "trade_date": "date"}
+        )
+        panel["date"] = panel["date"].dt.date
+        panel["TiaoYueDu"] = (
+            panel.groupby("code").cumcount() + panel["code"].map({"A": 0, "B": 2, "C": 4})
+        )
+        return fz.fz_methods.cal_FeiEPuHuo(
+            pl.from_pandas(panel, include_index=False)
+        ).sort(["code", "date"])
+
+    baseline = calculate(source)
+    split = source.copy()
+    split_mask = split["trade_date"].eq(dates[-1]) & split["ts_code"].eq("A")
+    split.loc[split_mask, ["open", "high", "low", "close"]] /= 2.0
+    split.loc[split_mask, "adj_factor"] = 2.0
+    adjusted = calculate(split)
+
+    assert baseline.select(["code", "date"]).equals(
+        adjusted.select(["code", "date"])
+    )
+    np.testing.assert_allclose(
+        adjusted["FeiEPuHuo"].to_numpy(),
+        baseline["FeiEPuHuo"].to_numpy(),
+        equal_nan=True,
+    )
 
 
 def test_cao_mu_source_availability_and_strict_policy() -> None:

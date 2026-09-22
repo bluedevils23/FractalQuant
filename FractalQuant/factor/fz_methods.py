@@ -667,13 +667,13 @@ def cal_FeiEPuHuo(df: pl.DataFrame):
     return (
         df.lazy().sort(by=['code', 'date'])
         .with_columns(
-            ((pl.col('high') - pl.col('low')) / pl.col('close').shift(1))
+            ((pl.col('adj_high') - pl.col('adj_low')) / pl.col('adj_close').shift(1))
             .over('code')
             .alias('range'),
-            (pl.col('high') / pl.col('low').shift(1) - 1)
+            (pl.col('adj_high') / pl.col('adj_low').shift(1) - 1)
             .over('code')
             .alias('single_return'),
-            (pl.col('high') / pl.col('low').shift(1))
+            (pl.col('adj_high') / pl.col('adj_low').shift(1))
             .over('code')
             .log()
             .alias('log_return')
@@ -749,7 +749,7 @@ def cal_CaoMuJieBing(df: pl.DataFrame):
         )
     return (
         df.lazy().sort(['code', 'date']).with_columns(
-            pl.col('close')
+            pl.col('adj_close')
             .pct_change()
             .over('code')
             .alias('daily_return')
@@ -1452,9 +1452,6 @@ def cal_XieTongJiaCha(
     minute['past_return_mean'] = grouped['minute_return'].transform(
         lambda values: values.shift(1).rolling(5, min_periods=5).mean()
     )
-    minute['past_close_mean'] = grouped['close'].transform(
-        lambda values: values.shift(1).rolling(5, min_periods=5).mean()
-    )
     minute['past_volume_mean'] = grouped['volume'].transform(
         lambda values: values.shift(1).rolling(5, min_periods=5).mean()
     )
@@ -1464,12 +1461,36 @@ def cal_XieTongJiaCha(
         daily = daily_pv.to_pandas().copy()
         daily['date'] = pd.to_datetime(daily['Trddt']).dt.date
         daily = daily.sort_values(['Stkcd', 'date'])
-        daily['previous_close'] = daily.groupby('Stkcd')['Clsprc'].shift(1)
+        factor = pd.to_numeric(
+            daily.get('AdjFactor', pd.Series(np.nan, index=daily.index)),
+            errors='coerce',
+        )
+        factor = factor.where(factor > 0)
+        daily['adjusted_close'] = pd.to_numeric(
+            daily['Clsprc'], errors='coerce'
+        ) * factor
+        daily['previous_close'] = daily.groupby('Stkcd')[
+            'adjusted_close'
+        ].shift(1)
         previous_close = {
             (str(row.Stkcd), row.date): row.previous_close
             for row in daily.itertuples()
             if pd.notna(row.previous_close)
         }
+        current_factor = {
+            (str(row.Stkcd), row.date): row.AdjFactor
+            for row in daily.itertuples()
+            if pd.notna(row.AdjFactor) and row.AdjFactor > 0
+        }
+    else:
+        current_factor = {}
+    minute['adjusted_close'] = minute['close'] * pd.Series(
+        [
+            current_factor.get((str(code), date), np.nan)
+            for code, date in zip(minute['code'], minute['date'])
+        ],
+        index=minute.index,
+    )
     minute['previous_close'] = [
         previous_close.get((str(code), date), np.nan)
         for code, date in zip(minute['code'], minute['date'])
@@ -1478,10 +1499,13 @@ def cal_XieTongJiaCha(
     # A zero return falls back to the preceding five-minute price, then the
     # previous daily close, as specified by the report.
     direction = np.sign(minute['minute_return'])
-    fallback_price = minute['close'] - minute['past_close_mean']
+    minute['past_adjusted_close_mean'] = grouped['adjusted_close'].transform(
+        lambda values: values.shift(1).rolling(5, min_periods=5).mean()
+    )
+    fallback_price = minute['adjusted_close'] - minute['past_adjusted_close_mean']
     fallback_price = fallback_price.where(
         fallback_price != 0,
-        minute['close'] - minute['previous_close'],
+        minute['adjusted_close'] - minute['previous_close'],
     )
     direction = direction.where(direction != 0, np.sign(fallback_price))
     relative_direction = np.sign(minute['minute_return'] - minute['past_return_mean'])
@@ -1516,7 +1540,9 @@ def cal_XieTongJiaCha(
         for signal in signals:
             similarity += (signal[:, None, :] == signal[None, :, :]).sum(axis=2)
         np.fill_diagonal(similarity, -np.inf)
-        returns = day.groupby('code')['close'].agg(lambda values: values.iloc[-1]).reindex(codes)
+        returns = day.groupby('code')['adjusted_close'].agg(
+            lambda values: values.iloc[-1]
+        ).reindex(codes)
         returns = returns / pd.Series(
             [previous_close.get((code, date), np.nan) for code in codes], index=codes
         ) - 1
