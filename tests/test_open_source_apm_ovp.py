@@ -26,6 +26,7 @@ def _minute_frame(symbol: str, dates: pd.DatetimeIndex, base: float) -> pd.DataF
                     "close": value,
                     "volume": 1000.0,
                     "amount": value * 1000.0,
+                    "adj_factor": 1.0,
                     "ts_code": symbol,
                 }
             )
@@ -64,3 +65,25 @@ def test_apm_panel_keeps_null_when_cross_section_is_too_small() -> None:
     assert result["kaiyuan_apmnew_m20"].isna().all()
     assert result["apm_cross_section_count"].eq(0).all()
     assert result["kaiyuan_ovp_m20"].notna().any()
+
+
+def test_apm_raw_features_are_invariant_to_split_adjustment() -> None:
+    dates = pd.bdate_range("2025-01-02", periods=22)
+    asset = _minute_frame("000001.SZ", dates, 100.0)
+    benchmark = _minute_frame("000300.SH", dates, 200.0)
+    baseline = build_daily_apm_raw_features(
+        asset, benchmark, "000001.SZ", "000300.SH"
+    )
+    split = asset.copy()
+    split_date = split["trade_time"].dt.normalize().max()
+    split_mask = split["trade_time"].dt.normalize().eq(split_date)
+    split.loc[split_mask, ["open", "high", "low", "close"]] /= 2.0
+    split.loc[split_mask, "adj_factor"] = 2.0
+    adjusted = build_daily_apm_raw_features(
+        split, benchmark, "000001.SZ", "000300.SH"
+    )
+
+    columns = ["overnight_return", "am_return", "pm_return", "_asset_close"]
+    pd.testing.assert_series_equal(
+        adjusted.loc[21, columns], baseline.loc[21, columns], check_names=False
+    )

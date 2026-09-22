@@ -169,7 +169,7 @@ def normalize_minute_frame(
     if missing:
         raise ValueError(f"Missing required minute columns: {missing}")
 
-    for column in ("open", "high", "low", "close", "volume", "amount"):
+    for column in ("open", "high", "low", "close", "volume", "amount", "adj_factor"):
         if column in frame.columns:
             frame[column] = pd.to_numeric(frame[column], errors="coerce")
     if "ts_code" not in frame.columns and ts_code_hint is not None:
@@ -207,6 +207,16 @@ def _positive_frame(day: pd.DataFrame) -> pd.DataFrame:
 
 def _daily_return_series(session: pd.DataFrame) -> pd.Series:
     return session["close"].pct_change().replace([np.inf, -np.inf], np.nan)
+
+
+def _daily_adjustment_factor(day: pd.DataFrame) -> float:
+    """Return the last valid cumulative adjustment factor for one trade day."""
+
+    if "adj_factor" not in day.columns:
+        return np.nan
+    factors = pd.to_numeric(day["adj_factor"], errors="coerce")
+    factors = factors.loc[np.isfinite(factors) & factors.gt(0)]
+    return float(factors.iloc[-1]) if not factors.empty else np.nan
 
 
 def _time_centers(returns: pd.Series) -> tuple[float, float, float, float]:
@@ -533,6 +543,7 @@ def build_daily_raw_features(
     sessions: list[pd.DataFrame] = []
     dates: list[pd.Timestamp] = []
     for trade_date, raw_day in frame.groupby(frame.index.normalize(), sort=True):
+        adjustment_factor = _daily_adjustment_factor(raw_day)
         day = _positive_frame(raw_day)
         session = _regular_session_frame(day).copy()
         session["_minute_return"] = _daily_return_series(session)
@@ -540,7 +551,11 @@ def build_daily_raw_features(
         sessions.append(session)
         dates.append(pd.Timestamp(trade_date))
         close = day["close"].dropna()
-        daily_close = float(close.iloc[-1]) if not close.empty else np.nan
+        daily_close = (
+            float(close.iloc[-1]) * adjustment_factor
+            if not close.empty and np.isfinite(adjustment_factor)
+            else np.nan
+        )
         high = day["high"].max(skipna=True)
         low = day["low"].min(skipna=True)
         daily_amplitude = (
@@ -557,8 +572,8 @@ def build_daily_raw_features(
             r2 = float(session_returns.iloc[30:60].sum(min_count=1))
             session_open_candidates = raw_day["open"].dropna()
             session_open = (
-                float(session_open_candidates.iloc[0])
-                if not session_open_candidates.empty
+                float(session_open_candidates.iloc[0]) * adjustment_factor
+                if not session_open_candidates.empty and np.isfinite(adjustment_factor)
                 else np.nan
             )
             amount_available = bool("amount" in day and day["amount"].notna().any())

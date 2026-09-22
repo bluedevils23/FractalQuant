@@ -11,7 +11,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-from .open_source import normalize_minute_frame
+from .open_source import _daily_adjustment_factor, normalize_minute_frame
 
 
 APM_FACTOR_COLUMNS = (
@@ -87,6 +87,7 @@ def build_daily_apm_raw_features(
     for date in dates:
         asset_day = _session_day(asset_frame, date)
         benchmark_day = _session_day(benchmark_frame, date)
+        asset_factor = _daily_adjustment_factor(asset_day)
         asset_regular = asset_day.loc[
             ((asset_day.index.strftime("%H:%M") >= "09:31") & (asset_day.index.strftime("%H:%M") <= "11:30"))
             | ((asset_day.index.strftime("%H:%M") >= "13:01") & (asset_day.index.strftime("%H:%M") <= "15:00"))
@@ -95,16 +96,35 @@ def build_daily_apm_raw_features(
             ((benchmark_day.index.strftime("%H:%M") >= "09:31") & (benchmark_day.index.strftime("%H:%M") <= "11:30"))
             | ((benchmark_day.index.strftime("%H:%M") >= "13:01") & (benchmark_day.index.strftime("%H:%M") <= "15:00"))
         ]
-        asset_open = _open_at(asset_day, "09:30")
+        asset_open_raw = _open_at(asset_day, "09:30")
+        asset_open = (
+            asset_open_raw * asset_factor
+            if np.isfinite(asset_open_raw) and np.isfinite(asset_factor)
+            else np.nan
+        )
         benchmark_open = _open_at(benchmark_day, "09:30")
-        asset_close = _close_at(asset_day, "15:00")
+        asset_close_raw = _close_at(asset_day, "15:00")
+        asset_close = (
+            asset_close_raw * asset_factor
+            if np.isfinite(asset_close_raw) and np.isfinite(asset_factor)
+            else np.nan
+        )
         benchmark_close = _close_at(benchmark_day, "15:00")
         if not np.isfinite(previous_asset_close):
-            previous_asset_close = _close_at(asset_frame.loc[asset_frame.index.normalize() < date], "15:00")
+            prior_asset = asset_frame.loc[asset_frame.index.normalize() < date]
+            if not prior_asset.empty:
+                prior_date = prior_asset.index.normalize().max()
+                prior_asset_day = _session_day(asset_frame, prior_date)
+                prior_close = _close_at(prior_asset_day, "15:00")
+                prior_factor = _daily_adjustment_factor(prior_asset_day)
+                if np.isfinite(prior_close) and np.isfinite(prior_factor):
+                    previous_asset_close = prior_close * prior_factor
         if not np.isfinite(previous_benchmark_close):
             previous_benchmark_close = _close_at(benchmark_frame.loc[benchmark_frame.index.normalize() < date], "15:00")
-        am_end = _close_at(asset_day, "11:30")
-        pm_start = _open_at(asset_day, "13:00")
+        am_end_raw = _close_at(asset_day, "11:30")
+        pm_start_raw = _open_at(asset_day, "13:00")
+        am_end = am_end_raw * asset_factor if np.isfinite(am_end_raw) and np.isfinite(asset_factor) else np.nan
+        pm_start = pm_start_raw * asset_factor if np.isfinite(pm_start_raw) and np.isfinite(asset_factor) else np.nan
         pm_end = asset_close
         bench_am_end = _close_at(benchmark_day, "11:30")
         bench_pm_start = _open_at(benchmark_day, "13:00")

@@ -50,6 +50,7 @@ def _minute_frame(
                 "low": close[position] - 0.02,
                 "close": close[position],
                 "vol": volume[position],
+                "adj_factor": 1.0,
                 "ts_code": symbol,
             }
             if with_amount:
@@ -96,6 +97,39 @@ def test_ideal_amplitude_uses_high_and_low_price_states() -> None:
     expected = raw["daily_amplitude"].iloc[-1] - raw["daily_amplitude"].iloc[0]
 
     assert np.isclose(raw["_ideal_amplitude"].iloc[-1], expected)
+
+
+def test_cross_day_price_features_are_invariant_to_split_adjustment() -> None:
+    source = _minute_frame(days=4)
+    baseline = build_daily_raw_features(
+        source.set_index("trade_time"),
+        "510300.SH",
+        factor_window=4,
+        smart_money_window=2,
+    )
+    split = source.copy()
+    split_date = split["trade_time"].dt.normalize().max()
+    split_mask = split["trade_time"].dt.normalize().eq(split_date)
+    split.loc[split_mask, ["open", "high", "low", "close"]] /= 2.0
+    split.loc[split_mask, "adj_factor"] = 2.0
+    adjusted = build_daily_raw_features(
+        split.set_index("trade_time"),
+        "510300.SH",
+        factor_window=4,
+        smart_money_window=2,
+    )
+
+    columns = [
+        "daily_close",
+        "daily_return",
+        "overnight_return",
+        "_ideal_amplitude",
+        "_ideal_reversal",
+        "ideal_turnover_raw",
+    ]
+    pd.testing.assert_series_equal(
+        adjusted.loc[3, columns], baseline.loc[3, columns], check_names=False
+    )
 
 
 def test_smart_money_selection_is_volume_weighted_and_causal() -> None:
