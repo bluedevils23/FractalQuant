@@ -36,6 +36,9 @@ DEFAULT_INPUT_ROOT = Path(r"E:\逐笔数据")
 DEFAULT_OUTPUT_ROOT = Path(
     r"D:\workspace\stockdata\stock-factors\open_source_tick_factors"
 )
+DEFAULT_DAILY_PATH = Path(
+    r"D:\workspace\stockdata\stock-data\行情数据\stock_daily.parquet"
+)
 SYMBOL_PATTERN = re.compile(r"^\d{6}\.[A-Z]{2}$")
 TRANSACTION_NAMES = ("逐笔成交.csv", "transactions.parquet")
 ORDER_NAMES = ("逐笔委托.csv", "orders.parquet")
@@ -306,6 +309,34 @@ def build_raw_panel(
     return pd.concat(frames, ignore_index=True), failures
 
 
+def load_daily_adjustment_factors(
+    path: Path,
+    symbols: list[str],
+    date_to: str | None,
+) -> pd.DataFrame:
+    """Load cumulative daily adjustment factors for the extracted tick panel."""
+
+    if not path.is_file():
+        raise FileNotFoundError(f"Daily adjustment source does not exist: {path}")
+    filters: list[tuple[str, str, object]] = [("ts_code", "in", symbols)]
+    if date_to:
+        filters.append(("trade_date", "<=", pd.Timestamp(date_to)))
+    factors = pd.read_parquet(path, columns=["adj_factor"], filters=filters).reset_index()
+    required = {"trade_date", "ts_code", "adj_factor"}
+    missing = sorted(required - set(factors.columns))
+    if missing:
+        raise ValueError(f"Daily adjustment source is missing columns: {missing}")
+    factors["trade_date"] = pd.to_datetime(
+        factors["trade_date"], errors="coerce"
+    ).dt.normalize()
+    factors["ts_code"] = factors["ts_code"].astype(str)
+    factors["adj_factor"] = pd.to_numeric(factors["adj_factor"], errors="coerce")
+    factors.loc[factors["adj_factor"].le(0), "adj_factor"] = pd.NA
+    return factors.dropna(subset=["trade_date", "ts_code"]).drop_duplicates(
+        ["trade_date", "ts_code"], keep="last"
+    )
+
+
 def write_outputs(
     panel: pd.DataFrame,
     output_root: Path,
@@ -350,6 +381,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input-root", type=Path, default=DEFAULT_INPUT_ROOT)
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
+    parser.add_argument("--daily-path", type=Path, default=DEFAULT_DAILY_PATH)
     parser.add_argument("--symbols", nargs="*", default=None)
     parser.add_argument("--symbols-file", type=Path, default=None)
     parser.add_argument("--limit", type=int, default=None)
@@ -387,6 +419,22 @@ def main() -> int:
     LOGGER.info("Extracting transaction factors for %s symbols", len(files))
     raw_started = time.monotonic()
     raw_panel, failures = build_raw_panel(files, max(1, int(args.workers)))
+    adjustments = load_daily_adjustment_factors(
+        args.daily_path, sorted(files), date_to
+    )
+    raw_panel = raw_panel.merge(
+        adjustments,
+        on=["trade_date", "ts_code"],
+        how="left",
+        validate="many_to_one",
+    )
+    missing_adjustments = int(raw_panel["adj_factor"].isna().sum())
+    if missing_adjustments:
+        LOGGER.warning(
+            "Missing daily adjustment factors for %s/%s raw rows; cross-day price factors will be null",
+            missing_adjustments,
+            len(raw_panel),
+        )
     LOGGER.info(
         "Raw extraction complete: %s rows, %s failures, elapsed=%s",
         len(raw_panel),

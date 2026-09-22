@@ -8,6 +8,7 @@ import numpy as np
 import pandas as pd
 
 from factor.open_source_tick import (
+    _adjusted_close_returns,
     AUDIT_COLUMNS,
     TICK_FACTOR_COLUMNS,
     add_availability_columns,
@@ -80,6 +81,7 @@ def test_panel_rolling_and_next_actual_date() -> None:
         [build_daily_tick_raw_features(frame, "000001.SZ") for frame in frames],
         ignore_index=True,
     )
+    raw["adj_factor"] = 1.0
     panel = add_availability_columns(build_open_source_tick_factor_panel(raw))
     assert panel[list(TICK_FACTOR_COLUMNS[:5])].iloc[19].notna().all()
     assert panel.loc[0, "available_date"] == dates[1]
@@ -98,6 +100,7 @@ def test_ev_and_conditional_flow_factors_are_cross_sectional() -> None:
                     "trade_date": date,
                     "ts_code": f"{symbol_index:06d}.SZ",
                     "daily_close": 100 + symbol_index + day_index * 0.1,
+                    "adj_factor": 1.0,
                     "daily_return": 0.001 * symbol_index,
                     "daily_amount": 10_000_000 + symbol_index * 100_000,
                     "trade_count": 240,
@@ -152,6 +155,7 @@ def test_tick_ideal_reversal_siblings_use_daily_trade_intensity() -> None:
         frame.loc[frame.index[-1], "price"] *= 1 + (0.002 if i % 2 else -0.002)
         frames.append(build_daily_tick_raw_features(frame, "000001.SZ"))
     raw = pd.concat(frames, ignore_index=True)
+    raw["adj_factor"] = 1.0
     panel = add_availability_columns(build_open_source_tick_factor_panel(raw))
     assert pd.notna(panel["kaiyuan_ideal_reversal_tick_notional_m20"].iloc[-1])
     assert pd.notna(panel["kaiyuan_ideal_reversal_tick_volume_m20"].iloc[-1])
@@ -198,6 +202,7 @@ def test_trade_code_cancellation_and_scaled_csv_values() -> None:
 def test_cli_single_symbol_smoke(tmp_path: Path) -> None:
     input_root = tmp_path / "ticks"
     output_root = tmp_path / "out"
+    daily_path = tmp_path / "stock_daily.parquet"
     day_dir = input_root / "2025" / "202501" / "20250102" / "000001.SZ"
     day_dir.mkdir(parents=True)
     _transactions("2025-01-02").to_csv(day_dir / "transactions.csv", index=False)
@@ -214,6 +219,13 @@ def test_cli_single_symbol_smoke(tmp_path: Path) -> None:
             "ts_code": "000001.SZ",
         }
     ).to_parquet(day_dir / "orders.parquet", index=False)
+    pd.DataFrame(
+        {
+            "trade_date": [pd.Timestamp("2025-01-02")],
+            "ts_code": ["000001.SZ"],
+            "adj_factor": [1.0],
+        }
+    ).set_index(["trade_date", "ts_code"]).to_parquet(daily_path)
     script = Path(__file__).parents[1] / "scripts" / "generate_open_source_tick_factors.py"
     completed = subprocess.run(
         [
@@ -223,6 +235,8 @@ def test_cli_single_symbol_smoke(tmp_path: Path) -> None:
             str(input_root),
             "--output-root",
             str(output_root),
+            "--daily-path",
+            str(daily_path),
             "--symbols",
             "000001.SZ",
             "--workers",
@@ -332,7 +346,7 @@ def test_flow_factors_require_cross_section_and_keep_unmatched_days_null() -> No
             )
         )
     panel = build_open_source_tick_factor_panel(
-        pd.concat(raw_frames, ignore_index=True)
+        pd.concat(raw_frames, ignore_index=True).assign(adj_factor=1.0)
     )
     last_day = panel.loc[panel["trade_date"] == pd.Timestamp("2025-01-30")]
     assert last_day["flow_cross_section_count"].eq(20).all()
@@ -345,6 +359,29 @@ def test_flow_factors_require_cross_section_and_keep_unmatched_days_null() -> No
     incomplete.loc[:, "active_order_match_amount_coverage"] = 0.1
     incomplete.loc[:, "flow_classification_valid"] = False
     incomplete.loc[:, "daily_flow_large_buy"] = np.nan
-    assert build_open_source_tick_factor_panel(incomplete)[
+    assert build_open_source_tick_factor_panel(incomplete.assign(adj_factor=1.0))[
         "kaiyuan_large_flow_s3_m20"
     ].isna().all()
+
+
+def test_cross_day_tick_returns_are_invariant_to_split_adjustment() -> None:
+    dates = pd.bdate_range("2025-01-02", periods=21)
+    raw = pd.concat(
+        [
+            build_daily_tick_raw_features(
+                _transactions(date.strftime("%Y-%m-%d"), amount_scale=1 + index / 100),
+                "000001.SZ",
+            )
+            for index, date in enumerate(dates)
+        ],
+        ignore_index=True,
+    )
+    raw["adj_factor"] = 1.0
+    baseline_return, baseline_ret20 = _adjusted_close_returns(raw, 20)
+    split = raw.copy()
+    split.loc[20, "daily_close"] /= 2.0
+    split.loc[20, "adj_factor"] = 2.0
+    adjusted_return, adjusted_ret20 = _adjusted_close_returns(split, 20)
+
+    assert np.isclose(adjusted_return.loc[20], baseline_return.loc[20])
+    assert np.isclose(adjusted_ret20.loc[20], baseline_ret20.loc[20])

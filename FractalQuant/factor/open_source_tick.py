@@ -1187,6 +1187,22 @@ def _cross_section_modified_flow(
     return modified_buy, modified_sell, counts, r2_values, daily_ratio
 
 
+def _adjusted_close_returns(
+    frame: pd.DataFrame, window: int
+) -> tuple[pd.Series, pd.Series]:
+    """Compute cross-day returns from raw closes and cumulative adjustment factors."""
+
+    close = pd.to_numeric(frame["daily_close"], errors="coerce")
+    factor = pd.to_numeric(frame["adj_factor"], errors="coerce").where(
+        lambda values: values.gt(0)
+    )
+    adjusted_close = close * factor
+    grouped = adjusted_close.groupby(frame["ts_code"], sort=False)
+    close_to_close = grouped.pct_change(fill_method=None)
+    ret20 = grouped.transform(lambda values: values / values.shift(window) - 1.0)
+    return close_to_close, ret20
+
+
 def build_open_source_tick_factor_panel(
     raw_panel: pd.DataFrame, window: int = ROLLING_WINDOW
 ) -> pd.DataFrame:
@@ -1197,14 +1213,12 @@ def build_open_source_tick_factor_panel(
     frame = raw_panel.copy()
     frame["trade_date"] = pd.to_datetime(frame["trade_date"], errors="coerce").dt.normalize()
     frame = frame.sort_values(["ts_code", "trade_date"], kind="mergesort").reset_index(drop=True)
-    for column in ("daily_close", *FLOW_RAW_COLUMNS):
+    for column in ("daily_close", "adj_factor", *FLOW_RAW_COLUMNS):
         if column not in frame.columns:
             frame[column] = np.nan
-    frame["close_to_close_return"] = frame.groupby("ts_code", sort=False)[
-        "daily_close"
-    ].pct_change()
-    frame["ret20"] = frame.groupby("ts_code", sort=False)["daily_close"].transform(
-        lambda values: values / values.shift(window) - 1.0
+        frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    frame["close_to_close_return"], frame["ret20"] = _adjusted_close_returns(
+        frame, window
     )
     for raw_name, factor_name in {
         "daily_qua": TICK_FACTOR_COLUMNS[0],
