@@ -118,14 +118,20 @@ def build_report78_daily_panel(
 
     frame = minute_frame.sort_index()
     rows: list[dict[str, float | pd.Timestamp]] = []
-    daily_closes: list[float] = []
+    daily_adjusted_closes: list[float] = []
     dates: list[pd.Timestamp] = []
     for trade_date, day in frame.groupby(frame.index.normalize(), sort=True):
         values = calculate_daily_report78_technical_factors(day)
         close = pd.to_numeric(day["close"], errors="coerce").dropna()
         last_close = float(close.iloc[-1]) if not close.empty else np.nan
+        if "adj_factor" in day.columns:
+            factors = pd.to_numeric(day["adj_factor"], errors="coerce")
+            factors = factors.where(factors.gt(0)).dropna()
+            last_factor = float(factors.iloc[-1]) if not factors.empty else np.nan
+        else:
+            last_factor = np.nan
         dates.append(pd.Timestamp(trade_date))
-        daily_closes.append(last_close)
+        daily_adjusted_closes.append(last_close * last_factor)
         rows.append({"trade_date": pd.Timestamp(trade_date), **values})
 
     if not rows:
@@ -134,7 +140,10 @@ def build_report78_daily_panel(
         )
 
     result = pd.DataFrame(rows).set_index("trade_date")
-    closes = pd.Series(daily_closes, index=pd.DatetimeIndex(dates), dtype=float)
-    result["technical_long_mom"] = closes.pct_change(long_momentum_window)
+    adjusted_closes = pd.Series(
+        daily_adjusted_closes, index=pd.DatetimeIndex(dates), dtype=float
+    )
+    result["technical_long_mom"] = adjusted_closes.pct_change(
+        long_momentum_window, fill_method=None
+    )
     return result[list(REPORT78_FACTOR_COLUMNS)]
-

@@ -40,7 +40,15 @@ def normalize_minute_frame(raw_df: pd.DataFrame) -> pd.DataFrame:
     frame.index.name = "trade_time"
     frame = frame.rename(columns={"vol": "volume"}).sort_index()
     frame = frame[~frame.index.duplicated(keep="last")]
-    for column in ("open", "high", "low", "close", "volume", "amount"):
+    for column in (
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+        "amount",
+        "adj_factor",
+    ):
         if column in frame.columns:
             frame[column] = pd.to_numeric(frame[column], errors="coerce")
     return frame
@@ -91,4 +99,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

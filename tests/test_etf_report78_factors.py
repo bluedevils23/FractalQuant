@@ -32,6 +32,7 @@ def _frame(days: int = 23, bars_per_day: int = 4) -> pd.DataFrame:
                     "close": close,
                     "vol": 1000.0 + minute * 100.0,
                     "amount": (1000.0 + minute * 100.0) * close,
+                    "adj_factor": 1.0,
                 }
             )
     return pd.DataFrame(rows)
@@ -60,9 +61,24 @@ def test_daily_panel_is_causal_and_long_momentum_uses_completed_days() -> None:
     assert panel.index.is_monotonic_increasing
 
 
+def test_long_momentum_uses_adjusted_daily_closes() -> None:
+    baseline = normalize_minute_frame(_frame(21))
+    split = baseline.copy()
+    last_date = split.index.normalize().max()
+    split.loc[split.index.normalize() == last_date, ["open", "high", "low", "close"]] /= 2.0
+    split.loc[split.index.normalize() == last_date, "adj_factor"] = 2.0
+
+    baseline_panel = build_report78_daily_panel(baseline)
+    split_panel = build_report78_daily_panel(split)
+
+    assert np.isclose(
+        split_panel.loc[last_date, "technical_long_mom"],
+        baseline_panel.loc[last_date, "technical_long_mom"],
+    )
+
+
 def test_amount_dependent_fields_remain_null_when_amount_is_unavailable() -> None:
     frame = normalize_minute_frame(_frame(1)).drop(columns="amount")
     values = calculate_daily_report78_technical_factors(frame)
     assert np.isnan(values["technical_cvilliq"])
     assert np.isnan(values["technical_qua"])
-
