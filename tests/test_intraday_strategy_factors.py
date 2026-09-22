@@ -215,6 +215,14 @@ def test_daily_context_is_strictly_historical_and_matches_formulas() -> None:
     pd.testing.assert_series_equal(context, changed)
 
 
+def test_missing_adjustment_factor_does_not_assume_unadjusted_prices() -> None:
+    daily = _daily_history().drop(columns="adj_factor")
+    target = daily["trade_date"].max() + pd.offsets.BDay(1)
+    context = build_daily_context(daily, [target], TS_CODE).iloc[0]
+
+    assert context.drop(labels="trade_date").isna().all()
+
+
 def test_breakout_tail_and_available_time_are_populated_without_future_bars() -> None:
     daily = _daily_history()
     target = (daily["trade_date"].max() + pd.offsets.BDay(1)).strftime("%Y-%m-%d")

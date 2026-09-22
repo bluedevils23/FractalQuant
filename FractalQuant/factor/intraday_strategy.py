@@ -137,7 +137,7 @@ def normalize_minute_frame(raw: pd.DataFrame, ts_code: str) -> pd.DataFrame:
 
     for column in ("open", "high", "low", "close", "vol", "amount", "adj_factor"):
         if column not in work.columns:
-            work[column] = 1.0 if column == "adj_factor" else np.nan
+            work[column] = np.nan
         work[column] = pd.to_numeric(work[column], errors="coerce")
 
     work = work.sort_values(["trade_date", "trade_time"], kind="mergesort")
@@ -174,7 +174,7 @@ def normalize_daily_frame(raw: pd.DataFrame, ts_code: str) -> pd.DataFrame:
         work["trade_date"], errors="coerce"
     ).dt.normalize()
     if "adj_factor" not in work.columns:
-        work["adj_factor"] = 1.0
+        work["adj_factor"] = np.nan
     for column in ("open", "high", "low", "close", "adj_factor"):
         work[column] = pd.to_numeric(work[column], errors="coerce")
     work = work.dropna(subset=["trade_date"])

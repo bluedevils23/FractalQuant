@@ -1,6 +1,6 @@
 # 因子生成项目交接文档
 
-更新时间：2026-09-22  
+更新时间：2026-09-23
 适用仓库：`D:\workspace\stock-fractalquant\FractalQuant`
 
 ## 1. 项目概览
@@ -29,6 +29,7 @@
 | CrossMarket Beta/残差 | `generate_etf_crossmarket_minute_factors.py` | ETF + 映射指数/分钟 | 4 | `etf_1min_crossmarket_factors_rqdata` |
 | CrossMarket OFI | `generate_etf_crossmarket_ofi_factors.py` | ETF Orderbook/分钟 | 8 | 追加至 `etf_1min_crossmarket_factors` |
 | 开源分钟研究因子 | `generate_open_source_factors.py` | ETF/股票分钟源、日频输出 | 19 | `etf_open_source_factors` |
+| 开源 APM/OVP | `generate_open_source_apm_ovp.py` | ETF + 映射指数/日 | 4 | `etf_open_source_apm_ovp` |
 | 开源 Tick 因子 | `generate_open_source_tick_factors.py` | A股逐笔/日 | 33 | `open_source_tick_factors` |
 | Report78 技术因子 | `generate_etf_report78_factors.py` | ETF/日 | 4 | `etf_report78_factors` |
 | 共享市场状态 | `generate_etf_regime_daily_factors.py` | ETF共享/日 | 12 | `etf_regime_daily_factors\market_regime_daily.parquet` |
@@ -37,8 +38,9 @@
 因子数量是当前代码注册表中的因子字段数量，不包含行情原始字段、键字段和诊断字段。
 同一公式的多窗口版本分别计数；不同管线间可能存在语义相近字段，不能把各行数量直接
 相加后视为去重后的全项目因子数。当前 `scripts/` 下共有 22 个
-`generate_*factor*.py` 可执行/兼容入口，合并股票/ETF包装器与弃用别名后，对应上表
-18 条独立生成管线；Session Path 是标准分钟入口的附属输出模式。
+`generate_*factor*.py` 入口，另有 `generate_open_source_apm_ovp.py`；合并股票/ETF
+包装器与弃用别名后，对应上表 19 条独立生成管线。Session Path 是标准分钟入口的
+附属输出模式。
 
 ## 2. 数据目录约定
 
@@ -52,6 +54,35 @@
 | 股票日线 | `D:\workspace\stockdata\stock-data\行情数据\stock_daily.parquet` | 日内策略、竞价上下文使用 |
 | 逐笔数据 | `E:\逐笔数据` | 目录结构为 `YYYY\YYYYMM\YYYYMMDD\symbol`，orderbook、advanced、竞价使用 |
 | 指数 1 分钟 | `D:\workspace\stockdata\index-data\index_1min` | noise-bound 因子使用 |
+
+### 2.1 复权口径
+
+分钟内收益、振幅、VWAP 和盘口结构使用当日原始价格；只要分子分母属于同一交易日，
+累计复权因子会相消，不应重复复权。跨交易日价格比较必须使用
+`adjusted_price = raw_price * adj_factor`，且 `adj_factor` 必须是累计复权因子，不能用
+QMT 的单次除权事件倍率 `dr` 代替。缺失、非数值或非正的 `adj_factor` 不得默认为 1；
+依赖它的跨日因子应保持 `NaN`，同日因子可继续计算。
+
+当前明确使用复权价的跨日路径包括：Session Path 的前收盘收益；FZ 的
+`FeiEPuHuo`、`CaoMuJieBing`、`XieTongJiaCha`；日内策略的日线背景；开源分钟因子的
+日收益/隔夜收益和价格状态排序；APM/OVP 的隔夜收益与 `ret20`；开源 Tick 的
+收盘收益与 `ret20`；Report78 的长期动量；开盘竞价的历史日线上下文；以及昨日上下文
+因子的跨日收益与排名。CICC 的 `liq_amihud_1min`、`corr_prvr` 已按交易日重置，不会把
+次日第一分钟与前日最后一分钟连接，因此无需跨日复权。
+
+| 管线 | `adj_factor` 结论 |
+| --- | --- |
+| 标准分钟、Advanced、Orderbook、收盘竞价、Tail30 | 公式在单一交易日内计算，不需要跨日复权 |
+| Session Path | `intraday_return_from_prev_close` 使用当日及前日复权收盘 |
+| FZ | `FeiEPuHuo`、`CaoMuJieBing`、`XieTongJiaCha` 使用复权价；其余同日分钟公式保持原价 |
+| CICC | 分钟收益按 `code/date` 重置，不跨日连接 |
+| 日内策略 | 分钟路径及历史日线背景使用复权 OHLC；缺失因子时相关输出为空 |
+| 开盘竞价 | 交易所竞价前收盘字段保持其撮合口径；另取的历史日线上下文使用复权价 |
+| Noise-bound、Regime | 输入是指数价格；指数序列不使用股票/ETF `adj_factor` |
+| CrossMarket | 分钟滚动在日内处理；上一日 NAV/规模由独立日状态侧车提供 |
+| 开源分钟、APM/OVP、开源 Tick | 跨日收益、`ret20` 和跨日价格状态使用复权价 |
+| Report78 | `technical_long_mom` 使用复权日收盘，其余字段为同日统计 |
+| Previous-day context | 跨日收益、滚动统计和截面排名使用复权价 |
 
 逐笔数据目录名可能带有错误的交易所后缀。orderbook 入口默认只使用六位数字代码匹配，
 例如 `501001.SZ` 可以匹配到分钟文件 `501001.SH.parquet`；只有显式传入
@@ -120,6 +151,11 @@ ETF 兼容入口：`scripts/generate_etf_fz_daily_factors.py`
 的收盘价计算。生成器会合并该侧车文件但不会修改原始股票日线。逐笔文件缺失的日期，
 该因子仍为空；传入 `--strict-source-fields` 会在分钟分片前终止。
 
+日线输入还必须包含累计 `adj_factor`。`FeiEPuHuo` 的跨日高低价、
+`CaoMuJieBing` 的日收益和 `XieTongJiaCha` 的当日/前日收盘均使用复权价；
+`GaoDiECha` 的同日开收到开盘收益仍可使用原价。缺失复权因子时，上述三个跨日因子
+保持空值，不得以 1 补齐。
+
 生成成功后，输出目录会写入 `_fz_generation_manifest.json`，记录 schema、因子源字段
 可用性、异常交易日统计和时点语义。当前生成器的截面标准化和市场相对计算仅使用本次
 选中的目标标的；使用静态 CSI 名单会保留幸存者偏差，不能将结果声明为全 A 研报复现。
@@ -167,6 +203,8 @@ uv run python scripts/generate_etf_cicc_minute_factors.py --workers 5
 ```
 
 同样是文件级跳过；需要补充或修复已有标的时必须使用 `--overwrite`。
+`liq_amihud_1min` 和 `corr_prvr` 的分钟变化率按 `code/date` 分组，交易日首分钟不会
+错误引用上一交易日的末分钟。
 
 ### 3.4 Advanced 因子
 
@@ -263,6 +301,8 @@ D:\workspace\stockdata\etf-data\etf_1min_intraday_strategy_p0_factors
 
 使用 `--priority-profile p0_p1` 时，输出切换到对应的 `*_p0_p1_factors` 目录。日线
 上下文会为日期过滤额外读取约 180 天历史；不能把 `--date-from` 的读取预热区误删。
+分钟和日线输入都应提供累计 `adj_factor`；缺失时依赖复权价的路径、突破和日线背景
+保持空值，而不是静默按未复权价格计算。
 
 ```powershell
 uv run python scripts/generate_intraday_strategy_factors.py --asset-type etf --workers 5
@@ -365,16 +405,23 @@ uv run python scripts/generate_etf_crossmarket_ofi_factors.py --enable-orderbook
 
 `generate_open_source_factors.py` 从分钟 OHLCV 构造 19 个日频开源研报代理，覆盖理想
 振幅、聪明钱、理想反转、ERR/TGD、成交量峰谷和价格跳跃等主题。默认输入是 ETF 分钟
-目录，但可通过输入/输出路径用于同结构数据。
+目录，但可通过输入/输出路径用于同结构数据。跨日 `daily_return`、`overnight_return`
+以及理想振幅/反转/换手和 TGD 的价格状态使用复权收盘价；纯日内分钟路径保持原价。
+
+`generate_open_source_apm_ovp.py` 生成 `kaiyuan_apmnew_m20`、
+`kaiyuan_apmraw_m20`、`kaiyuan_ovp_m20`、`kaiyuan_avp_m20`。标的隔夜收益和
+`ret20` 使用复权价，映射指数使用指数原价；同日 AM/PM 收益的复权因子会相消。
 
 `generate_open_source_tick_factors.py` 从 A 股逐笔成交与委托构造 33 个日频因子，包括
 单笔金额分位、MTS/MTE、大小单资金流、NIR/CNIR、主动交易行为和 EVL/EVM/EVS。
-20 日滚动项必须保留 `--date-from` 之前的预热历史；日期下界只应在写出时过滤。
+20 日滚动项必须保留 `--date-from` 之前的预热历史；日期下界只应在写出时过滤。该入口
+通过 `--daily-path`（默认股票日线 parquet）合并累计 `adj_factor`，收盘到收盘收益和
+`ret20` 使用复权收盘；缺失复权因子的相关行保持空值并记录告警。
 
 ### 3.12 Report78、共享市场状态与昨日上下文
 
 - `generate_etf_report78_factors.py`：4 个 ETF 日频因子，分别为日内量比、CVILLIQ、
-  QUA 和长期动量；完整日信息映射到下一可用日；
+  QUA 和长期动量；长期动量使用复权日收盘，完整日信息映射到下一可用日；
 - `generate_etf_regime_daily_factors.py`：基于配置指数生成一份全市场共享文件，含当前/
   下一状态、三状态概率、预期波动、置信度、熵和转移分数，共 12 个输出字段；
 - `generate_previous_day_factors.py`：从严格早于目标日的日线/分钟上下文生成 11 个字段，
@@ -432,6 +479,7 @@ uv run python scripts/generate_etf_noise_bound_ratio_factors.py --workers 5
 uv run python scripts/generate_etf_crossmarket_factors.py --workers 5
 uv run python scripts/generate_etf_crossmarket_minute_factors.py --workers 5
 uv run python scripts/generate_open_source_factors.py --workers 5
+uv run python scripts/generate_open_source_apm_ovp.py --workers 5
 uv run python scripts/generate_open_source_tick_factors.py --workers 4
 uv run python scripts/generate_etf_report78_factors.py
 uv run python scripts/generate_etf_regime_daily_factors.py
@@ -469,6 +517,9 @@ uv run python -c "import pandas as pd; p=r'D:\workspace\stockdata\etf-data\etf_1
 - 全量任务长时间没有写入：orderbook 首先会扫描 `E:\逐笔数据` 并建立日期/标的任务索引，这是正常的前置阶段。
 - 日期过滤后窗口变短：advanced 和 intraday strategy 需要历史预热；不要把预热数据误当成输出范围删除。
 - 修改因子注册表后输出未变化：文件级跳过或旧 parquet schema 仍在生效，使用 `--overwrite` 并记录新输出列集合。
+- 拆分/分红日跨日收益异常：确认源字段是累计 `adj_factor`，抽取事件日前后做
+  “原价按比例变化、复权因子反向变化后结果不变”的回归检查；不得将 QMT `dr` 当作
+  累计复权因子。
 
 ## 7. 代码维护边界
 
