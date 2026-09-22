@@ -9,6 +9,7 @@ are explicitly marked as proxies in the output names and manifest.
 from __future__ import annotations
 
 import argparse
+import bisect
 import json
 import logging
 import os
@@ -17,6 +18,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq
 
 
 LOGGER = logging.getLogger("generate_tail30_factors")
@@ -28,9 +30,12 @@ DEFAULT_UNIVERSE_FILE = Path(
 )
 BENCHMARK_SYMBOL = "510300.SH"
 
+RETURN_START = pd.Timedelta(hours=14, minutes=30)
 TAIL_START = pd.Timedelta(hours=14, minutes=31)
 TAIL_END = pd.Timedelta(hours=15)
 TAIL_BAR_COUNT = 30
+RESIDUAL_LOOKBACK_DAYS = 60
+RESIDUAL_MIN_HISTORY_DAYS = 20
 
 KEY_COLUMNS = ["trade_date", "available_time", "ts_code"]
 DIAGNOSTIC_COLUMNS = [
@@ -43,6 +48,7 @@ DIAGNOSTIC_COLUMNS = [
 ]
 REFERENCE_COLUMNS = [
     "tail30_first_open",
+    "tail30_return_start_close",
     "tail30_last_close",
     "tail30_vwap",
 ]
@@ -54,6 +60,11 @@ FACTOR_COLUMNS = [
     "tail30_residual_volatility_proxy",
     "tail30_daily_volatility",
     "tail30_maxilliq_proxy",
+    "tail30_maxilliq_signed_proxy",
+    "tail30_maxilliq_w3_proxy",
+    "tail30_maxilliq_w3_signed_proxy",
+    "tail30_maxilliq_w5_proxy",
+    "tail30_maxilliq_w5_signed_proxy",
     "tail30_daily_milliq",
 ]
 OUTPUT_COLUMNS = KEY_COLUMNS + DIAGNOSTIC_COLUMNS + REFERENCE_COLUMNS + FACTOR_COLUMNS
@@ -142,24 +153,92 @@ def _safe_ratio(numerator: float, denominator: float) -> float:
     return float(numerator / denominator)
 
 
+def _maxilliq_window(
+    minute_returns: np.ndarray, amount: np.ndarray, window_size: int
+) -> tuple[float, float]:
+    """Return absolute and signed return/amount at the max-amount window."""
+    if window_size < 1 or len(minute_returns) < window_size:
+        return np.nan, np.nan
+    amount_sums = np.convolve(amount, np.ones(window_size), mode="valid")
+    if not np.isfinite(amount_sums).any():
+        return np.nan, np.nan
+    peak = int(np.nanargmax(np.where(np.isfinite(amount_sums), amount_sums, -np.inf)))
+    peak_amount = float(amount_sums[peak])
+    if peak_amount <= 0:
+        return np.nan, np.nan
+    window_return = float(np.nansum(minute_returns[peak : peak + window_size]))
+    signed = _safe_ratio(window_return, peak_amount)
+    return abs(signed) if np.isfinite(signed) else np.nan, signed
+
+
 def _tail_index(day: pd.Timestamp) -> pd.DatetimeIndex:
     return pd.date_range(day + TAIL_START, day + TAIL_END, freq="min")
 
 
-def _residual_std(asset_returns: np.ndarray, benchmark_returns: np.ndarray | None) -> float:
-    if benchmark_returns is None or len(benchmark_returns) != len(asset_returns):
-        # Fallback is deliberately a proxy: remove the asset's intraday mean.
-        residual = asset_returns - np.nanmean(asset_returns)
-    else:
-        valid = np.isfinite(asset_returns) & np.isfinite(benchmark_returns)
-        if valid.sum() < 3 or np.nanvar(benchmark_returns[valid], ddof=1) <= 0:
-            residual = asset_returns - np.nanmean(asset_returns)
-        else:
-            x = benchmark_returns[valid]
-            y = asset_returns[valid]
-            beta, alpha = np.polyfit(x, y, 1)
-            residual = y - (alpha + beta * x)
-    return float(np.nanstd(residual, ddof=1)) if np.isfinite(residual).sum() >= 2 else np.nan
+def _return_index(day: pd.Timestamp) -> pd.DatetimeIndex:
+    return pd.date_range(day + RETURN_START, day + TAIL_END, freq="min")
+
+
+def _build_tail_returns(frame: pd.DataFrame) -> dict[str, np.ndarray]:
+    result: dict[str, np.ndarray] = {}
+    for day in sorted(pd.DatetimeIndex(frame.index.normalize()).unique()):
+        closes = frame.reindex(_return_index(day))["close"]
+        if closes.notna().all() and (closes > 0).all():
+            result[day.strftime("%Y-%m-%d")] = np.diff(
+                np.log(closes.to_numpy(dtype=float))
+            )
+    return result
+
+
+def _residual_std(
+    asset_returns: np.ndarray,
+    benchmark_returns: dict[str, np.ndarray],
+    asset_returns_by_date: dict[str, np.ndarray],
+    date_text: str,
+    lookback_days: int = RESIDUAL_LOOKBACK_DAYS,
+    min_history_days: int = RESIDUAL_MIN_HISTORY_DAYS,
+    ordered_asset_dates: list[str] | None = None,
+) -> float:
+    """Estimate current residual volatility using strictly prior tail returns."""
+    current_benchmark = benchmark_returns.get(date_text)
+    if current_benchmark is None or len(current_benchmark) != len(asset_returns):
+        return np.nan
+
+    ordered_asset_dates = ordered_asset_dates or sorted(asset_returns_by_date)
+    date_pos = bisect.bisect_left(ordered_asset_dates, date_text)
+    prior_candidates = ordered_asset_dates[max(0, date_pos - lookback_days) : date_pos]
+    prior_dates = [value for value in prior_candidates if value in benchmark_returns]
+    if len(prior_dates) < min_history_days:
+        return np.nan
+
+    historical_asset = []
+    historical_benchmark = []
+    for prior_date in prior_dates:
+        asset = asset_returns_by_date[prior_date]
+        benchmark = benchmark_returns[prior_date]
+        if len(asset) != len(benchmark):
+            continue
+        valid = np.isfinite(asset) & np.isfinite(benchmark)
+        if valid.any():
+            historical_asset.append(asset[valid])
+            historical_benchmark.append(benchmark[valid])
+    if len(historical_asset) < min_history_days:
+        return np.nan
+
+    x = np.concatenate(historical_benchmark)
+    y = np.concatenate(historical_asset)
+    if len(x) < 3 or np.nanvar(x, ddof=1) <= 0:
+        return np.nan
+    if np.allclose(x, y, rtol=1e-10, atol=1e-14):
+        return np.nan
+    beta, alpha = np.polyfit(x, y, 1)
+    valid_current = np.isfinite(asset_returns) & np.isfinite(current_benchmark)
+    if valid_current.sum() < 2:
+        return np.nan
+    residual = asset_returns[valid_current] - (
+        alpha + beta * current_benchmark[valid_current]
+    )
+    return float(np.nanstd(residual, ddof=1)) if len(residual) >= 2 else np.nan
 
 
 def calculate_tail30_factors(
@@ -167,6 +246,9 @@ def calculate_tail30_factors(
     ts_code: str,
     next_trade_dates: dict[str, str] | None = None,
     benchmark_returns: dict[str, np.ndarray] | None = None,
+    selected_dates: set[str] | None = None,
+    asset_returns_by_date: dict[str, np.ndarray] | None = None,
+    ordered_asset_dates: list[str] | None = None,
 ) -> list[dict[str, object]]:
     """Calculate one output row per complete tail-30-minute trading day."""
     frame = normalize_minute_frame(frame)
@@ -174,9 +256,15 @@ def calculate_tail30_factors(
     next_trade_dates = next_trade_dates or {
         str(dates[i].date()): str(dates[i + 1].date()) for i in range(len(dates) - 1)
     }
+    benchmark_returns = benchmark_returns or {}
+    asset_returns_by_date = asset_returns_by_date or _build_tail_returns(frame)
+    ordered_asset_dates = ordered_asset_dates or sorted(asset_returns_by_date)
+
     records: list[dict[str, object]] = []
     for day in dates:
         date_text = day.strftime("%Y-%m-%d")
+        if selected_dates is not None and date_text not in selected_dates:
+            continue
         window = frame.reindex(_tail_index(day))
         if window["close"].notna().sum() != TAIL_BAR_COUNT or window["open"].notna().sum() != TAIL_BAR_COUNT:
             raise ValueError(f"{ts_code} {date_text}: incomplete tail30 minute bars")
@@ -189,27 +277,36 @@ def calculate_tail30_factors(
 
         volume = window["volume"].to_numpy(dtype=float)
         amount = window["amount"].to_numpy(dtype=float)
-        close = window["close"].to_numpy(dtype=float)
         if np.any(volume < 0) or np.any(amount < 0):
             raise ValueError(f"{ts_code} {date_text}: negative volume/amount")
         total_volume = float(np.nansum(volume))
-        vwap = _safe_ratio(float(np.nansum(close * volume)), total_volume)
-        prices = np.concatenate(([first_open], close))
-        minute_returns = np.diff(np.log(prices))
-        tail_return = float(last_close / first_open - 1.0)
+        total_amount = float(np.nansum(amount))
+        vwap = _safe_ratio(total_amount, total_volume)
+        return_closes = frame.reindex(_return_index(day))["close"]
+        if return_closes.isna().any() or (return_closes <= 0).any():
+            raise ValueError(f"{ts_code} {date_text}: missing 14:30 close for return boundary")
+        return_start_close = float(return_closes.iloc[0])
+        minute_returns = np.diff(np.log(return_closes.to_numpy(dtype=float)))
+        tail_return = float(last_close / return_start_close - 1.0)
         dastd = float(np.nanstd(minute_returns, ddof=1))
         bias = _safe_ratio(last_close - vwap, vwap)
 
         amount_positive = amount > 0
         amount_peak = int(np.nanargmax(np.where(np.isfinite(amount), amount, -np.inf)))
-        maxilliq = (
-            _safe_ratio(abs(float(minute_returns[amount_peak])), float(amount[amount_peak]))
+        maxilliq_signed = (
+            _safe_ratio(float(minute_returns[amount_peak]), float(amount[amount_peak]))
             if amount_positive[amount_peak]
             else np.nan
         )
+        maxilliq = abs(maxilliq_signed) if np.isfinite(maxilliq_signed) else np.nan
+        maxilliq_w3, maxilliq_w3_signed = _maxilliq_window(minute_returns, amount, 3)
+        maxilliq_w5, maxilliq_w5_signed = _maxilliq_window(minute_returns, amount, 5)
         residual = _residual_std(
             minute_returns,
-            (benchmark_returns or {}).get(date_text),
+            benchmark_returns,
+            asset_returns_by_date,
+            date_text,
+            ordered_asset_dates=ordered_asset_dates,
         )
         daily_reverse = 0.5 * tail_return + 0.5 * bias
         daily_volatility = 0.5 * dastd + 0.5 * residual
@@ -229,6 +326,7 @@ def calculate_tail30_factors(
                 "tail30_total_amount": float(np.nansum(amount)),
                 "tail30_zero_amount_bar_count": int((amount <= 0).sum()),
                 "tail30_first_open": first_open,
+                "tail30_return_start_close": return_start_close,
                 "tail30_last_close": last_close,
                 "tail30_vwap": vwap,
                 "tail30_return": tail_return,
@@ -238,6 +336,11 @@ def calculate_tail30_factors(
                 "tail30_residual_volatility_proxy": residual,
                 "tail30_daily_volatility": daily_volatility,
                 "tail30_maxilliq_proxy": maxilliq,
+                "tail30_maxilliq_signed_proxy": maxilliq_signed,
+                "tail30_maxilliq_w3_proxy": maxilliq_w3,
+                "tail30_maxilliq_w3_signed_proxy": maxilliq_w3_signed,
+                "tail30_maxilliq_w5_proxy": maxilliq_w5,
+                "tail30_maxilliq_w5_signed_proxy": maxilliq_w5_signed,
                 "tail30_daily_milliq": maxilliq,
             }
         )
@@ -251,19 +354,39 @@ def _existing_dates(output_path: Path) -> set[str]:
     return set(pd.to_datetime(values, errors="coerce").dropna().dt.strftime("%Y-%m-%d"))
 
 
-def merge_symbol_output(output_path: Path, requested: pd.DataFrame, overwrite: bool) -> pd.DataFrame:
+def _output_has_current_schema(output_path: Path) -> bool:
+    if not output_path.exists():
+        return True
+    try:
+        return set(OUTPUT_COLUMNS).issubset(pq.ParquetFile(output_path).schema_arrow.names)
+    except (OSError, ValueError):
+        return False
+
+
+def merge_symbol_output(
+    output_path: Path,
+    requested: pd.DataFrame,
+    overwrite: bool,
+    replace_dates: set[str] | None = None,
+) -> pd.DataFrame:
+    schema_upgrade = False
     if output_path.exists():
         existing = pd.read_parquet(output_path)
+        schema_upgrade = not set(OUTPUT_COLUMNS).issubset(existing.columns)
         for column in OUTPUT_COLUMNS:
             if column not in existing:
                 existing[column] = np.nan
         existing = existing[OUTPUT_COLUMNS]
     else:
         existing = pd.DataFrame(columns=OUTPUT_COLUMNS)
-    if overwrite:
-        replace_dates = set(requested["trade_date"].astype(str))
-        existing = existing.loc[~existing["trade_date"].astype(str).isin(replace_dates)]
+    if overwrite or schema_upgrade:
+        dates_to_replace = (
+            set(replace_dates)
+            if replace_dates is not None
+            else set(requested["trade_date"].astype(str))
+        )
         additions = requested
+        existing = existing.loc[~existing["trade_date"].astype(str).isin(dates_to_replace)]
     else:
         existing_dates = set(existing["trade_date"].astype(str))
         additions = requested.loc[~requested["trade_date"].astype(str).isin(existing_dates)]
@@ -280,14 +403,7 @@ def build_benchmark_returns(path: Path | None) -> dict[str, np.ndarray]:
     if path is None or not path.exists():
         return {}
     frame = normalize_minute_frame(pd.read_parquet(path))
-    result: dict[str, np.ndarray] = {}
-    for day in sorted(pd.DatetimeIndex(frame.index.normalize()).unique()):
-        window = frame.reindex(_tail_index(day))
-        if window["open"].notna().all() and window["close"].notna().all():
-            result[day.strftime("%Y-%m-%d")] = np.diff(
-                np.log(np.concatenate(([float(window["open"].iloc[0])], window["close"].to_numpy(dtype=float))))
-            )
-    return result
+    return _build_tail_returns(frame)
 
 
 def process_symbol(
@@ -307,17 +423,35 @@ def process_symbol(
         for i in range(len(dates) - 1)
     }
     selected_dates = {day.strftime("%Y-%m-%d") for day in dates if _date_in_range(day.strftime("%Y-%m-%d"), date_from, date_to)}
-    if not overwrite:
+    output_has_current_schema = _output_has_current_schema(output_path)
+    if not overwrite and output_has_current_schema:
         selected_dates -= _existing_dates(output_path)
     records: list[dict[str, object]] = []
+    asset_returns_by_date = _build_tail_returns(frame)
+    ordered_asset_dates = sorted(asset_returns_by_date)
     for date_text in sorted(selected_dates):
         try:
             single = frame.loc[date_text]
-            records.extend(calculate_tail30_factors(single, symbol, next_dates, benchmark_returns))
+            records.extend(
+                calculate_tail30_factors(
+                    single,
+                    symbol,
+                    next_dates,
+                    benchmark_returns,
+                    selected_dates={date_text},
+                    asset_returns_by_date=asset_returns_by_date,
+                    ordered_asset_dates=ordered_asset_dates,
+                )
+            )
         except Exception as exc:  # noqa: BLE001
             LOGGER.warning("%s skipped %s: %s", symbol, date_text, exc)
     requested = pd.DataFrame(records, columns=OUTPUT_COLUMNS)
-    combined = merge_symbol_output(output_path, requested, overwrite)
+    combined = merge_symbol_output(
+        output_path,
+        requested,
+        overwrite,
+        replace_dates=selected_dates if not output_has_current_schema else None,
+    )
     output_root.mkdir(parents=True, exist_ok=True)
     combined.to_parquet(output_path, index=False)
     return output_path, len(records), len(selected_dates) - len(records)
@@ -327,14 +461,26 @@ def write_manifest(output_root: Path, input_root: Path, universe_file: Path) -> 
     manifest = {
         "source_report_interval": "211m-240m",
         "bar_window": "14:31:00-15:00:00 inclusive (30 one-minute bars)",
+        "return_boundary": "30 close-to-close returns from 14:30 close through 15:00 close",
         "availability": "next available trading day 09:15; last observed day is NaT",
+        "units": {
+            "volume": "ETF shares",
+            "amount": "CNY",
+            "tail30_vwap": "CNY per ETF share",
+            "maxilliq": "log return per CNY traded",
+        },
         "factor_definitions": {
-            "tail30_return": "last close / first open - 1",
-            "tail30_bias_proxy": "last close relative to volume-weighted average close",
+            "tail30_return": "15:00 close / 14:30 close - 1",
+            "tail30_bias_proxy": "15:00 close relative to sum(amount) / sum(volume) transaction VWAP",
             "tail30_daily_reverse": "0.5 * tail30_return + 0.5 * tail30_bias_proxy",
-            "tail30_dastd": "sample std of 30 within-window log returns",
-            "tail30_residual_volatility_proxy": "OLS residual std versus benchmark when available; otherwise demeaned intraday return proxy",
+            "tail30_dastd": "sample std of 30 close-to-close log returns",
+            "tail30_residual_volatility_proxy": "current tail30 residual std using alpha and beta estimated from up to 60 strictly prior trading days; minimum 20 days",
             "tail30_maxilliq_proxy": "absolute return of the maximum-amount minute divided by that minute amount",
+            "tail30_maxilliq_signed_proxy": "signed return of the maximum-amount minute divided by that minute amount",
+            "tail30_maxilliq_w3_proxy": "absolute three-minute log return divided by the maximum three-minute amount sum",
+            "tail30_maxilliq_w3_signed_proxy": "signed three-minute log return divided by the maximum three-minute amount sum",
+            "tail30_maxilliq_w5_proxy": "absolute five-minute log return divided by the maximum five-minute amount sum",
+            "tail30_maxilliq_w5_signed_proxy": "signed five-minute log return divided by the maximum five-minute amount sum",
             "tail30_daily_volatility": "0.5 * tail30_dastd + 0.5 * tail30_residual_volatility_proxy",
             "tail30_daily_milliq": "tail30_maxilliq_proxy",
         },
