@@ -1,6 +1,6 @@
 # 因子生成项目交接文档
 
-更新时间：2026-07-21  
+更新时间：2026-09-22  
 适用仓库：`D:\workspace\stock-fractalquant\FractalQuant`
 
 ## 1. 项目概览
@@ -11,19 +11,34 @@
 
 当前已实现的生成管线如下：
 
-| 管线 | 入口脚本 | 资产 | 因子数量 | 默认输出 |
+| 管线 | 入口脚本 | 资产/频率 | 因子数量 | 默认输出 |
 | --- | --- | --- | ---: | --- |
-| 标准分钟因子 | `generate_etf_minute_factors.py` | ETF | base 58 / multi 162 | `D:\workspace\stockdata\etf-data\etf_1min_factors*` |
-| FZ 日频因子 | `generate_fz_daily_factors.py` | 股票 + ETF | 38 | 按 `--asset-type` 选择默认目录 |
-| CICC 分钟因子 | `generate_etf_cicc_minute_factors.py` | ETF | 58 | `D:\workspace\stockdata\etf-data\etf_1min_cicc_factors` |
-| Advanced 因子 | `generate_stock_advanced_factor.py` / `generate_etf_advanced_factor.py` | 股票 / ETF | 46 | `stock_advanced_factors` / `etf_1min_advanced_factors` |
-| Orderbook 因子 | `generate_stock_orderbook_factors.py` | 股票 + ETF | base 63 / multi 135 | `stock_1min_orderbook_factors*` / `etf_1min_orderbook_factors*` |
-| ETF Orderbook 专用入口 | `generate_etf_orderbook_factors.py` | ETF | base 63 / multi 135 | `etf_1min_orderbook_factors*` |
-| 日内策略因子 | `generate_intraday_strategy_factors.py` | 股票 + ETF | P0 21 / P0+P1 34 | `*_intraday_strategy_p0*` |
-| 开盘集合竞价 | `generate_auction_factors.py` | 股票 + ETF | 51 | `*_auction_factors` |
-| FZ 噪声边界 | `generate_etf_noise_bound_ratio_factors.py` | ETF + 指数 | 9 个主要边界/强度字段 | `etf_noise_bound_ratio_factors` |
+| 标准分钟因子 | `generate_etf_minute_factors.py` | ETF/分钟 | base 58 / multi 162 | `D:\workspace\stockdata\etf-data\etf_1min_factors*` |
+| Session Path | `generate_etf_minute_factors.py --write-session-path-factors` | 股票 + ETF/分钟 | 3 | `*_intraday_session_path_factors` |
+| FZ 日频因子 | `generate_fz_daily_factors.py` | 股票 + ETF/日 | 38 | 按 `--asset-type` 选择默认目录 |
+| CICC 日频因子 | `generate_etf_cicc_minute_factors.py` | ETF/日 | 58 | `D:\workspace\stockdata\etf-data\etf_cicc_daily_factors` |
+| Advanced 因子 | `generate_stock_advanced_factor.py` / `generate_etf_advanced_factor.py` | 股票 / ETF/分钟 | 46 | `stock_advanced_factors` / `etf_1min_advanced_factors` |
+| Orderbook 因子 | `generate_stock_orderbook_factors.py` | 股票 + ETF/分钟 | base 84 / multi 156 | `stock_1min_orderbook_factors*` / `etf_1min_orderbook_factors*` |
+| ETF Orderbook 专用入口 | `generate_etf_orderbook_factors.py` | ETF/分钟 | base 84 / multi 156 | `etf_1min_orderbook_factors*` |
+| 日内策略因子 | `generate_intraday_strategy_factors.py` | 股票 + ETF/分钟 | P0 21 / P0+P1 34 | `*_intraday_strategy_p0*` |
+| 开盘集合竞价 | `generate_auction_factors.py` | 股票 + ETF/日 | 94 | `*_auction_factors` |
+| 收盘集合竞价 | `generate_close_auction_factors.py` | 股票 + ETF/日 | 7 | `*_close_auction_factors` |
+| Tail30 | `generate_tail30_factors.py` | ETF/日 | 13 | `etf_tail30_factors` |
+| FZ 噪声边界 | `generate_etf_noise_bound_ratio_factors.py` | ETF + 指数/分钟 | 9 个派生字段 | `etf_noise_bound_ratio_factors` |
+| CrossMarket 综合 | `generate_etf_crossmarket_factors.py` | ETF + 映射指数/分钟 | 35 | `etf_1min_crossmarket_factors` |
+| CrossMarket Beta/残差 | `generate_etf_crossmarket_minute_factors.py` | ETF + 映射指数/分钟 | 4 | `etf_1min_crossmarket_factors_rqdata` |
+| CrossMarket OFI | `generate_etf_crossmarket_ofi_factors.py` | ETF Orderbook/分钟 | 8 | 追加至 `etf_1min_crossmarket_factors` |
+| 开源分钟研究因子 | `generate_open_source_factors.py` | ETF/股票分钟源、日频输出 | 19 | `etf_open_source_factors` |
+| 开源 Tick 因子 | `generate_open_source_tick_factors.py` | A股逐笔/日 | 33 | `open_source_tick_factors` |
+| Report78 技术因子 | `generate_etf_report78_factors.py` | ETF/日 | 4 | `etf_report78_factors` |
+| 共享市场状态 | `generate_etf_regime_daily_factors.py` | ETF共享/日 | 12 | `etf_regime_daily_factors\market_regime_daily.parquet` |
+| 前一交易日上下文 | `generate_previous_day_factors.py` | 股票 + ETF/日 | 11 | `*_daily_context_factors` |
 
 因子数量是当前代码注册表中的因子字段数量，不包含行情原始字段、键字段和诊断字段。
+同一公式的多窗口版本分别计数；不同管线间可能存在语义相近字段，不能把各行数量直接
+相加后视为去重后的全项目因子数。当前 `scripts/` 下共有 22 个
+`generate_*factor*.py` 可执行/兼容入口，合并股票/ETF包装器与弃用别名后，对应上表
+18 条独立生成管线；Session Path 是标准分钟入口的附属输出模式。
 
 ## 2. 数据目录约定
 
@@ -137,13 +152,15 @@ uv run python scripts/generate_fz_daily_factors.py --asset-type stock --strict-s
 - [飞蛾扑火](https://mp.weixin.qq.com/s/V8r1Xbz5J0A9D5J_9GD_IA)、[草木皆兵](https://mp.weixin.qq.com/s/hdtzQaCF2h6ZjZd-0HAftQ)、[水中行舟](https://mp.weixin.qq.com/s/Zv6XX8ddUvBCtG-4LM1MKQ)、[花隐林间](https://mp.weixin.qq.com/s/4G8Fm2x1Bv61idbbQS2BlA)；
 - [待著而救](https://mp.weixin.qq.com/s/vCK2QIi0W19WWTyfiWpAyQ)、[多空博弈](https://mp.weixin.qq.com/s/04H8mVTVxa6OznMSj3JKgg)、[协同效应](https://mp.weixin.qq.com/s/_L3kv76mgoxctgW45iwIBA)。
 
-### 3.3 CICC 分钟因子
+### 3.3 CICC 日频因子
 
 入口：`scripts/generate_etf_cicc_minute_factors.py`  
 实现来源：项目同级 `Replication-of-Minute-Frequency-Factor-refer-CICC`
 
-CICC 函数先生成日级暴露，再按交易日合并回原始分钟行。输出保留分钟键和行情字段，
-日级因子在同一交易日的分钟行中重复。该脚本当前注册 58 个 CICC 因子。
+CICC 函数从分钟行情计算日级暴露，直接输出一行一个 `trade_date/ts_code` 的日频结果，
+不再合并回原始分钟行。脚本文件名保留 `minute` 是历史兼容命名，当前默认输出目录为
+`D:\workspace\stockdata\etf-data\etf_cicc_daily_factors`。该脚本注册 58 个 CICC
+因子，按名称前缀分为动量、波动、分布形态、流动性、价量相关、日内分布和交易时段。
 
 ```powershell
 uv run python scripts/generate_etf_cicc_minute_factors.py --workers 5
@@ -202,7 +219,7 @@ scripts/generate_etf_orderbook_factors.py
 - VPIN 和 `adverse_selection_markout_30s`；
 - 上下文异常和分段异常因子。
 
-`base` 输出 63 个 orderbook 因子，`multi` 输出 135 个因子。因子先在逐笔盘口/成交时间轴
+`base` 输出 84 个 orderbook 因子，`multi` 输出 156 个因子。因子先在逐笔盘口/成交时间轴
 上计算，再通过不向前看的时间对齐映射到分钟行情。
 
 ETF 专用入口默认配置：
@@ -259,7 +276,7 @@ uv run python scripts/generate_intraday_strategy_factors.py --asset-type etf --p
 
 入口：`scripts/generate_auction_factors.py`
 
-该脚本生成每日开盘竞价因子，当前有 51 个核心字段，分为：
+该脚本生成每日开盘竞价因子，当前有 94 个因子字段，分为：
 
 - overnight/stage1/stage2 收益和金额比例；
 - 委托撤单、虚假压力和大单行为；
@@ -267,20 +284,23 @@ uv run python scripts/generate_intraday_strategy_factors.py --asset-type etf --p
 - 鲁棒 imbalance/fisher 变化；
 - 基于前 5/20 日 ADV 的参与度；
 - 相对基准 ETF 的超额收益和市场上下文。
+- 区间振幅、阶段端点收益、上下行步数、L3 买方占比等研报补充字段；
+- 20 日历史平滑、5/20 日量比和竞价换手率字段。
 
 默认 ETF 输出：
 
 ```text
-D:\workspace\stockdata\etf-data\etf_auction_factors
+D:\workspace\stockdata\etf-factors\etf_auction_factors
 ```
 
-默认 benchmark 为 `510300.SH`。使用 `--write-session-path-factors` 时，还会输出
-分钟级 session path companion parquet，默认目录为
-`D:\workspace\stockdata\etf-factors\etf_intraday_session_path_factors`。
+默认 benchmark 为 `510300.SH`。竞价入口中的 `--write-session-path-factors` 和
+`--session-path-only` 已弃用；分钟级 Session Path 应通过
+`generate_etf_minute_factors.py` 的同名参数生成，避免把开盘竞价和全日分钟路径混成
+同一生成职责。
 
 ```powershell
 uv run python scripts/generate_auction_factors.py --asset-type etf --workers 5
-uv run python scripts/generate_auction_factors.py --asset-type etf --write-session-path-factors --workers 5
+uv run python scripts/generate_etf_minute_factors.py --asset-type etf --session-path-only --workers 5
 ```
 
 竞价输出按日期合并；`--overwrite` 替换请求日期，同时保留范围外日期。竞价因子使用
@@ -303,6 +323,66 @@ uv run python scripts/generate_etf_noise_bound_ratio_factors.py --workers 5
 已有输出是文件级跳过。修改指数映射、候选 ETF 或 `NoiseArea` 参数后必须显式使用
 `--overwrite`。
 
+### 3.9 收盘集合竞价与 Tail30
+
+收盘集合竞价入口为 `scripts/generate_close_auction_factors.py`，从 14:57--15:00 的逐笔
+委托和成交重建 7 个日频因子：委托失衡、净委托失衡、撤单比例与方向，以及买方、卖方、
+总体成交相对提交金额的三个代理字段。代理字段必须保留 `_proxy` 后缀；订单窗口为
+`[14:57,15:00)`，成交窗口为 `[14:57,15:00]`。
+
+Tail30 入口为 `scripts/generate_tail30_factors.py`，从 ETF 14:31--15:00 的 30 根分钟线
+生成 13 个日频因子，包括收益、VWAP 偏离、反转、日内/残差波动率和 MaxILLIQ 的
+单分钟、3 分钟、5 分钟代理。`tail30_return` 使用 14:30 close 到 15:00 close；完整日
+应有 30 根尾盘分钟。两套输出通常在下一交易日可用。
+
+```powershell
+uv run python scripts/generate_close_auction_factors.py --asset-type etf --workers 5
+uv run python scripts/generate_tail30_factors.py --workers 5
+```
+
+### 3.10 CrossMarket 因子
+
+CrossMarket 有三个互补入口：
+
+- `generate_etf_crossmarket_factors.py`：35 个字段，由 16 个通用跨市场因子、15 个
+  ETF/映射指数相对价值字段和 4 个同指数 ETF 截面字段组成；
+- `generate_etf_crossmarket_minute_factors.py`：4 个 benchmark-relative 字段，分别是
+  60 分钟市场 beta、20 分钟残差动量、60 分钟残差 ZScore 和 60 分钟基准相关性；
+- `generate_etf_crossmarket_ofi_factors.py`：8 个 L1/MLOFI 截面 OFI 字段，依赖已生成的
+  ETF orderbook。该入口默认禁用，必须显式传 `--enable-orderbook-factors`。
+
+综合入口还依赖 `exchange_fund_index_mapping.csv`、映射指数分钟数据，以及由
+`generate_etf_daily_states.py` 生成的上一日 NAV/规模/份额状态。状态文件是输入侧车，
+不属于独立因子管线。
+
+```powershell
+uv run python scripts/generate_etf_crossmarket_factors.py --workers 5
+uv run python scripts/generate_etf_crossmarket_minute_factors.py --workers 5
+uv run python scripts/generate_etf_crossmarket_ofi_factors.py --enable-orderbook-factors --workers 5
+```
+
+### 3.11 开源研报因子
+
+`generate_open_source_factors.py` 从分钟 OHLCV 构造 19 个日频开源研报代理，覆盖理想
+振幅、聪明钱、理想反转、ERR/TGD、成交量峰谷和价格跳跃等主题。默认输入是 ETF 分钟
+目录，但可通过输入/输出路径用于同结构数据。
+
+`generate_open_source_tick_factors.py` 从 A 股逐笔成交与委托构造 33 个日频因子，包括
+单笔金额分位、MTS/MTE、大小单资金流、NIR/CNIR、主动交易行为和 EVL/EVM/EVS。
+20 日滚动项必须保留 `--date-from` 之前的预热历史；日期下界只应在写出时过滤。
+
+### 3.12 Report78、共享市场状态与昨日上下文
+
+- `generate_etf_report78_factors.py`：4 个 ETF 日频因子，分别为日内量比、CVILLIQ、
+  QUA 和长期动量；完整日信息映射到下一可用日；
+- `generate_etf_regime_daily_factors.py`：基于配置指数生成一份全市场共享文件，含当前/
+  下一状态、三状态概率、预期波动、置信度、熵和转移分数，共 12 个输出字段；
+- `generate_previous_day_factors.py`：从严格早于目标日的日线/分钟上下文生成 11 个字段，
+  包括昨日会话路径、2/20 日截面收益排名、60/10 日偏度及相对偏度、市场宽度和市场动量。
+
+这些日频结果均带显式 `available_time` 或源日期信息；下游不能把完整交易日信息回填到
+同日更早的交易时点。
+
 ## 4. 增量、覆盖和并行规则
 
 通用规则：
@@ -317,10 +397,12 @@ uv run python scripts/generate_etf_noise_bound_ratio_factors.py --workers 5
 
 | 类型 | 跳过粒度 | 需要补日期时的做法 |
 | --- | --- | --- |
-| 标准分钟、FZ、CICC、advanced、noise-bound | 标的文件 | 传 `--overwrite` 重算整个目标文件 |
+| 标准分钟、FZ、CICC、advanced、noise-bound、Report78、开源分钟/Tick | 标的文件 | 传 `--overwrite` 重算整个目标文件 |
 | orderbook | 标的 + 交易日 | 不传 `--overwrite` 可增量补新日期 |
 | intraday strategy | 标的；指定日期时按请求日期替换 | 使用 `--date-from/--date-to` 加 `--overwrite` |
-| auction | 标的 + 请求日期 | 使用 `--date-from/--date-to` 加 `--overwrite` |
+| opening/close auction、Tail30 | 标的 + 请求日期 | 使用日期范围增量补算；`--overwrite` 替换请求日期 |
+| CrossMarket 综合/Beta/OFI | 标的文件或已有 CrossMarket 文件 | 补列或修复时显式使用 `--overwrite`；OFI 另需启用开关 |
+| regime、previous-day context | 共享文件或资产级输出 | 写前核对源日期和 `available_time`，不要并发写同一路径 |
 
 ## 5. 推荐运行流程
 
@@ -344,11 +426,23 @@ uv run python scripts/generate_etf_advanced_factor.py --workers 5
 uv run python scripts/generate_etf_orderbook_factors.py --workers 5
 uv run python scripts/generate_intraday_strategy_factors.py --asset-type etf --workers 5
 uv run python scripts/generate_auction_factors.py --asset-type etf --workers 5
+uv run python scripts/generate_close_auction_factors.py --asset-type etf --workers 5
+uv run python scripts/generate_tail30_factors.py --workers 5
 uv run python scripts/generate_etf_noise_bound_ratio_factors.py --workers 5
+uv run python scripts/generate_etf_crossmarket_factors.py --workers 5
+uv run python scripts/generate_etf_crossmarket_minute_factors.py --workers 5
+uv run python scripts/generate_open_source_factors.py --workers 5
+uv run python scripts/generate_open_source_tick_factors.py --workers 4
+uv run python scripts/generate_etf_report78_factors.py
+uv run python scripts/generate_etf_regime_daily_factors.py
+uv run python scripts/generate_previous_day_factors.py --asset-type etf
 ```
 
-建议先生成基础分钟、日线依赖，再生成需要逐笔数据的 advanced/orderbook/竞价管线。
+建议先生成基础分钟、日线及 ETF 日状态，再生成 orderbook；CrossMarket OFI 必须排在
+orderbook 和 CrossMarket 综合输出之后。开盘/收盘竞价和开源 Tick 都依赖逐笔数据。
 不同输出目录彼此独立，可以分批运行，但不要让同一个脚本的两个实例同时写同一目录。
+上面没有默认执行 CrossMarket OFI，因为其生成器默认关闭；确认 orderbook 覆盖后再显式
+传入 `--enable-orderbook-factors`。
 
 ## 6. 质量检查和常见问题
 
@@ -383,7 +477,14 @@ uv run python -c "import pandas as pd; p=r'D:\workspace\stockdata\etf-data\etf_1
 - 股票和 ETF orderbook 的计算真值在 `FractalQuant/factor/stock_orderbook.py`，不要只修改某个生成脚本中的列名列表。
 - advanced 的自动发现机制依赖 `advanced.py` 中的 `BaseFactor` 子类；新增类后要确认构造函数可无参数实例化，并确认是否属于未来标签。
 - 日内策略和 P1 的列清单分别由 `intraday_strategy.py`、`intraday_strategy_p1.py` 维护；生成脚本只负责资产、日期、缓存和输出。
-- 外部复现管线的公式来自同级 Replication 目录；升级外部代码后应重新做一标的对照验证。
+- 开盘竞价注册表在 `generate_auction_factors.py`，收盘竞价和 Tail30 分别维护自己的
+  `FACTOR_COLUMNS`；修改代理公式时必须同步字段说明、单位和 `available_time` 语义。
+- CrossMarket 的 35 个综合字段、4 个 beta/残差字段和 8 个 OFI 字段属于三个独立注册表；
+  OFI 不应在缺少 orderbook 覆盖时用零值代替。
+- 开源分钟、开源 Tick、Report78、regime 和 previous-day 的列清单分别位于对应的
+  `factor/` 模块或生成脚本；文档数量应从注册表读取，不要依赖旧报告中的历史计数。
+- CICC 外部复现公式来自同级 Replication 目录；升级外部代码后应重新做一标的日频输出
+  对照验证。
 
 ## 8. 交接后的第一步
 
