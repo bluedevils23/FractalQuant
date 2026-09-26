@@ -9,8 +9,6 @@ import pandas as pd
 import polars as pl
 import pytest
 
-from scripts import generate_etf_fz_daily_factors as daily_entry
-from scripts import generate_etf_fz_minute_factors as legacy_entry
 from scripts import generate_fz_daily_factors as fz
 
 from FractalQuant.factor.fz_factor import MinFreqFactor
@@ -135,9 +133,9 @@ def test_daily_writer_uses_factor_date_index_and_all_registered_factors(tmp_path
     )[0] == "skipped"
 
 
-def test_compatibility_entrypoints_reuse_daily_engine() -> None:
-    assert daily_entry.normalize_factor_output is fz.normalize_factor_output
-    assert legacy_entry.normalize_factor_output is fz.normalize_factor_output
+def test_default_asset_type_is_etf() -> None:
+    args = fz.parse_args([])
+    assert args.asset_type == "etf"
 
 
 def test_asset_defaults_cover_stock_and_etf(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

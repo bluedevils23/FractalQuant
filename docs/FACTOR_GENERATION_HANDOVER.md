@@ -37,9 +37,8 @@
 
 因子数量是当前代码注册表中的因子字段数量，不包含行情原始字段、键字段和诊断字段。
 同一公式的多窗口版本分别计数；不同管线间可能存在语义相近字段，不能把各行数量直接
-相加后视为去重后的全项目因子数。当前 `scripts/` 下共有 22 个
-`generate_*factor*.py` 入口，另有 `generate_open_source_apm_ovp.py`；合并股票/ETF
-包装器与弃用别名后，对应上表 19 条独立生成管线。Session Path 是标准分钟入口的
+相加后视为去重后的全项目因子数。当前 `scripts/` 下共有 20 个
+`generate_*factor*.py` 入口，另有 `generate_open_source_apm_ovp.py`；对应上表 19 条独立生成管线。Session Path 是标准分钟入口的
 附属输出模式。
 
 ## 2. 数据目录约定
@@ -123,11 +122,10 @@ uv run python scripts/generate_etf_minute_factors.py --window-profile multi --wo
 ### 3.2 FZ 日频因子
 
 统一入口：`scripts/generate_fz_daily_factors.py`
-ETF 兼容入口：`scripts/generate_etf_fz_daily_factors.py`
 实现来源：`FractalQuant/factor/fz_methods.py`、`fz_factor.py`、`fz_base.py`
 
-脚本通过 `--asset-type stock|etf` 选择股票或 ETF 默认数据目录，先把分钟行情拆成
-交易日面板，计算原始 FZ 因子，再计算组合因子，最后按 `code/factor_date` 输出
+脚本默认针对 ETF 资产（`--asset-type etf`），也可传入 `--asset-type stock` 处理股票。
+运行机制是先把分钟行情拆成交易日面板，计算原始 FZ 因子，再计算组合因子，最后按 `code/factor_date` 输出
 每个标的一份日频 parquet。输入必须是 orderbook 同口径的
 241 根分钟：`09:30–11:30`、`13:01–15:00`；缺行、重复或异常时间网格的
 `code/date` 会跳过且记录告警。`GaoDiECha` 等因子还需要对应资产的日线数据。
@@ -138,9 +136,7 @@ ETF 兼容入口：`scripts/generate_etf_fz_daily_factors.py`
 最近20个交易日的两个原始半潮汐值均有效，不会删除缺失日后跨更长区间凑满20个样本。
 
 `factor_date=d` 的暴露包含 d 日完整分钟信息，只能在 d+1 或之后用于回测和交易；
-月频回测应选取月末构造日，而不是把日频因子复制到分钟行。旧
-`generate_etf_fz_minute_factors.py` 仅保留兼容入口，运行时会输出弃用提示并生成同样的
-日频文件。
+月频回测应选取月末构造日，而不是把日频因子复制到分钟行。
 
 `CaoMuJieBing` 依赖 `retail_trade_ratio` 和中证全指 `000985.CSI` 日收益
 `csi_all_share_return`。`retail_trade_ratio` 是单笔成交额小于4万元的个人投资者买卖额
@@ -170,7 +166,7 @@ ETF： D:\workspace\stockdata\etf-data\etf_daily_fz_factors
 常用命令：
 
 ```powershell
-uv run python scripts/generate_etf_fz_daily_factors.py --workers 5
+uv run python scripts/generate_fz_daily_factors.py --workers 5
 uv run python scripts/generate_fz_daily_factors.py --asset-type stock --workers 5
 uv run python scripts/generate_fz_daily_factors.py --asset-type stock --build-cao-mu-source --overwrite --workers 5
 uv run python scripts/generate_fz_daily_factors.py --asset-type stock --strict-source-fields
@@ -408,6 +404,24 @@ uv run python scripts/generate_etf_crossmarket_ofi_factors.py --enable-orderbook
 目录，但可通过输入/输出路径用于同结构数据。跨日 `daily_return`、`overnight_return`
 以及理想振幅/反转/换手和 TGD 的价格状态使用复权收盘价；纯日内分钟路径保持原价。
 
+该入口的计算版本为 `2`。聪明钱跨日比较使用 `close * adj_factor` 和
+`volume / adj_factor`，保持价量乘积不变；缺少有效复权因子的日期不参与其计算。
+09:31 收益以同日 09:30 收盘价为参考，没有 09:30 行时使用首分钟开盘价。
+振幅切割先剔除无效收益/振幅再分组，不依赖成交量历史是否有效；成交量与价格状态
+分别判断历史有效性。爆发后续金额比只使用同一上午/下午时段内前后金额均有效的事件。
+
+`--symbols`、`--symbols-file` 和 `--limit` **只筛选输出**，ERR/TGD 始终使用输入
+目录中的全部标的计算，因此限制输出数量不会降低提取工作量。任一标的提取失败或为空
+都会阻止写出。输出目录的 `manifest.json` 记录版本、计算池及其哈希、TGD 最小样本数
+与日历版本；旧目录没有清单或计算约定不同，须使用新的输出目录，避免混用历史结果。
+同一约定下仍可通过 `--overwrite` 重算目标文件，日期过滤仍只发生在写出阶段。
+
+`available_time` 使用 `exchange-calendars` 的 XSHG 日历取下一交易日 09:30，
+包括输入最后一天，不再依赖个股下一条行情。该日历用于境内 ETF/A 股；超出已知
+节假日覆盖范围时明确失败，需更新日历依赖。2026 年中秋、国庆边界已按
+[上交所休市安排](https://www.sse.com.cn/disclosure/dealinstruc/closed/c/c_20251222_10802510.shtml)
+验证。旧因子文件不会随代码更新自动修复，应在新目录重新生成并重跑下游分析。
+
 `generate_open_source_apm_ovp.py` 生成 `kaiyuan_apmnew_m20`、
 `kaiyuan_apmraw_m20`、`kaiyuan_ovp_m20`、`kaiyuan_avp_m20`。标的隔夜收益和
 `ret20` 使用复权价，映射指数使用指数原价；同日 AM/PM 收益的复权因子会相消。
@@ -417,6 +431,27 @@ uv run python scripts/generate_etf_crossmarket_ofi_factors.py --enable-orderbook
 20 日滚动项必须保留 `--date-from` 之前的预热历史；日期下界只应在写出时过滤。该入口
 通过 `--daily-path`（默认股票日线 parquet）合并累计 `adj_factor`，收盘到收盘收益和
 `ret20` 使用复权收盘；缺失复权因子的相关行保持空值并记录告警。
+
+逐笔入口计算版本为 `2`，旧因子目录需要换新目录重新生成。原始归档的中文字段/
+位置字段（`raw_trade_date`）使用万分之一元、股，标准化的 `price/quantity` 字段使用
+元、股；适配器按字段契约转换，不能通过价格中位数判断单位。直接调用标准化函数时
+可用 `price_divisor` 显式指定其他来源。15:00 分钟的收盘成交保留在日收盘价、金额和
+分钟统计中，首个交易分钟的收益以当日第一笔成交价为参考；分钟统计按实际有成交的
+钟表分钟分组。数量版理想反转以 `daily_mean_trade_volume / adj_factor` 做跨日排序，
+不改变原始成交量、成交额或其他日内输入。
+
+EVL/EVM/EVS 已按第 6 篇研报第 6 页修正：超大单占比依次对大单、中单、小单占比
+做带截距的一元截面回归，分别取残差。条件资金流沿用项目四档定义：大单为
+`[20万, 100万)`、小单为 `<4万`，二者不重叠；`>=2万` 仅用于 NIR 家族。
+`flow_bucket_schema` 保留字符串。仅有委托文件时可以生成委托记忆因子，无需日线
+复权文件，成交和资金流因子保持空值。
+
+`--symbols`、`--symbols-file`、`--limit` 只限制输出，计算池为截止 `--date-to` 的
+完整归档发现结果，因此限制输出不会降低提取工作量。任一标的提取失败或无有效数据
+会阻止整批写出。`manifest.json` 记录计算版本、完整标的池与哈希、数据路径、单位
+契约和日历版本，禁止将无清单旧结果或不同约定的结果混入同一目录。
+`available_time` 使用 XSHG 日历的下一交易日 09:30，包括输入末日；超出已知日历
+范围时失败，不猜测下一个工作日。以上修正不自动回写旧文件或更新下游回测。
 
 ### 3.12 Report78、共享市场状态与昨日上下文
 

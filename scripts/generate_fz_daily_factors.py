@@ -1,3 +1,8 @@
+"""Unified daily FangZheng (FZ) factor generator for ETF and Stock assets.
+
+Default asset type is ETF. Use --asset-type stock for A-share equities.
+"""
+
 from __future__ import annotations
 
 import argparse
