@@ -233,6 +233,41 @@ def test_qmt_tick_mapping_and_auction_window(tmp_path: Path) -> None:
     assert result["open_price"].isna().all()
 
 
+def test_previous_close_prefers_daily_reference_and_uses_stable_quote_fallback() -> None:
+    quotes = _auction_quotes()
+    quotes.loc[0, "previous_close"] = 100.0
+
+    daily_reference = calculate_daily_auction_factors(
+        quotes,
+        "563010.SH",
+        expected_previous_close=10.0,
+    )
+    assert daily_reference["previous_close"] == 10.0
+    assert np.isclose(daily_reference["auction_stage2_mid_mean_return"], 0.004)
+
+    quote_fallback = calculate_daily_auction_factors(quotes, "563010.SH")
+    assert quote_fallback["previous_close"] == 10.0
+    assert np.isclose(quote_fallback["auction_stage2_mid_mean_return"], 0.004)
+
+    precision_quotes = _auction_quotes()
+    precision_quotes["previous_close"] = 1.2
+    precision_reference = calculate_daily_auction_factors(
+        precision_quotes,
+        "159150.SZ",
+        expected_previous_close=1.198,
+    )
+    assert precision_reference["previous_close"] == 1.2
+
+    sentinel_quotes = _auction_quotes()
+    sentinel_quotes["previous_close"] = 100.0
+    sentinel_reference = calculate_daily_auction_factors(
+        sentinel_quotes,
+        "563010.SH",
+        expected_previous_close=2.045,
+    )
+    assert sentinel_reference["previous_close"] == 2.045
+
+
 def test_open_transaction_match_excludes_cancellations_and_selects_dominant_price() -> None:
     class StubCache:
         def load_open_transactions(self, _: Path) -> pd.DataFrame:
@@ -1239,6 +1274,7 @@ def test_historical_context_uses_prior_day_and_full_universe_ranks(tmp_path) -> 
     assert context["_market_above_ma20"] == 1.0
     assert np.isclose(context["_prev_2d_return"], 121 / 119 - 1)
     assert context["previous_day_volume_shares"] == 1210 * 100
+    assert context["previous_close"] == 121.0
     assert context["previous_day_high"] == 131.0
     assert context["_previous_day_high_adjusted"] == 131.0
     assert context["previous_7d_close_max"] == 121.0

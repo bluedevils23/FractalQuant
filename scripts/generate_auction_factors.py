@@ -945,10 +945,93 @@ def _safe_return(end_value: float, start_value: float) -> float:
     return float(end_value / start_value - 1.0)
 
 
-def _first_finite(series: pd.Series) -> float:
+def _stable_previous_close(series: pd.Series) -> float:
+    """Return a robust quote-window fallback for a constant previous close.
+
+    Quote feeds occasionally contain an isolated boundary/sentinel value.  The
+    median identifies the stable price without changing the raw cached rows.
+    """
     values = pd.to_numeric(series, errors="coerce")
     values = values[np.isfinite(values) & (values > 0)]
-    return float(values.iloc[0]) if not values.empty else np.nan
+    if values.empty:
+        return np.nan
+    numeric = values.to_numpy(dtype=float)
+    median = float(np.median(numeric))
+    distances = np.abs(numeric - median)
+    closest = np.flatnonzero(np.isclose(distances, distances.min(), atol=1e-12))
+    # If only two conflicting snapshots exist, prefer the later one; boundary
+    # sentinels in the local CSV precede the stable auction quote.
+    return float(values.iloc[closest[-1]])
+
+
+def _resolve_previous_close(
+    quotes: pd.DataFrame,
+    expected_previous_close: float | None = None,
+    *,
+    ts_code: str | None = None,
+    trade_date: str | None = None,
+) -> float:
+    """Resolve a stable raw auction previous close with daily validation.
+
+    A daily reference detects materially inconsistent quote clusters, while a
+    close quote value is retained to preserve the feed's finer price precision.
+    When daily history is unavailable (for example, warm-up sessions), the
+    quote-window median is used as the fallback.
+    """
+    raw_quote_values = (
+        quotes["previous_close"]
+        if "previous_close" in quotes.columns
+        else pd.Series(dtype=float)
+    )
+    quote_values = pd.to_numeric(raw_quote_values, errors="coerce")
+    quote_values = quote_values[np.isfinite(quote_values) & (quote_values > 0)]
+    expected = pd.to_numeric(pd.Series([expected_previous_close]), errors="coerce").iloc[0]
+    if np.isfinite(expected) and expected > 0:
+        stable = _stable_previous_close(quote_values)
+        if np.isfinite(stable) and stable > 0:
+            stable_matches = bool(
+                np.isclose(stable, float(expected), rtol=5e-3, atol=1e-4)
+            )
+            matches = np.isclose(
+                quote_values.to_numpy(dtype=float),
+                float(expected),
+                rtol=5e-3,
+                atol=1e-4,
+            )
+            if not stable_matches:
+                LOGGER.warning(
+                    "%s %s quote previous_close conflict; daily benchmark %.10g, "
+                    "stable quote %.10g (%s/%s quote values match)",
+                    ts_code or "unknown",
+                    trade_date or "unknown-date",
+                    float(expected),
+                    float(stable),
+                    int(matches.sum()),
+                    len(matches),
+                )
+            # Preserve the stable quote precision when it is consistent with
+            # the daily benchmark; use the benchmark to reject isolated or
+            # materially inconsistent quote clusters.
+            if stable_matches:
+                return float(stable)
+            return float(expected)
+        return float(expected)
+    return _stable_previous_close(quote_values)
+
+
+def _context_value_map(
+    context: pd.DataFrame | None, column: str
+) -> dict[str, float]:
+    """Build a date-keyed lookup for numeric context values."""
+    if context is None or context.empty or column not in context.columns:
+        return {}
+    dates = pd.to_datetime(context["trade_date"], errors="coerce").dt.strftime("%Y-%m-%d")
+    values = pd.to_numeric(context[column], errors="coerce")
+    result: dict[str, float] = {}
+    for date, value in zip(dates, values, strict=False):
+        if pd.notna(date) and np.isfinite(value) and value > 0:
+            result[str(date)] = float(value)
+    return result
 
 
 def _calculate_indicative_price(frame: pd.DataFrame) -> pd.Series:
@@ -1548,6 +1631,7 @@ def calculate_daily_auction_factors(
     event_reconstruction_ok: bool = False,
     match_override: dict[str, object] | None = None,
     match_source: str | None = None,
+    expected_previous_close: float | None = None,
 ) -> dict[str, object]:
     if quotes.empty:
         raise ValueError(f"Empty quote frame for {ts_code}")
@@ -1607,7 +1691,12 @@ def calculate_daily_auction_factors(
     stage1_valid = stage1.dropna(subset=["indicative_price"])
     stage2_valid = stage2.dropna(subset=["indicative_price"])
 
-    previous_close = _first_finite(quotes["previous_close"])
+    previous_close = _resolve_previous_close(
+        quotes,
+        expected_previous_close,
+        ts_code=ts_code,
+        trade_date=trade_date,
+    )
     row["previous_close"] = previous_close
     row["auction_has_match"] = has_match
     if has_match:
@@ -1734,9 +1823,14 @@ def _calculate_daily_with_transaction_fallback(
     event_reconstruction_ok: bool = False,
     symbol_dir: Path | None = None,
     cache: AuctionTickCache | None = None,
+    expected_previous_close: float | None = None,
 ) -> dict[str, object]:
     daily = calculate_daily_auction_factors(
-        quotes, ts_code, events, event_reconstruction_ok
+        quotes,
+        ts_code,
+        events,
+        event_reconstruction_ok,
+        expected_previous_close=expected_previous_close,
     )
     if bool(daily["auction_has_match"]):
         return daily
@@ -1755,6 +1849,7 @@ def _calculate_daily_with_transaction_fallback(
                     event_reconstruction_ok,
                     match_override=transaction_match,
                     match_source="transaction_0925",
+                    expected_previous_close=expected_previous_close,
                 )
                 if bool(daily["auction_has_match"]):
                     return daily
@@ -1763,7 +1858,9 @@ def _calculate_daily_with_transaction_fallback(
 
 
 def calculate_supplemental_auction_fields(
-    quotes: pd.DataFrame, ts_code: str
+    quotes: pd.DataFrame,
+    ts_code: str,
+    expected_previous_close: float | None = None,
 ) -> dict[str, object]:
     """Calculate only columns introduced by the report-supplement extension."""
     if quotes.empty:
@@ -1775,7 +1872,12 @@ def calculate_supplemental_auction_fields(
     row["trade_date"] = trade_day.strftime("%Y-%m-%d")
     row["auction_stage1_end_time"] = pd.NaT
     row["auction_stage2_end_time"] = pd.NaT
-    row["previous_close"] = _first_finite(quotes["previous_close"])
+    row["previous_close"] = _resolve_previous_close(
+        quotes,
+        expected_previous_close,
+        ts_code=ts_code,
+        trade_date=trade_day.strftime("%Y-%m-%d"),
+    )
     row["auction_open_price"] = np.nan
     row["auction_amount"] = np.nan
     row["auction_matched_volume"] = np.nan
@@ -1993,6 +2095,9 @@ def build_historical_context(
     valid_pre_close = work["pre_close"].where(work["pre_close"].gt(0))
     valid_adj_factor = work["adj_factor"].where(work["adj_factor"].gt(0))
     work["_adj_close"] = valid_close * valid_adj_factor
+    # The source row mapped to a target auction date is the prior session.
+    # Its raw close is the fallback when the target daily file has no pre_close.
+    work["_auction_previous_close"] = valid_close
     work["_previous_day_high_adjusted"] = valid_high * valid_adj_factor
     work["previous_day_volume_shares"] = work["vol"].where(work["vol"].gt(0)) * 100.0
     work["previous_day_high"] = valid_high
@@ -2098,6 +2203,7 @@ def build_historical_context(
     context_columns = [
         "trade_date",
         "ts_code",
+        "_auction_previous_close",
         "previous_day_volume_shares",
         "previous_day_high",
         "_previous_day_high_adjusted",
@@ -2126,10 +2232,18 @@ def build_historical_context(
     context = work[context_columns].merge(mappings, on="trade_date", how="inner")
     target_limits = work.loc[
         work["trade_date"].isin(normalized_targets),
-        ["trade_date", "ts_code", "up_limit", "down_limit", "adj_factor"],
+        [
+            "trade_date",
+            "ts_code",
+            "pre_close",
+            "up_limit",
+            "down_limit",
+            "adj_factor",
+        ],
     ].rename(
         columns={
             "trade_date": "target_date",
+            "pre_close": "_target_previous_close",
             "up_limit": "auction_limit_up_price",
             "down_limit": "auction_limit_down_price",
             "adj_factor": "_target_adj_factor",
@@ -2140,6 +2254,13 @@ def build_historical_context(
         on=["target_date", "ts_code"],
         how="left",
         validate="one_to_one",
+    )
+    context["previous_close"] = context["_target_previous_close"].where(
+        context["_target_previous_close"].gt(0),
+        context["_auction_previous_close"],
+    )
+    context = context.drop(
+        columns=["_target_previous_close", "_auction_previous_close"]
     )
     context["source_trade_date"] = context["trade_date"]
     context["trade_date"] = context.pop("target_date").dt.strftime("%Y-%m-%d")
@@ -2159,6 +2280,9 @@ def build_benchmark_context(
     cache: AuctionTickCache | None = None,
 ) -> pd.DataFrame:
     paths_by_date = {path.parent.name: path for path in symbol_paths}
+    expected_previous_close_by_date = _context_value_map(
+        historical_context, "previous_close"
+    )
     records: list[dict[str, object]] = []
     for trade_date in sorted(set(target_dates)):
         record: dict[str, object] = {
@@ -2184,6 +2308,9 @@ def build_benchmark_context(
                     benchmark_ts_code,
                     symbol_dir=path,
                     cache=cache,
+                    expected_previous_close=expected_previous_close_by_date.get(
+                        record["trade_date"]
+                    ),
                 )
                 record["benchmark_available_time"] = benchmark_row["available_time"]
                 record["benchmark_auction_has_match"] = benchmark_row[
@@ -2855,6 +2982,9 @@ def process_qmt_symbol_series(
         date: group.drop(columns="trade_date").reset_index(drop=True)
         for date, group in quotes.groupby("trade_date", sort=True)
     }
+    expected_previous_close_by_date = _context_value_map(
+        symbol_context, "previous_close"
+    )
     # Keep the full source calendar so dates before date_from can warm up
     # rolling auction histories without being written to the requested output.
     ordered_dates = sorted(grouped)
@@ -2894,6 +3024,7 @@ def process_qmt_symbol_series(
             False,
             match_override=match_obj,
             match_source=match_source,
+            expected_previous_close=expected_previous_close_by_date.get(date),
         )
         records.append(daily)
         event_frames[date] = _empty_event_frame()
@@ -2972,6 +3103,9 @@ def build_qmt_benchmark_context(
         date: group.drop(columns="trade_date").reset_index(drop=True)
         for date, group in quotes.groupby("trade_date", sort=True)
     }
+    expected_previous_close_by_date = _context_value_map(
+        historical_context, "previous_close"
+    )
     records: list[dict[str, object]] = []
     for date in sorted(set(target_dates)):
         record = {
@@ -2995,6 +3129,7 @@ def build_qmt_benchmark_context(
                 False,
                 match_override=match_obj,
                 match_source=match_source,
+                expected_previous_close=expected_previous_close_by_date.get(date),
             )
             record["benchmark_available_time"] = row["available_time"]
             record["benchmark_auction_has_match"] = row["auction_has_match"]
@@ -3028,6 +3163,9 @@ def process_symbol_series(
         if _date_in_requested_range(path.parent.name, date_from, date_to)
     ]
     output_path = output_root / f"{ts_code}.parquet"
+    expected_previous_close_by_date = _context_value_map(
+        symbol_context, "previous_close"
+    )
     existing_dates = _existing_trade_dates(output_path)
     output_uses_current_schema = _output_uses_current_schema(output_path)
     missing_output_columns = _missing_output_columns(output_path)
@@ -3077,7 +3215,15 @@ def process_symbol_series(
                     path.parent.name,
                 )
                 continue
-            records.append(calculate_supplemental_auction_fields(quotes, ts_code))
+            records.append(
+                calculate_supplemental_auction_fields(
+                    quotes,
+                    ts_code,
+                    expected_previous_close=expected_previous_close_by_date.get(
+                        pd.Timestamp(path.parent.name).strftime("%Y-%m-%d")
+                    ),
+                )
+            )
         if records:
             supplement = apply_supplemental_context(
                 pd.DataFrame(records), symbol_context
@@ -3163,6 +3309,9 @@ def process_symbol_series(
             event_ok,
             symbol_dir=path,
             cache=cache,
+            expected_previous_close=expected_previous_close_by_date.get(
+                pd.Timestamp(path.parent.name).strftime("%Y-%m-%d")
+            ),
         )
         return daily, events
 
