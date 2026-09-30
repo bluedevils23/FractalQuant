@@ -4,9 +4,11 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from scripts.auction_tick_cache import AuctionTickCache
 from scripts.generate_close_auction_factors import (
+    _cancel_notional_by_side,
     OUTPUT_COLUMNS,
     calculate_daily_close_auction_factors,
     merge_symbol_output,
@@ -14,11 +16,79 @@ from scripts.generate_close_auction_factors import (
 )
 
 
+@pytest.mark.parametrize("ids,quantities", [([1, 999], [20, 50]), ([1, 1], [80, 80])])
+def test_invalid_cancel_coverage_and_cumulative_quantity(ids, quantities):
+    adds = pd.DataFrame({"order_id": [1], "side": ["B"], "price": [10.], "quantity": [100.]})
+    cancels = pd.DataFrame({"order_id": ids, "quantity": quantities})
+    assert not _cancel_notional_by_side(adds, cancels)[2]
+
+
+def test_empty_transactions_are_unknown_not_zero():
+    orders = _orders(("2026-03-31 14:58:00", 1, "A", "B", 10., 100.))
+    row = calculate_daily_close_auction_factors(orders, _transactions(), "600000.SH", "20260401")
+    assert not row["close_auction_event_reconstruction_ok"]
+    assert pd.isna(row["close_auction_matched_notional"])
+    assert pd.isna(row["close_auction_order_imbalance"])
+
+
+def test_failed_refresh_preserves_old_record(tmp_path):
+    path = tmp_path / "old.parquet"
+    old = pd.DataFrame([{c: np.nan for c in OUTPUT_COLUMNS}])
+    old["trade_date"] = "2026-03-31"
+    old.to_parquet(path)
+    result = merge_symbol_output(path, pd.DataFrame(columns=OUTPUT_COLUMNS), False, {"2026-03-31"})
+    assert result.trade_date.tolist() == ["2026-03-31"]
+
+
+def test_millisecond_close_match_is_included():
+    orders = _orders(("2026-03-31 14:58:00", 1, "A", "B", 10., 100.),
+                     ("2026-03-31 14:58:00", 2, "A", "S", 10., 100.))
+    trades = _transactions(("2026-03-31 15:00:00.500", "0", 10., 50., 2, 1))
+    row = calculate_daily_close_auction_factors(orders, trades, "600000.SH", "20260401")
+    assert row["close_auction_matched_notional"] == 500.
+
+
 def _orders(*rows: tuple[str, int, str, str, float, float]) -> pd.DataFrame:
     return pd.DataFrame(
         rows,
         columns=["trade_time", "order_id", "order_type", "side", "price", "quantity"],
     ).assign(trade_time=lambda frame: pd.to_datetime(frame["trade_time"]))
+
+
+@pytest.mark.parametrize("day,asset_type,applicable", [
+    ("2026-07-03", "etf", False), ("2026-07-06", "etf", True),
+    ("2026-07-03", "stock", True),
+])
+def test_sh_fund_session_switch(day, asset_type, applicable):
+    orders = _orders((day + " 14:58", 1, "A", "B", 10., 100.),
+                     (day + " 14:58", 2, "A", "S", 10., 100.))
+    trades = _transactions((day + " 15:00:01.350", "", 10., 50., 2, 1))
+    row = calculate_daily_close_auction_factors(orders, trades, "510300.SH", None, asset_type=asset_type)
+    assert row["auction_applicable"] == applicable
+    assert row["close_auction_event_reconstruction_ok"] == applicable
+    if not applicable:
+        assert row["auction_status"] == "not_applicable"
+        assert pd.isna(row["close_auction_order_imbalance"])
+
+
+def test_delayed_match_old_order_linkage_and_postclose_exclusion():
+    orders = _orders(("2026-07-27 10:00", 1, "A", "B", 10., 100.),
+                     ("2026-07-27 14:58", 2, "A", "S", 10., 100.),
+                     ("2026-07-27 14:58", 3, "A", "B", 10., 100.),
+                     ("2026-07-27 14:59", 1, "D", "B", 10., 10.))
+    trades = _transactions(("2026-07-27 15:00:01.350", "", 10., 50., 2, 1),
+                           ("2026-07-27 15:05:00.000", "", 10., 20., 2, 3))
+    row = calculate_daily_close_auction_factors(orders, trades, "510300.SH", None, asset_type="etf")
+    assert row["close_auction_event_reconstruction_ok"]
+    assert row["close_auction_matched_notional"] == 500.
+    assert row["close_auction_match_count"] == 1
+    assert row["close_auction_order_count"] == 2
+    assert row["close_auction_cancel_buy_notional"] == 0.
+    assert row["close_auction_attributed_buy_match_notional"] == 0.
+    assert row["close_auction_attributed_sell_match_notional"] == 500.
+    assert row["source_available_time"] == pd.Timestamp("2026-07-27 15:00:01.350")
+    trades.loc[0, "bid_order_id"] = 999
+    assert not calculate_daily_close_auction_factors(orders, trades, "510300.SH", None, asset_type="etf")["close_auction_event_reconstruction_ok"]
 
 
 def _transactions(*rows: tuple[str, str, float, float, int, int]) -> pd.DataFrame:
@@ -96,14 +166,14 @@ def test_close_tick_cache_uses_expected_boundaries(tmp_path: Path) -> None:
     )
     transactions = pd.DataFrame(
         {
-            "自然日": [20260331] * 4,
-            "时间": [145659999, 145700000, 145959999, 150000000],
-            "成交代码": ["0"] * 4,
-            "BS标志": ["B"] * 4,
-            "成交价格": [100000] * 4,
-            "成交数量": [100] * 4,
-            "叫卖序号": [1] * 4,
-            "叫买序号": [2] * 4,
+            "自然日": [20260331] * 6,
+            "时间": [145659999, 145700000, 145959999, 150000000, 150001350, 150500000],
+            "成交代码": ["0"] * 6,
+            "BS标志": ["B"] * 6,
+            "成交价格": [100000] * 6,
+            "成交数量": [100] * 6,
+            "叫卖序号": [1] * 6,
+            "叫买序号": [2] * 6,
         }
     )
     orders.to_csv(symbol_dir / "逐笔委托.csv", index=False, encoding="gbk")
@@ -112,6 +182,8 @@ def test_close_tick_cache_uses_expected_boundaries(tmp_path: Path) -> None:
     cache = AuctionTickCache(None)
     close_orders = cache.load_close_orders(symbol_dir)
     close_transactions = cache.load_close_transactions(symbol_dir)
+    history = cache.load_close_order_history(symbol_dir)
+    assert history["order_id"].tolist() == [1, 2, 3]
 
     assert close_orders["trade_time"].tolist() == [
         pd.Timestamp("2026-03-31 14:57:00"),
@@ -121,6 +193,7 @@ def test_close_tick_cache_uses_expected_boundaries(tmp_path: Path) -> None:
         pd.Timestamp("2026-03-31 14:57:00"),
         pd.Timestamp("2026-03-31 14:59:59.999"),
         pd.Timestamp("2026-03-31 15:00:00"),
+        pd.Timestamp("2026-03-31 15:00:01.350"),
     ]
 
 
@@ -160,7 +233,7 @@ def test_existing_close_auction_date_skips_tick_load(tmp_path: Path, monkeypatch
     def fail_loader(*args, **kwargs):
         raise AssertionError("existing output must skip tick loading")
 
-    monkeypatch.setattr(AuctionTickCache, "load_close_orders", fail_loader)
+    monkeypatch.setattr(AuctionTickCache, "load_close_order_history", fail_loader)
     result = process_symbol_series(
         "stock",
         "600000.SH",
@@ -184,18 +257,20 @@ def test_close_auction_symbol_continues_after_single_invalid_date(
     invalid_dir = tmp_path / "2026" / "202604" / "20260401" / "600000.SH"
     valid_dir.mkdir(parents=True)
     invalid_dir.mkdir(parents=True)
-    orders = _orders(("2026-03-31 14:57:00", 1, "A", "B", 10.0, 100.0))
+    orders = _orders(("2026-03-31 14:57:00", 1, "A", "B", 10.0, 100.0),
+                     ("2026-03-31 14:57:00", 2, "A", "S", 10.0, 100.0))
     transactions = _transactions(
-        ("2026-03-31 15:00:00", "", 10.0, 100.0, 1, 1)
+        ("2026-03-31 15:00:00", "", 10.0, 100.0, 2, 1)
     )
 
     def load_orders(_cache: AuctionTickCache, path: Path) -> pd.DataFrame:
         return orders if path == valid_dir else orders.iloc[0:0]
 
-    monkeypatch.setattr(AuctionTickCache, "load_close_orders", load_orders)
+    monkeypatch.setattr(AuctionTickCache, "load_close_order_history", load_orders)
     monkeypatch.setattr(AuctionTickCache, "load_close_transactions", lambda *args: transactions)
 
-    _, output_path, row_count = process_symbol_series(
+    with pytest.raises(ValueError, match="dates failed"):
+        process_symbol_series(
         "stock",
         "600000.SH",
         [valid_dir, invalid_dir],
@@ -208,9 +283,9 @@ def test_close_auction_symbol_continues_after_single_invalid_date(
         False,
     )
 
-    result = pd.read_parquet(output_path)
-    assert row_count == 1
+    result = pd.read_parquet(tmp_path / "output" / "600000.SH.parquet")
     assert result["trade_date"].tolist() == ["2026-03-31"]
+    assert result["close_auction_event_reconstruction_ok"].all()
 
 
 def test_legacy_close_auction_schema_backfills_existing_date(
@@ -223,11 +298,12 @@ def test_legacy_close_auction_schema_backfills_existing_date(
     pd.DataFrame({"trade_date": ["2026-03-31"]}).to_parquet(
         output_root / "600000.SH.parquet", index=False
     )
-    orders = _orders(("2026-03-31 14:57:00", 1, "A", "B", 10.0, 100.0))
+    orders = _orders(("2026-03-31 14:57:00", 1, "A", "B", 10.0, 100.0),
+                     ("2026-03-31 14:57:00", 2, "A", "S", 10.0, 100.0))
     transactions = _transactions(
-        ("2026-03-31 15:00:00", "", 10.0, 100.0, 1, 1)
+        ("2026-03-31 15:00:00", "", 10.0, 100.0, 2, 1)
     )
-    monkeypatch.setattr(AuctionTickCache, "load_close_orders", lambda *args: orders)
+    monkeypatch.setattr(AuctionTickCache, "load_close_order_history", lambda *args: orders)
     monkeypatch.setattr(
         AuctionTickCache, "load_close_transactions", lambda *args: transactions
     )

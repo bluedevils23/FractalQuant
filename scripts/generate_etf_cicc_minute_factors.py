@@ -25,6 +25,7 @@ from typing import Callable
 
 import pandas as pd
 import polars as pl
+import pyarrow.parquet as pq
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -134,6 +135,18 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=None,
         help="Optional ETF symbol list file with one symbol per line.",
+    )
+    parser.add_argument(
+        "--date-from",
+        type=str,
+        default=None,
+        help="Optional inclusive first trade date (YYYY-MM-DD).",
+    )
+    parser.add_argument(
+        "--date-to",
+        type=str,
+        default=None,
+        help="Optional inclusive last trade date (YYYY-MM-DD).",
     )
     parser.add_argument(
         "--limit",
@@ -276,6 +289,51 @@ def normalize_minute_frame(raw_df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def normalize_date_arg(value: str | None) -> pd.Timestamp | None:
+    if value is None:
+        return None
+    return pd.Timestamp(value).normalize()
+
+
+def filter_minute_frame(
+    minute_df: pd.DataFrame,
+    date_from: pd.Timestamp | None = None,
+    date_to: pd.Timestamp | None = None,
+) -> pd.DataFrame:
+    if date_from is None and date_to is None:
+        return minute_df
+    if date_from is not None and date_to is not None and date_from > date_to:
+        raise ValueError("date_from cannot be later than date_to")
+
+    trade_dates = minute_df.index.normalize()
+    mask = pd.Series(True, index=minute_df.index)
+    if date_from is not None:
+        mask &= trade_dates >= date_from
+    if date_to is not None:
+        mask &= trade_dates <= date_to
+    return minute_df.loc[mask.to_numpy()]
+
+
+def read_minute_source(
+    input_path: Path,
+    date_from: pd.Timestamp | None = None,
+    date_to: pd.Timestamp | None = None,
+) -> pd.DataFrame:
+    if date_from is None and date_to is None:
+        return pd.read_parquet(input_path)
+
+    schema_names = pq.ParquetFile(input_path).schema.names
+    if "trade_date" not in schema_names:
+        return pd.read_parquet(input_path)
+
+    filters: list[tuple[str, str, pd.Timestamp]] = []
+    if date_from is not None:
+        filters.append(("trade_date", ">=", date_from))
+    if date_to is not None:
+        filters.append(("trade_date", "<=", date_to))
+    return pd.read_parquet(input_path, filters=filters)
+
+
 def build_factor_registry() -> list[tuple[str, Callable[[pl.DataFrame], pl.DataFrame]]]:
     registry: list[tuple[str, Callable[[pl.DataFrame], pl.DataFrame]]] = []
     for function_name in FACTOR_FUNCTION_NAMES:
@@ -406,14 +464,21 @@ def calculate_daily_factor_exposures(
 
 
 def process_file(
-    input_path: Path, output_root: Path, overwrite: bool
+    input_path: Path,
+    output_root: Path,
+    overwrite: bool,
+    date_from: pd.Timestamp | None = None,
+    date_to: pd.Timestamp | None = None,
 ) -> tuple[str, Path, int | None, int | None]:
     output_path = output_root / input_path.name
     if output_path.exists() and not overwrite:
         return ("skipped", output_path, None, None)
 
-    raw_df = pd.read_parquet(input_path)
+    raw_df = read_minute_source(input_path, date_from, date_to)
     minute_df = normalize_minute_frame(raw_df)
+    minute_df = filter_minute_frame(minute_df, date_from, date_to)
+    if minute_df.empty:
+        return ("no_data", output_path, 0, None)
     cicc_df = build_cicc_input(minute_df)
     daily_exposure, factor_columns = calculate_daily_factor_exposures(cicc_df)
 
@@ -445,6 +510,11 @@ def main() -> int:
     args = parse_args()
     configure_logging()
 
+    date_from = normalize_date_arg(args.date_from)
+    date_to = normalize_date_arg(args.date_to)
+    if date_from is not None and date_to is not None and date_from > date_to:
+        raise ValueError("--date-from cannot be later than --date-to")
+
     requested_symbols = load_requested_symbols(args.symbols, args.symbols_file)
     files = discover_input_files(args.input_root, requested_symbols)
     if args.limit is not None:
@@ -463,10 +533,16 @@ def main() -> int:
         for input_path in files:
             try:
                 status, output_path, row_count, column_count = process_file(
-                    input_path, args.output_root, args.overwrite
+                    input_path,
+                    args.output_root,
+                    args.overwrite,
+                    date_from,
+                    date_to,
                 )
                 if status == "skipped":
                     LOGGER.info("Skipping existing output: %s", output_path)
+                elif status == "no_data":
+                    LOGGER.info("Skipping %s: no rows in requested date range", input_path)
                 else:
                     LOGGER.info(
                         "Wrote %s rows and %s columns to %s",
@@ -482,7 +558,12 @@ def main() -> int:
         with ProcessPoolExecutor(max_workers=worker_count) as executor:
             future_map = {
                 executor.submit(
-                    process_file, input_path, args.output_root, args.overwrite
+                    process_file,
+                    input_path,
+                    args.output_root,
+                    args.overwrite,
+                    date_from,
+                    date_to,
                 ): input_path
                 for input_path in files
             }
@@ -492,6 +573,8 @@ def main() -> int:
                     status, output_path, row_count, column_count = future.result()
                     if status == "skipped":
                         LOGGER.info("Skipping existing output: %s", output_path)
+                    elif status == "no_data":
+                        LOGGER.info("Skipping %s: no rows in requested date range", input_path)
                     else:
                         LOGGER.info(
                             "Wrote %s rows and %s columns to %s",

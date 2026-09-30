@@ -16,6 +16,7 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+from exchange_calendars.exchange_calendar_xshg import XSHGExchangeCalendar
 
 
 LOGGER = logging.getLogger(__name__)
@@ -205,8 +206,14 @@ def _positive_frame(day: pd.DataFrame) -> pd.DataFrame:
     return work
 
 
-def _daily_return_series(session: pd.DataFrame) -> pd.Series:
-    return session["close"].pct_change().replace([np.inf, -np.inf], np.nan)
+def _daily_return_series(
+    session: pd.DataFrame, previous_close: float | None = None
+) -> pd.Series:
+    returns = session["close"].pct_change(fill_method=None)
+    if not session.empty:
+        reference = session["open"].iloc[0] if previous_close is None else previous_close
+        returns.iloc[0] = session["close"].iloc[0] / reference - 1.0 if reference > 0 else np.nan
+    return returns.replace([np.inf, -np.inf], np.nan)
 
 
 def _daily_adjustment_factor(day: pd.DataFrame) -> float:
@@ -268,9 +275,14 @@ def _smart_money_gap_for_sessions(
     for session in sessions:
         if len(session) != SESSION_BAR_COUNT:
             continue
-        returns = _daily_return_series(session)
-        volume = pd.to_numeric(session["volume"], errors="coerce")
-        close = pd.to_numeric(session["close"], errors="coerce")
+        adjustment = _daily_adjustment_factor(session)
+        if not np.isfinite(adjustment):
+            continue
+        returns = session["_minute_return"] if "_minute_return" in session else _daily_return_series(session)
+        # Keep price * quantity unchanged while comparing all days in the same
+        # cumulative-adjustment units. Raw intraday state inputs stay untouched.
+        volume = pd.to_numeric(session["volume"], errors="coerce") / adjustment
+        close = pd.to_numeric(session["close"], errors="coerce") * adjustment
         valid = returns.notna() & volume.gt(0) & close.gt(0)
         if valid.any():
             part = pd.DataFrame(
@@ -347,7 +359,9 @@ def _history_zscore(
     std = np.nanstd(matrix, axis=0, ddof=1)
     count = np.sum(np.isfinite(matrix), axis=0)
     result = np.full(SESSION_BAR_COUNT, np.nan, dtype=float)
-    valid = np.isfinite(current_values) & np.isfinite(mean) & (std > 0) & (count >= minimum_history)
+    # Identical floating-point values can still produce a tiny nonzero std.
+    nonconstant = np.any(matrix != matrix[:1], axis=0)
+    valid = np.isfinite(current_values) & np.isfinite(mean) & (std > 0) & nonconstant & (count >= minimum_history)
     result[valid] = (current_values[valid] - mean[valid]) / std[valid]
     return result
 
@@ -404,8 +418,6 @@ def _state_daily_metrics(
         return missing
     volume_z = _history_zscore(history, current, "volume")
     amplitude_z = _history_zscore(history, current, "_minute_amplitude")
-    if not np.isfinite(volume_z).any() or not np.isfinite(amplitude_z).any():
-        return missing
 
     returns = current["_minute_return"].to_numpy(dtype=float)
     amplitude = current["_minute_amplitude"].to_numpy(dtype=float)
@@ -432,8 +444,9 @@ def _state_daily_metrics(
     amount_safe = np.where(np.isfinite(amount) & (amount > 0), amount, np.nan)
     ridge_amount = np.nansum(np.where(volume_ridge, amount_safe, np.nan))
     peak_amount = np.nansum(np.where(volume_peak, amount_safe, np.nan))
-    eruption_amount = np.nansum(np.where(eruption, amount_safe, np.nan))
     next_amount = _shift_with_session_boundary(amount_safe, -1)
+    follow_events = eruption & np.isfinite(amount_safe) & np.isfinite(next_amount)
+    eruption_amount = np.sum(amount_safe[follow_events])
 
     missing.update(
         {
@@ -449,7 +462,7 @@ def _state_daily_metrics(
                 float(peak_amount / ridge_amount) if ridge_amount > 0 else np.nan
             ),
             "volume_eruption_follow_ratio_raw": (
-                float(np.nansum(np.where(eruption, next_amount, np.nan)) / eruption_amount)
+                float(np.sum(next_amount[follow_events]) / eruption_amount)
                 if eruption_amount > 0
                 else np.nan
             ),
@@ -491,15 +504,19 @@ def _state_daily_metrics(
     finite_returns = np.isfinite(returns) & np.isfinite(amplitude)
     if finite_returns.sum() >= 4:
         count = max(1, int(np.ceil(finite_returns.sum() * STATE_FRACTION)))
-        order = np.argsort(np.where(finite_returns, returns, np.nan))
+        valid_positions = np.flatnonzero(finite_returns)
+        order = valid_positions[np.argsort(returns[valid_positions], kind="mergesort")]
         low = order[:count]
         high = order[-count:]
-        low = low[np.isfinite(returns[low])]
-        high = high[np.isfinite(returns[high])]
         if len(low) and len(high):
             missing["intraday_amplitude_cut_raw"] = float(
                 np.mean(amplitude[high]) - np.mean(amplitude[low])
             )
+    for prefix, zscore in (("volume_", volume_z), ("price_", amplitude_z)):
+        if not np.isfinite(zscore).any():
+            for column in missing:
+                if column.startswith(prefix):
+                    missing[column] = np.nan
     return missing
 
 
@@ -546,7 +563,10 @@ def build_daily_raw_features(
         adjustment_factor = _daily_adjustment_factor(raw_day)
         day = _positive_frame(raw_day)
         session = _regular_session_frame(day).copy()
-        session["_minute_return"] = _daily_return_series(session)
+        opening_bar = day.loc[day.index == pd.Timestamp(trade_date) + pd.Timedelta(hours=9, minutes=30)]
+        previous_close = float(opening_bar["close"].iloc[-1]) if not opening_bar.empty else None
+        session["_minute_return"] = _daily_return_series(session, previous_close)
+        session["adj_factor"] = adjustment_factor
         session["_minute_amplitude"] = session["high"].div(session["low"]).sub(1.0)
         sessions.append(session)
         dates.append(pd.Timestamp(trade_date))
@@ -565,7 +585,7 @@ def build_daily_raw_features(
             float(day["amount"].sum(min_count=1)) if "amount" in day else np.nan
         )
         if len(session) == SESSION_BAR_COUNT:
-            session_returns = _daily_return_series(session)
+            session_returns = session["_minute_return"]
             gu, gd, avg_up, avg_down = _time_centers(session_returns)
             extreme_return, prior_return = _extreme_returns(session_returns)
             r1 = float(session_returns.iloc[:30].sum(min_count=1))
@@ -834,10 +854,25 @@ def build_open_source_factor_panel(
 
 
 def add_availability_columns(panel: pd.DataFrame) -> pd.DataFrame:
-    """Add next-observed-trading-day availability metadata per symbol."""
+    """Add next exchange-session availability, including the latest input day.
+
+    XSHG supplies the mainland ETF/stock trading dates. Fail outside its known
+    holiday coverage rather than guessing a weekday or using future observations.
+    """
 
     frame = panel.copy().sort_values(["ts_code", "trade_date"], kind="mergesort")
-    frame["available_date"] = frame.groupby("ts_code", sort=False)["trade_date"].shift(-1)
+    dates = pd.DatetimeIndex(pd.to_datetime(frame["trade_date"])).normalize()
+    if dates.empty:
+        frame["available_date"] = pd.Series(index=frame.index, dtype="datetime64[ns]")
+    else:
+        last_known = XSHGExchangeCalendar.bound_max()
+        end = min(dates.max() + pd.Timedelta(days=31), last_known)
+        calendar = XSHGExchangeCalendar(start=dates.min(), end=end)
+        sessions = calendar.sessions.tz_localize(None)
+        positions = sessions.searchsorted(dates, side="right")
+        if (positions >= len(sessions)).any():
+            raise ValueError("XSHG calendar does not cover the next trading day; update exchange-calendars")
+        frame["available_date"] = sessions.take(positions).to_numpy()
     frame["available_time"] = pd.to_datetime(frame["available_date"], errors="coerce") + pd.Timedelta(
         hours=9, minutes=30
     )

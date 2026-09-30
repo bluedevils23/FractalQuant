@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import logging
 import os
 import re
 import sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from importlib.metadata import version
 from pathlib import Path
 
 import pandas as pd
@@ -32,6 +35,7 @@ DEFAULT_OUTPUT_ROOT = Path(
     r"D:\workspace\stockdata\etf-factors\etf_open_source_factors"
 )
 SYMBOL_PATTERN = re.compile(r"^\d{6}\.[A-Z]{2}$")
+FACTOR_VERSION = "2"
 
 
 def normalize_symbol(value: str) -> str:
@@ -109,7 +113,10 @@ def build_raw_panel(files: list[Path], workers: int) -> tuple[pd.DataFrame, list
     if workers <= 1:
         for path in files:
             try:
-                frames.append(_extract_one(path))
+                frame = _extract_one(path)
+                if frame.empty:
+                    raise ValueError("No daily raw features")
+                frames.append(frame)
             except Exception as exc:  # noqa: BLE001
                 LOGGER.exception("Failed to extract %s", path)
                 failures.append((normalize_symbol(path.name), str(exc)))
@@ -119,7 +126,10 @@ def build_raw_panel(files: list[Path], workers: int) -> tuple[pd.DataFrame, list
             for future in as_completed(futures):
                 path = futures[future]
                 try:
-                    frames.append(future.result())
+                    frame = future.result()
+                    if frame.empty:
+                        raise ValueError("No daily raw features")
+                    frames.append(frame)
                 except Exception as exc:  # noqa: BLE001
                     LOGGER.exception("Failed to extract %s", path)
                     failures.append((normalize_symbol(path.name), str(exc)))
@@ -167,9 +177,10 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input-root", type=Path, default=DEFAULT_INPUT_ROOT)
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
-    parser.add_argument("--symbols", nargs="*", default=None)
-    parser.add_argument("--symbols-file", type=Path, default=None)
-    parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--symbols", nargs="*", default=None, help="Output symbols only; all input symbols form the calculation universe.")
+    parser.add_argument("--symbols-file", type=Path, default=None, help="Output symbols file; does not restrict the calculation universe.")
+    parser.add_argument("--calculation-symbols-file", type=Path, default=None, help="Full calculation universe. When set, cross-sectional factors use only this file.")
+    parser.add_argument("--limit", type=int, default=None, help="Limit output symbols, not the calculation universe.")
     parser.add_argument("--date-from", type=str, default=None)
     parser.add_argument("--date-to", type=str, default=None)
     parser.add_argument("--overwrite", action="store_true")
@@ -201,13 +212,39 @@ def main() -> int:
     if args.symbols:
         requested.extend(normalize_symbol(symbol) for symbol in args.symbols)
     symbols = list(dict.fromkeys(requested)) or None
-    files = discover_input_files(args.input_root, symbols, args.limit)
+    output_symbols = {path.stem for path in discover_input_files(args.input_root, symbols, args.limit)}
+    calculation_symbols = (
+        read_symbols_file(args.calculation_symbols_file)
+        if args.calculation_symbols_file is not None
+        else None
+    )
+    files = discover_input_files(args.input_root, calculation_symbols)
+    universe = [path.stem for path in files]
+    contract = {
+        "factor_version": FACTOR_VERSION,
+        "input_root": str(resolve_input_root(args.input_root).resolve()),
+        "calculation_universe": universe,
+        "universe_sha256": hashlib.sha256("\n".join(universe).encode("utf-8")).hexdigest(),
+        "min_tgd_cross_section": max(1, int(args.min_tgd_cross_section)),
+        "calendar": "XSHG",
+        "exchange_calendars_version": version("exchange-calendars"),
+    }
+    manifest_path = args.output_root / "manifest.json"
+    if manifest_path.exists():
+        if json.loads(manifest_path.read_text(encoding="utf-8")) != contract:
+            raise ValueError("Output calculation contract changed; use a new --output-root to avoid mixing factors")
+    elif any(args.output_root.glob("*.parquet")):
+        raise ValueError("Existing output has no calculation manifest; use a new --output-root")
     LOGGER.info("Extracting open-source factors for %s symbols", len(files))
     raw_panel, failures = build_raw_panel(files, max(1, int(args.workers)))
+    if failures:
+        LOGGER.error("Aborting without writing: %s symbols failed in the calculation universe", len(failures))
+        return 1
     factor_panel = build_open_source_factor_panel(
         raw_panel, min_tgd_cross_section=max(1, int(args.min_tgd_cross_section))
     )
     factor_panel = add_availability_columns(factor_panel)
+    factor_panel = factor_panel.loc[factor_panel["ts_code"].isin(output_symbols)]
     written = write_outputs(
         factor_panel,
         args.output_root,
@@ -215,6 +252,8 @@ def main() -> int:
         date_to=date_to,
         overwrite=args.overwrite,
     )
+    if written:
+        manifest_path.write_text(json.dumps(contract, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     LOGGER.info("Completed: %s files written, %s failures", len(written), len(failures))
     return 1 if failures else 0
 

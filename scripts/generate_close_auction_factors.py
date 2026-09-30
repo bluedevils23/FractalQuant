@@ -2,8 +2,10 @@
 
 The transaction-to-order fields are explicitly named ``*_proxy`` because the
 source reports do not disclose their exact numerator and denominator.  They
-measure the notional executed at 15:00 against close-auction orders submitted
-in the same window, linked by exchange order identifier.
+measure the closing-match notional against orders submitted in that window,
+linked by exchange order identifier. Full-day orders establish linkage; delayed
+matches before 15:05 are included, while post-close fixed-price trades are not.
+Shanghai ETFs before 2026-07-06 have no closing auction and are not applicable.
 """
 
 from __future__ import annotations
@@ -11,6 +13,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import json
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
@@ -83,7 +86,8 @@ FACTOR_COLUMNS = [
     "close_auction_sell_match_to_submitted_notional_proxy",
     "close_auction_match_to_submitted_notional_proxy",
 ]
-OUTPUT_COLUMNS = KEY_COLUMNS + DIAGNOSTIC_COLUMNS + REFERENCE_COLUMNS + FACTOR_COLUMNS
+SESSION_COLUMNS = ["auction_applicable", "auction_status"]
+OUTPUT_COLUMNS = KEY_COLUMNS + SESSION_COLUMNS + DIAGNOSTIC_COLUMNS + REFERENCE_COLUMNS + FACTOR_COLUMNS
 
 
 def parse_args() -> argparse.Namespace:
@@ -107,6 +111,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--auction-cache-root", type=Path, default=DEFAULT_AUCTION_CACHE_ROOT)
     parser.add_argument("--refresh-auction-cache", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument("--calendar-file", type=Path, default=Path(r"D:\workspace\stockdata\etf-data\etf_daily.parquet"),
+                        help="Parquet with trade_date from a complete market trading calendar; never inferred from tick folders.")
     parser.add_argument(
         "--refresh-existing-factors",
         action="store_true",
@@ -199,17 +205,22 @@ def _cancel_notional_by_side(
     )
     cancelled = cancellations.merge(lookup, on="order_id", how="left", validate="many_to_one")
     matched = cancelled["add_price"].notna() & cancelled["add_quantity"].gt(0)
+    all_matched = bool(matched.all())
     cancelled = cancelled.loc[matched].copy()
     if cancelled.empty:
         return {"B": 0.0, "S": 0.0}, 0, False
     cancelled["quantity"] = pd.to_numeric(cancelled["quantity"], errors="coerce")
+    quantities_ok = bool((cancelled["quantity"].gt(0) & np.isfinite(cancelled["quantity"])).all())
     cancelled = cancelled.loc[cancelled["quantity"].gt(0)].copy()
     cancelled["notional"] = cancelled["add_price"] * cancelled["quantity"]
     totals = {
         side: float(cancelled.loc[cancelled["add_side"].eq(side), "notional"].sum())
         for side in ("B", "S")
     }
-    valid = bool((cancelled["quantity"] <= cancelled["add_quantity"]).all())
+    cumulative = cancelled.groupby("order_id")["quantity"].sum()
+    capacities = adds.set_index("order_id")["quantity"].reindex(cumulative.index)
+    side_ok = "side" not in cancelled or bool(cancelled["side"].eq(cancelled["add_side"]).all())
+    valid = all_matched and quantities_ok and side_ok and bool(cumulative.le(capacities).all())
     return totals, len(cancelled), valid
 
 
@@ -236,11 +247,19 @@ def calculate_daily_close_auction_factors(
     transactions: pd.DataFrame,
     ts_code: str,
     next_trade_date: str | None,
+    *,
+    asset_type: str = "stock",
 ) -> dict[str, object]:
+    """Use full-day order history, but retain the 14:57 new-order cohort."""
+    if asset_type not in ("stock", "etf"):
+        raise ValueError("asset_type must be stock or etf")
     if orders.empty:
         raise ValueError(f"Empty close-auction order frame for {ts_code}")
     trade_day = pd.Timestamp(orders["trade_time"].iloc[0]).normalize()
     close_time = trade_day + pd.Timedelta(hours=15)
+    window_start = close_time - pd.Timedelta(minutes=3)
+    if next_trade_date is not None and pd.Timestamp(next_trade_date).normalize() <= trade_day:
+        raise ValueError("next_trade_date must be strictly after the source date")
     row: dict[str, object] = {column: np.nan for column in OUTPUT_COLUMNS}
     row.update(
         {
@@ -253,21 +272,38 @@ def calculate_daily_close_auction_factors(
             "ts_code": ts_code,
             "source_available_time": close_time,
             "close_auction_event_reconstruction_ok": False,
+            "auction_applicable": True,
+            "auction_status": "invalid_event_coverage",
         }
     )
     exchange = ts_code.rsplit(".", 1)[-1].upper()
-    adds, order_cancellations, unique_ids = _valid_orders(orders, exchange)
+    # SSE fund closing auction took effect on 2026-07-06; earlier closes
+    # are continuous trading, not missing auction observations.
+    if asset_type == "etf" and exchange == "SH" and trade_day < pd.Timestamp("2026-07-06"):
+        row.update(auction_applicable=False, auction_status="not_applicable")
+        return row
+    history = orders.loc[orders["trade_time"].ge(trade_day) & orders["trade_time"].lt(close_time)]
+    all_adds, order_cancellations, unique_ids = _valid_orders(history, exchange)
+    adds = all_adds.loc[all_adds["trade_time"].ge(window_start)].copy()
+    if not unique_ids:
+        raise ValueError(f"Duplicate close-auction order identifiers for {ts_code}")
     if exchange == "SZ":
-        cancellations = _sz_cancellations(transactions)
+        cancel_events = transactions.loc[transactions["trade_time"].ge(window_start) & transactions["trade_time"].lt(close_time)]
+        cancellations = _sz_cancellations(cancel_events)
+        cancel_shape_ok = len(cancellations) == int(cancel_events["trade_code"].eq("C").sum())
     else:
-        cancellations = order_cancellations
-    cancel_notional, cancel_count, cancellation_ok = _cancel_notional_by_side(adds, cancellations)
+        cancellations = order_cancellations.loc[order_cancellations["trade_time"].ge(window_start)]
+        cancel_shape_ok = True
+    _, _, cancellation_ok = _cancel_notional_by_side(all_adds, cancellations)
+    cohort_cancellations = cancellations.loc[cancellations["order_id"].isin(adds["order_id"])]
+    cancel_notional, cancel_count, _ = _cancel_notional_by_side(adds, cohort_cancellations)
 
     work = transactions.copy()
     work["price"] = pd.to_numeric(work["price"], errors="coerce")
     work["quantity"] = pd.to_numeric(work["quantity"], errors="coerce")
     matches = work.loc[
-        work["trade_time"].eq(close_time)
+        work["trade_time"].ge(close_time)
+        & work["trade_time"].lt(close_time + pd.Timedelta(minutes=5))
         & ~work["trade_code"].eq("C")
         & work["price"].gt(0)
         & work["quantity"].gt(0)
@@ -280,13 +316,22 @@ def calculate_daily_close_auction_factors(
         for side in ("B", "S")
     }
     attributed_matches = _matched_notional_by_submitted_side(adds, matches)
+    linkage_ok = all(
+        matches[id_column].isin(all_adds.loc[all_adds["side"].eq(side), "order_id"]).all()
+        for side, id_column in (("B", "bid_order_id"), ("S", "ask_order_id"))
+    )
+    valid = bool(unique_ids and cancellation_ok and cancel_shape_ok and linkage_ok
+                 and not matches.empty and matches["price"].nunique() == 1)
+    if not matches.empty:
+        row["source_available_time"] = matches["trade_time"].max()
+    row["auction_status"] = "ok" if valid else "invalid_event_coverage"
 
     row.update(
         {
             "close_auction_order_count": int(len(adds)),
             "close_auction_cancel_count": int(cancel_count),
             "close_auction_match_count": int(len(matches)),
-            "close_auction_event_reconstruction_ok": bool(unique_ids and cancellation_ok),
+            "close_auction_event_reconstruction_ok": valid,
             "close_auction_submitted_buy_notional": submitted["B"],
             "close_auction_submitted_sell_notional": submitted["S"],
             "close_auction_cancel_buy_notional": cancel_notional["B"],
@@ -321,6 +366,10 @@ def calculate_daily_close_auction_factors(
     row["close_auction_match_to_submitted_notional_proxy"] = _safe_ratio(
         attributed_total, submitted_total
     )
+    if not row["close_auction_event_reconstruction_ok"]:
+        # Unknown event coverage must not masquerade as a valid zero signal.
+        for column in FACTOR_COLUMNS + REFERENCE_COLUMNS[1:] + DIAGNOSTIC_COLUMNS[:3]:
+            row[column] = np.nan
     return row
 
 
@@ -335,7 +384,7 @@ def merge_symbol_output(
     else:
         existing = pd.DataFrame(columns=OUTPUT_COLUMNS)
     requested_dates = set(requested["trade_date"])
-    replace_dates = requested_dates if overwrite else (replace_existing_dates or set())
+    replace_dates = requested_dates if overwrite else ((replace_existing_dates or set()) & requested_dates)
     if replace_dates:
         existing = existing.loc[~existing["trade_date"].astype(str).isin(replace_dates)]
         additions = requested
@@ -367,6 +416,14 @@ def process_symbol_series(
 ) -> tuple[str, Path, int]:
     output_path = output_root / f"{ts_code}.parquet"
     existing_dates = _existing_trade_dates(output_path)
+    if output_path.exists():
+        old = pd.read_parquet(output_path)
+        if "available_time" in old:
+            for date, available in zip(old["trade_date"], old["available_time"]):
+                key = pd.Timestamp(date).strftime("%Y%m%d")
+                expected = next_trade_dates.get(key)
+                if expected is not None and (pd.isna(available) or pd.Timestamp(available).normalize() != pd.Timestamp(expected)):
+                    existing_dates.discard(pd.Timestamp(date).strftime("%Y-%m-%d"))
     output_uses_current_schema = _output_uses_current_schema(output_path)
     requested_paths = [
         path
@@ -388,14 +445,16 @@ def process_symbol_series(
             for path in requested_paths
             if pd.Timestamp(path.parent.name).strftime("%Y-%m-%d") not in existing_dates
         ]
+        replace_existing_dates = {pd.Timestamp(path.parent.name).strftime("%Y-%m-%d") for path in missing_paths}
     if not missing_paths:
         LOGGER.info("%s skipped: requested=%s existing=%s missing=0", ts_code, len(requested_paths), len(existing_dates))
         return asset_type, output_path, 0
-    cache = AuctionTickCache(auction_cache_root, refresh=refresh_auction_cache)
+    cache = AuctionTickCache(auction_cache_root, refresh=refresh_auction_cache, validate_source=True)
     records: list[dict[str, object]] = []
+    failed_dates = []
     for path in missing_paths:
         try:
-            orders = cache.load_close_orders(path)
+            orders = cache.load_close_order_history(path)
             transactions = cache.load_close_transactions(path)
             records.append(
                 calculate_daily_close_auction_factors(
@@ -403,9 +462,11 @@ def process_symbol_series(
                     transactions,
                     ts_code,
                     next_trade_dates.get(path.parent.name),
+                    asset_type=asset_type,
                 )
             )
         except Exception as exc:  # noqa: BLE001
+            failed_dates.append({"date": path.parent.name, "error": str(exc)})
             LOGGER.warning("%s skipped %s: %s", ts_code, path.parent.name, exc)
     requested = pd.DataFrame(records, columns=OUTPUT_COLUMNS)
     combined = merge_symbol_output(
@@ -415,8 +476,17 @@ def process_symbol_series(
         replace_existing_dates=replace_existing_dates,
     )
     output_root.mkdir(parents=True, exist_ok=True)
-    combined.to_parquet(output_path, index=False)
+    temp = output_path.with_name(f".{output_path.name}.{os.getpid()}.tmp.parquet")
+    try:
+        combined.to_parquet(temp, index=False)
+        os.replace(temp, output_path)
+    finally:
+        temp.unlink(missing_ok=True)
+    report_path = output_path.with_suffix(".failures.json")
+    report_path.write_text(json.dumps(failed_dates, ensure_ascii=False, indent=2), encoding="utf-8")
     LOGGER.info("%s cache: hits=%s rebuilds=%s", ts_code, cache.stats.hits, cache.stats.rebuilds)
+    if failed_dates:
+        raise ValueError(f"{ts_code}: {len(failed_dates)} dates failed; successful dates saved; see {report_path}")
     return asset_type, output_path, len(requested)
 
 
@@ -438,10 +508,9 @@ def main() -> int:
     if args.limit is not None:
         assets = assets[: args.limit]
     date_dirs = discover_trade_date_dirs(args.tick_root, None)
-    next_trade_dates = {
-        path.name: date_dirs[index + 1].name
-        for index, path in enumerate(date_dirs[:-1])
-    }
+    calendar = pd.read_parquet(args.calendar_file, columns=["trade_date"])
+    dates = pd.DatetimeIndex(pd.to_datetime(calendar["trade_date"].astype(str), errors="raise")).normalize().unique().sort_values()
+    next_trade_dates = {left.strftime("%Y%m%d"): right.strftime("%Y%m%d") for left, right in zip(dates[:-1], dates[1:])}
     requested_date_dirs = [
         path
         for path in date_dirs

@@ -577,3 +577,72 @@ def test_xie_tong_jia_cha_uses_daily_previous_close() -> None:
         adjusted["XieTongJiaCha"].to_numpy(),
         result["XieTongJiaCha"].to_numpy(),
     )
+
+
+def test_gen_sui_xi_shu_cross_hour_moment_diff_suppresses_within_five_minutes() -> None:
+    times = []
+    for h, m in [
+        (9, range(30, 60)),
+        (10, range(0, 60)),
+        (11, range(0, 31)),
+        (13, range(1, 60)),
+        (14, range(0, 60)),
+        (15, [0]),
+    ]:
+        for minute in m:
+            times.append(h * 10000000 + minute * 100000)
+
+    vols = [10.0] * 241
+    # 09:58 (idx 28, time 95800000) and 10:02 (idx 32, time 100200000) are 4 minutes apart.
+    vols[28] = 1000.0
+    vols[32] = 900.0
+    for i in range(8):
+        vols[100 + i * 10] = 500.0
+
+    df = pl.DataFrame(
+        {
+            "code": ["A"] * 241,
+            "date": [date(2024, 1, 2)] * 241,
+            "time": times,
+            "volume": vols,
+            "close": [10.0] * 241,
+        }
+    )
+
+    result = fz_methods.cal_GenSuiXiShu(df)
+    assert result.height == 1
+    assert result["GenSuiXiShu"][0] is not None
+    assert result["GenSuiXiShu"][0] > 0
+
+
+def test_composite_factors_preserve_dates_when_unrelated_column_has_nan() -> None:
+    dates = pd.bdate_range("2024-01-01", periods=25)
+    panel = pl.DataFrame(
+        {
+            "code": ["A"] * len(dates),
+            "date": [value.date() for value in dates],
+            "PanDeng": [0.01 * (i + 1) for i in range(len(dates))],
+            "GenSuiXiShu": [0.5] * len(dates),
+            "ZhaoMoChenWu": [1.0] * len(dates),
+            "WuBiGuMu": [1.0] * len(dates),
+            "YeMianShuangLu": [0.2] * len(dates),
+            "ChengJiaoLiangBoYi_ShouYiLv": [0.1] * len(dates),
+            "ChengJiaoLiangBoYi_RiNeiXiangDuiWeiZhi": [0.1] * len(dates),
+            "ZhenFuBoYi": [0.1] * len(dates),
+            "ChengJiaoLiangXieTong": [0.1] * len(dates),
+            "XieTongJiaCha": [0.1] * len(dates),
+            "unrelated_nan_col": [float("nan") if i % 2 == 0 else 1.0 for i in range(len(dates))],
+        }
+    )
+
+    ypgf = fz_methods.cal_YongPanGaoFeng(panel)
+    assert ypgf.height == len(dates)
+
+    dzrj = fz_methods.cal_DaiZhuErJiu(panel)
+    assert dzrj.height == len(dates)
+
+    dkby = fz_methods.cal_DuoKongBoYi(panel)
+    assert dkby.height == len(dates)
+
+    xtxy = fz_methods.cal_XieTongXiaoYing(panel)
+    assert xtxy.height == len(dates)

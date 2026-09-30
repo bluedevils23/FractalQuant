@@ -6,6 +6,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from factor.open_source_tick import (
     _adjusted_close_returns,
@@ -17,7 +18,11 @@ from factor.open_source_tick import (
     build_daily_order_raw_features,
     build_open_source_tick_factor_panel,
     normalize_tick_transactions,
+    normalize_tick_orders,
+    FLOW_BUCKET_SCHEMA,
+    select_output_columns,
 )
+from scripts import generate_open_source_tick_factors as generator
 
 
 def _transactions(day: str, *, amount_scale: float = 1.0) -> pd.DataFrame:
@@ -86,7 +91,7 @@ def test_panel_rolling_and_next_actual_date() -> None:
     assert panel[list(TICK_FACTOR_COLUMNS[:5])].iloc[19].notna().all()
     assert panel.loc[0, "available_date"] == dates[1]
     assert panel.loc[0, "available_time"] == dates[1] + pd.Timedelta(hours=9, minutes=30)
-    assert pd.isna(panel.iloc[-1]["available_date"])
+    assert panel.iloc[-1]["available_date"] == pd.Timestamp("2025-02-05")
     assert not np.isinf(panel[list(TICK_FACTOR_COLUMNS)].dropna().to_numpy()).any()
 
 
@@ -385,3 +390,212 @@ def test_cross_day_tick_returns_are_invariant_to_split_adjustment() -> None:
 
     assert np.isclose(adjusted_return.loc[20], baseline_return.loc[20])
     assert np.isclose(adjusted_ret20.loc[20], baseline_ret20.loc[20])
+
+
+@pytest.mark.parametrize("kind", ["transactions", "orders"])
+def test_price_units_follow_schema_not_price_magnitude(kind: str) -> None:
+    normalize = normalize_tick_transactions if kind == "transactions" else normalize_tick_orders
+    canonical = pd.DataFrame({"trade_time": pd.to_datetime(["2026-09-18 09:31"]),
+                              "price": [1500.0], "quantity": [100.0], "side": ["B"]})
+    assert normalize(canonical, "600519.SH")["price"].iloc[0] == 1500.0
+    assert normalize(canonical, "600519.SH", price_divisor=10000)["price"].iloc[0] == 0.15
+    archive = pd.DataFrame({"raw_trade_date": [20260918] * 5,
+                            "raw_time": [93100000] * 5,
+                            "price": [0, 0, 0, 0, 8800], "quantity": [100] * 5,
+                            "side": ["B"] * 5, "trade_code": ["C"] * 4 + ["0"]})
+    normalized = normalize(archive, "159007.SZ")
+    assert normalized.loc[normalized["price"].gt(0), "price"].tolist() == [0.88]
+    if kind == "transactions":
+        assert normalized["amount"].tolist() == [88.0]
+
+
+def test_close_auction_is_preserved_for_close_amount_and_returns() -> None:
+    trades = pd.DataFrame({"trade_time": pd.to_datetime([
+        "2026-09-17 09:30", "2026-09-17 14:56", "2026-09-17 15:00", "2026-09-17 15:01",
+        "2026-09-18 09:30", "2026-09-18 14:56", "2026-09-18 15:00"]),
+        "price": [10., 10., 11., 99., 10., 10., 12.], "quantity": [100.] * 7})
+    raw = build_daily_tick_raw_features(trades, "000001.SZ")
+    assert raw["daily_close"].tolist() == [11., 12.]
+    assert raw["daily_amount"].tolist() == [3100., 3200.]
+    returns, _ = _adjusted_close_returns(raw.assign(adj_factor=1.), 1)
+    assert returns.iloc[-1] == pytest.approx(12 / 11 - 1)
+
+
+def test_sr_includes_opening_minute_price_move() -> None:
+    trades = _transactions("2026-09-18")
+    trades["price"] = 110.
+    trades.loc[0, "trade_time"] += pd.Timedelta(seconds=30)
+    first = trades.iloc[[0]].copy()
+    first["trade_time"] -= pd.Timedelta(seconds=30)
+    first["price"] = 100.
+    first["quantity"] = 100000.
+    raw = build_daily_tick_raw_features(pd.concat([first, trades]), "000001.SZ")
+    assert raw.loc[0, "daily_sr_l020"] == pytest.approx(0.1)
+
+
+def _raw_ev_panel(symbol_count: int = 25, days: int = 4) -> pd.DataFrame:
+    rng = np.random.default_rng(15)
+    rows = []
+    for day_index, date in enumerate(pd.bdate_range("2026-09-14", periods=days)):
+        for symbol_index in range(symbol_count):
+            row = {"trade_date": date, "ts_code": f"{symbol_index:06d}.SZ",
+                   "daily_close": 100. + day_index + symbol_index, "adj_factor": 1.,
+                   "daily_return": 0.01, "daily_amount": 1_000_000., "trade_count": 240,
+                   "valid_trade_minutes": 240, "amount_available": True,
+                   "daily_mean_trade_notional": 1000., "daily_mean_trade_volume": 100.,
+                   "flow_bucket_schema": FLOW_BUCKET_SCHEMA, "flow_classification_valid": True}
+            for column in ("daily_qua", "daily_q90_q10_ratio", "daily_mts", "daily_mte", "daily_sr_l020"):
+                row[column] = .1
+            for category, share in zip(("extra", "large", "medium", "small"), rng.dirichlet([1.] * 4)):
+                row[f"daily_flow_{category}_buy"] = 1_000_000. * share * .6
+                row[f"daily_flow_{category}_sell"] = 1_000_000. * share * .4
+            rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def test_ev_uses_three_separate_regressions_on_extra_share() -> None:
+    raw = _raw_ev_panel()
+    panel = build_open_source_tick_factor_panel(raw, window=4)
+    latest = panel.loc[panel["trade_date"].eq(panel["trade_date"].max())].set_index("ts_code")
+    averages = raw.groupby("ts_code").mean(numeric_only=True)
+    y = (averages["daily_flow_extra_buy"] + averages["daily_flow_extra_sell"]) / averages["daily_amount"]
+    for category, label in (("large", "evl"), ("medium", "evm"), ("small", "evs")):
+        x = (averages[f"daily_flow_{category}_buy"] + averages[f"daily_flow_{category}_sell"]) / averages["daily_amount"]
+        centered_x, centered_y = x - x.mean(), y - y.mean()
+        slope = (centered_x * centered_y).sum() / centered_x.pow(2).sum()
+        expected = centered_y - slope * centered_x
+        actual = latest[f"kaiyuan_{label}_m20"]
+        np.testing.assert_allclose(actual, expected, atol=1e-12)
+        assert actual.std() > .001
+        assert latest[f"flow_{label}_r2"].lt(.999).all()
+
+
+def test_volume_reversal_is_split_invariant_and_requires_adjustment() -> None:
+    raw = _raw_ev_panel(symbol_count=1)
+    raw["daily_return"] = [.01, -.01, .02, -.02]
+    raw["daily_mean_trade_volume"] = [100., 200., 150., 180.]
+    baseline = build_open_source_tick_factor_panel(raw, window=4)
+    split = raw.copy()
+    split.loc[2:, "daily_close"] /= 2
+    split.loc[2:, "adj_factor"] = 2.
+    split.loc[2:, "daily_mean_trade_volume"] *= 2
+    adjusted = build_open_source_tick_factor_panel(split, window=4)
+    column = "kaiyuan_ideal_reversal_tick_volume_m20"
+    assert baseline[column].iloc[-1] == pytest.approx(-.03)
+    np.testing.assert_allclose(baseline[column], adjusted[column], equal_nan=True)
+    split["adj_factor"] = np.nan
+    assert build_open_source_tick_factor_panel(split, window=4)[column].isna().all()
+
+
+def test_conditional_buckets_are_disjoint_and_follow_daily_buckets() -> None:
+    amounts = [19999., 20000., 30000., 39999., 40000., 199999., 200000., 999999., 1000000.]
+    times = pd.date_range("2026-09-18 09:30", periods=len(amounts), freq="min")
+    trades = pd.DataFrame({"trade_time": times, "price": 10., "quantity": 100.,
+                           "bs_flag": "B", "buy_order_id": np.arange(1, len(amounts) + 1)})
+    orders = pd.DataFrame({"trade_time": times, "price": 10., "quantity": np.array(amounts) / 10,
+                           "side": "B", "order_type": "0", "order_id": np.arange(1, len(amounts) + 1)})
+    row = build_daily_flow_raw_features(trades, orders, "000001.SZ").iloc[0]
+    assert row["daily_flow_large_open30_buy"] == row["daily_flow_large_buy"] == 2000.
+    assert row["daily_flow_small_open30_buy"] == row["daily_flow_small_buy"] == 4000.
+    assert row["daily_flow_ge20k_buy"] == 8000.
+    assert row["daily_flow_total_buy"] == 9000.
+
+
+def test_availability_uses_calendar_even_at_input_end() -> None:
+    raw = pd.DataFrame({"trade_date": pd.to_datetime(["2026-09-21", "2026-09-24", "2026-09-30"]),
+                        "ts_code": ["000001.SZ"] * 3})
+    result = add_availability_columns(raw)
+    assert result["available_date"].tolist() == list(pd.to_datetime(["2026-09-22", "2026-09-28", "2026-10-08"]))
+    assert result["available_time"].dt.hour.eq(9).all()
+    assert result["available_time"].dt.minute.eq(30).all()
+
+
+def test_bucket_schema_survives_panel_and_parquet_roundtrip(tmp_path: Path) -> None:
+    result = select_output_columns(add_availability_columns(build_open_source_tick_factor_panel(_raw_ev_panel(1))))
+    path = tmp_path / "factor.parquet"
+    result.to_parquet(path, index=False)
+    assert pd.read_parquet(path)["flow_bucket_schema"].eq(FLOW_BUCKET_SCHEMA).all()
+
+
+def test_missing_bucket_schema_gets_explicit_contract_value() -> None:
+    raw = _raw_ev_panel(1).drop(columns="flow_bucket_schema")
+    panel = build_open_source_tick_factor_panel(raw)
+    assert panel["flow_bucket_schema"].eq(FLOW_BUCKET_SCHEMA).all()
+
+
+def test_order_only_cli_emits_order_factors_without_daily_prices(tmp_path: Path, monkeypatch) -> None:
+    input_root, output_root = tmp_path / "ticks", tmp_path / "out"
+    for date in pd.bdate_range("2026-08-03", periods=20):
+        day = date.strftime("%Y%m%d")
+        directory = input_root / day[:4] / day[:6] / day / "000001.SZ"
+        directory.mkdir(parents=True)
+        orders = pd.DataFrame({"trade_time": pd.date_range(date + pd.Timedelta(hours=9, minutes=30), periods=100, freq="s"),
+                               "side": np.where(np.arange(100) % 6 < 3, "B", "S"),
+                               "order_type": "0", "order_id": np.arange(100) + 1,
+                               "price": 10., "quantity": 100.})
+        orders.to_parquet(directory / "orders.parquet", index=False)
+    monkeypatch.setattr(sys, "argv", ["generate_open_source_tick_factors.py", "--input-root", str(input_root),
+                                     "--output-root", str(output_root), "--daily-path", str(tmp_path / "missing.parquet"), "--workers", "1"])
+    assert generator.main() == 0
+    result = pd.read_parquet(output_root / "000001.SZ.parquet")
+    assert result["source_level"].eq("tick_order").all()
+    assert result["kaiyuan_order_lms_m20"].notna().sum() == 1
+    assert result["kaiyuan_order_island_mean_m20"].iloc[-1] > 1
+    assert result[list(TICK_FACTOR_COLUMNS[:8])].isna().all().all()
+    assert result["available_time"].notna().all()
+
+
+def test_cli_subset_and_limit_keep_full_ev_cross_section(tmp_path: Path, monkeypatch) -> None:
+    import json
+    raw = _raw_ev_panel(symbol_count=25, days=20)
+    symbols = sorted(raw["ts_code"].unique())
+    files = {symbol: {"transactions": [], "orders": []} for symbol in symbols}
+    def discover(input_root, selected, limit, date_from, date_to):
+        assert selected is None and limit is None and date_from is None
+        return files
+    monkeypatch.setattr(generator, "discover_symbol_files", discover)
+    monkeypatch.setattr(generator, "build_raw_panel", lambda files, workers: (raw.drop(columns="adj_factor"), []))
+    monkeypatch.setattr(generator, "load_daily_adjustment_factors", lambda *args: raw[["trade_date", "ts_code", "adj_factor"]])
+    for folder, extra in (("full", []), ("subset", ["--symbols", symbols[0]]), ("limited", ["--limit", "1"])):
+        monkeypatch.setattr(sys, "argv", ["generate_open_source_tick_factors.py", "--input-root", str(tmp_path / "ticks"),
+                                         "--output-root", str(tmp_path / folder), "--workers", "1"] + extra)
+        assert generator.main() == 0
+    full = pd.read_parquet(tmp_path / "full" / f"{symbols[0]}.parquet")
+    assert full["kaiyuan_evl_m20"].notna().any()
+    for folder in ("subset", "limited"):
+        pd.testing.assert_frame_equal(full, pd.read_parquet(tmp_path / folder / f"{symbols[0]}.parquet"))
+        manifest = json.loads((tmp_path / folder / "manifest.json").read_text())
+        assert manifest["calculation_universe"] == symbols
+        assert len(list((tmp_path / folder).glob("*.parquet"))) == 1
+    files["999999.SZ"] = {"transactions": [], "orders": []}
+    monkeypatch.setattr(sys, "argv", ["generate_open_source_tick_factors.py", "--input-root", str(tmp_path / "ticks"),
+                                     "--output-root", str(tmp_path / "full"), "--overwrite"])
+    with pytest.raises(ValueError, match="contract changed"):
+        generator.main()
+
+
+@pytest.mark.parametrize("workers", [1, 2])
+def test_extraction_failure_aborts_all_output(tmp_path: Path, monkeypatch, workers: int) -> None:
+    directory = tmp_path / "input" / "2026" / "202609" / "20260918"
+    good, bad = directory / "000001.SZ", directory / "000002.SZ"
+    good.mkdir(parents=True)
+    bad.mkdir()
+    _transactions("2026-09-18").to_parquet(good / "transactions.parquet", index=False)
+    (bad / "transactions.parquet").write_bytes(b"broken parquet")
+    output = tmp_path / "out"
+    monkeypatch.setattr(sys, "argv", ["generate_open_source_tick_factors.py", "--input-root", str(tmp_path / "input"),
+                                     "--output-root", str(output), "--symbols", "000001.SZ", "--workers", str(workers)])
+    assert generator.main() == 1
+    assert not output.exists()
+
+
+def test_cli_rejects_legacy_outputs_before_extracting(tmp_path: Path, monkeypatch) -> None:
+    output = tmp_path / "out"
+    output.mkdir()
+    sentinel = output / "000001.SZ.parquet"
+    sentinel.write_bytes(b"legacy")
+    monkeypatch.setattr(generator, "discover_symbol_files", lambda *args: {"000001.SZ": {"transactions": [], "orders": []}})
+    monkeypatch.setattr(sys, "argv", ["generate_open_source_tick_factors.py", "--output-root", str(output), "--overwrite"])
+    with pytest.raises(ValueError, match="no calculation manifest"):
+        generator.main()
+    assert sentinel.read_bytes() == b"legacy"

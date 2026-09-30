@@ -2015,12 +2015,22 @@ def build_historical_context(
     normalized_targets = sorted({pd.Timestamp(value).normalize() for value in target_dates})
     read_start = normalized_targets[0] - pd.Timedelta(days=140)
     read_end = normalized_targets[-1]
-    required_columns = ["close", "high", "low", "pre_close", "adj_factor"]
-    optional_columns = ["vol", "circ_mv", "up_limit", "down_limit", "float_share", "free_share"]
+    required_columns = ["close", "high", "low", "adj_factor"]
+    optional_columns = [
+        "pre_close",
+        "vol",
+        "circ_mv",
+        "up_limit",
+        "down_limit",
+        "float_share",
+        "free_share",
+    ]
     if daily_path.is_dir():
-        target_symbols = requested_codes if requested_codes is not None else {
-            p.name.split(".parquet")[0] for p in daily_path.glob("*.parquet")
-        }
+        target_symbols = (
+            {p.stem for p in daily_path.glob("*.parquet")}
+            if include_daily_factor_fields or requested_codes is None
+            else requested_codes
+        )
         pieces: list[pd.DataFrame] = []
         for symbol in target_symbols:
             sym_path = daily_path / f"{symbol}.parquet"
@@ -2040,8 +2050,6 @@ def build_historical_context(
             if df_sym.empty:
                 continue
             df_sym["ts_code"] = symbol.upper()
-            if "pre_close" not in df_sym.columns and "close" in df_sym.columns:
-                df_sym["pre_close"] = pd.to_numeric(df_sym["close"], errors="coerce").shift(1)
             for col in optional_columns:
                 if col not in df_sym.columns:
                     df_sym[col] = np.nan
@@ -2115,7 +2123,9 @@ def build_historical_context(
             valid_close / valid_low - 1.0
         )
         work["prevday_intraday_return_from_prev_close"] = (
-            valid_close / valid_pre_close - 1.0
+            work["_adj_close"]
+            / work.groupby("ts_code", sort=False)["_adj_close"].shift(1)
+            - 1.0
         )
 
     available_daily_dates = np.sort(work["trade_date"].dropna().unique())

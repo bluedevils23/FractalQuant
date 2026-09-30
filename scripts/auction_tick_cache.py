@@ -360,14 +360,21 @@ class AuctionTickCache:
             _normalize_orders,
         )
 
+    def load_close_order_history(self, symbol_dir: Path) -> pd.DataFrame:
+        """Include earlier orders carried into the closing auction."""
+        return self._load(
+            symbol_dir, "close_order_history", "逐笔委托.csv", list(ORDER_COLUMNS),
+            "09:15", "15:00", False, _normalize_orders,
+        )
+
     def load_close_transactions(self, symbol_dir: Path) -> pd.DataFrame:
         return self._load(
             symbol_dir,
-            "close_transactions",
+            "close_transactions_before_postclose_v4",
             "逐笔成交.csv",
             list(TRANSACTION_COLUMNS),
             "14:57",
-            "15:00",
-            True,
+            "15:05",
+            False,
             _normalize_transactions,
         )

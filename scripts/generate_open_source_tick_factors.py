@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import logging
 import os
 import re
 import sys
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from importlib.metadata import version
 from pathlib import Path
 
 import pandas as pd
@@ -44,6 +47,7 @@ TRANSACTION_NAMES = ("逐笔成交.csv", "transactions.parquet")
 ORDER_NAMES = ("逐笔委托.csv", "orders.parquet")
 PROGRESS_EVERY = 25
 WRITE_PROGRESS_EVERY = 50
+FACTOR_VERSION = "2"
 
 
 def _format_duration(seconds: float) -> str:
@@ -280,13 +284,18 @@ def build_raw_panel(
     total = len(items)
     LOGGER.info("Raw extraction started: %s symbols, workers=%s", total, workers)
     if workers <= 1:
-        iterator = ((item, _extract_one(item)) for item in items)
-        for (symbol, _), result in iterator:
+        for item in items:
+            symbol = item[0]
+            try:
+                result = _extract_one(item)
+                if result.empty:
+                    failures.append((symbol, "no valid transaction or order rows"))
+                else:
+                    frames.append(result)
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.exception("Failed to extract %s", symbol)
+                failures.append((symbol, str(exc)))
             completed += 1
-            if result.empty:
-                failures.append((symbol, "no valid transaction rows"))
-            else:
-                frames.append(result)
             _log_extraction_progress(completed, total, len(failures), started)
     else:
         with ProcessPoolExecutor(max_workers=workers) as executor:
@@ -296,7 +305,7 @@ def build_raw_panel(
                 try:
                     result = future.result()
                     if result.empty:
-                        failures.append((symbol, "no valid transaction rows"))
+                        failures.append((symbol, "no valid transaction or order rows"))
                     else:
                         frames.append(result)
                 except Exception as exc:  # noqa: BLE001
@@ -382,9 +391,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--input-root", type=Path, default=DEFAULT_INPUT_ROOT)
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
     parser.add_argument("--daily-path", type=Path, default=DEFAULT_DAILY_PATH)
-    parser.add_argument("--symbols", nargs="*", default=None)
-    parser.add_argument("--symbols-file", type=Path, default=None)
-    parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--symbols", nargs="*", default=None, help="Output symbols only; all discovered symbols form the calculation universe.")
+    parser.add_argument("--symbols-file", type=Path, default=None, help="Output symbols file, not the calculation universe.")
+    parser.add_argument("--limit", type=int, default=None, help="Limit output symbols, not the calculation universe.")
     parser.add_argument("--date-from", type=str, default=None)
     parser.add_argument("--date-to", type=str, default=None)
     parser.add_argument("--overwrite", action="store_true")
@@ -409,7 +418,32 @@ def main() -> int:
     symbols = list(dict.fromkeys(requested)) or None
     # Keep history before --date-from so the 20-day rolling factors retain a
     # causal warm-up window; date_from is applied only when writing outputs.
-    files = discover_symbol_files(args.input_root, symbols, args.limit, None, date_to)
+    files = discover_symbol_files(args.input_root, None, None, None, date_to)
+    output_symbols = symbols or sorted(files)
+    missing = sorted(set(output_symbols) - set(files))
+    if missing:
+        raise ValueError("Output symbols absent from calculation universe: " + ", ".join(missing[:10]))
+    if args.limit is not None:
+        output_symbols = output_symbols[:max(0, args.limit)]
+    if not output_symbols:
+        raise ValueError("No output symbols selected")
+    universe = sorted(files)
+    contract = {
+        "factor_version": FACTOR_VERSION,
+        "input_root": str(args.input_root.resolve()),
+        "daily_path": str(args.daily_path.resolve()),
+        "calculation_universe": universe,
+        "universe_sha256": hashlib.sha256("\n".join(universe).encode("utf-8")).hexdigest(),
+        "calendar": "XSHG",
+        "exchange_calendars_version": version("exchange-calendars"),
+        "price_units": "archive=1/10000 yuan; canonical=yuan; quantity=shares",
+    }
+    manifest_path = args.output_root / "manifest.json"
+    if manifest_path.exists():
+        if json.loads(manifest_path.read_text(encoding="utf-8")) != contract:
+            raise ValueError("Output calculation contract changed; use a new --output-root")
+    elif any(args.output_root.glob("*.parquet")):
+        raise ValueError("Existing output has no calculation manifest; use a new --output-root")
     LOGGER.info(
         "Discovered %s symbols, %s transaction files, %s order files",
         len(files),
@@ -419,15 +453,17 @@ def main() -> int:
     LOGGER.info("Extracting transaction factors for %s symbols", len(files))
     raw_started = time.monotonic()
     raw_panel, failures = build_raw_panel(files, max(1, int(args.workers)))
-    adjustments = load_daily_adjustment_factors(
-        args.daily_path, sorted(files), date_to
-    )
-    raw_panel = raw_panel.merge(
-        adjustments,
-        on=["trade_date", "ts_code"],
-        how="left",
-        validate="many_to_one",
-    )
+    if failures:
+        LOGGER.error("Aborting without writing: %s symbols failed in the calculation universe", len(failures))
+        return 1
+    if "daily_close" in raw_panel and raw_panel["daily_close"].notna().any():
+        adjustments = load_daily_adjustment_factors(args.daily_path, sorted(files), date_to)
+        raw_panel = raw_panel.merge(
+            adjustments, on=["trade_date", "ts_code"], how="left", validate="many_to_one"
+        )
+    else:
+        # Order-memory factors do not need transaction prices or adjustments.
+        raw_panel["adj_factor"] = float("nan")
     missing_adjustments = int(raw_panel["adj_factor"].isna().sum())
     if missing_adjustments:
         LOGGER.warning(
@@ -444,6 +480,7 @@ def main() -> int:
     factor_started = time.monotonic()
     LOGGER.info("Building cross-sectional tick factors")
     factor_panel = add_availability_columns(build_open_source_tick_factor_panel(raw_panel))
+    factor_panel = factor_panel.loc[factor_panel["ts_code"].isin(output_symbols)]
     LOGGER.info(
         "Cross-sectional factor build complete: %s rows, elapsed=%s",
         len(factor_panel),
@@ -457,6 +494,8 @@ def main() -> int:
         date_to=date_to,
         overwrite=args.overwrite,
     )
+    if written:
+        manifest_path.write_text(json.dumps(contract, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     LOGGER.info(
         "Output write complete: %s files, elapsed=%s",
         len(written),

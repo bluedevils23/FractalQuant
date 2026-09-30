@@ -113,16 +113,12 @@ def build_daily_market_feature_panel(close_panel: pd.DataFrame) -> pd.DataFrame:
 
 
 def _daily_hmm_fit(
-    values: np.ndarray,
+    standardized: np.ndarray,
     random_state: int = DAILY_REGIME_RANDOM_STATE,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None:
-    """Fit a standardized three-state daily HMM and order states by variance."""
-    if len(values) < 3 or not np.isfinite(values).all():
+    """Fit a three-state daily HMM on pre-standardized features and order by variance."""
+    if len(standardized) < 3 or not np.isfinite(standardized).all():
         return None
-    center = values.mean(axis=0)
-    scale = values.std(axis=0, ddof=0)
-    scale = np.where(np.isfinite(scale) & (scale > 1e-8), scale, 1.0)
-    standardized = (values - center) / scale
     if np.unique(standardized, axis=0).shape[0] < 3:
         return None
     model = GaussianHMM(
@@ -225,7 +221,8 @@ def calculate_causal_daily_market_regime_features(
             center = training.mean(axis=0)
             scale = training.std(axis=0, ddof=0)
             scale = np.where(np.isfinite(scale) & (scale > 1e-8), scale, 1.0)
-            fitted = _daily_hmm_fit(training)
+            standardized = (training - center) / scale
+            fitted = _daily_hmm_fit(standardized)
             if fitted is None:
                 fit_failure_dates.append(ordered.index[position].strftime("%Y-%m-%d"))
                 previous_model = None
@@ -261,6 +258,8 @@ def calculate_causal_daily_market_regime_features(
             continue
         posterior /= normalizer
         next_probability = posterior @ transition
+        # covars[:, 0] and scale[0] correspond to the first feature
+        # (market_return_1d) as defined by DAILY_REGIME_FEATURE_COLUMNS order.
         state_vol = np.sqrt(np.maximum(covars[:, 0], 1e-12)) * scale[0]
         valid_previous = previous_probability is not None
         entropy = -np.sum(np.clip(posterior, 1e-12, 1.0) * np.log(np.clip(posterior, 1e-12, 1.0))) / np.log(3.0)

@@ -98,7 +98,8 @@ class Factor:
         """
         coverage = (
             self.factor_exposure.filter(
-                ~pl.col(self.factor_name).is_nan()
+                pl.col(self.factor_name).is_not_null()
+                & ~pl.col(self.factor_name).is_nan()
             ).group_by('date').agg(
                 pl.col(self.factor_name).count()
             ).sort(by='date')
@@ -165,7 +166,8 @@ class Factor:
                 items=[
                     self.factor_exposure
                     .filter(
-                        ~pl.col(self.factor_name).is_nan()
+                        pl.col(self.factor_name).is_not_null()
+                        & ~pl.col(self.factor_name).is_nan()
                     ),
                     pv_data
                 ], how='align_left'

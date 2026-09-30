@@ -94,15 +94,34 @@ def calculate_previous_day_factors(
     """
     if not daily_path.exists():
         raise FileNotFoundError(f"Daily file does not exist: {daily_path}")
-    try:
-        daily = pd.read_parquet(daily_path, columns=["trade_date", "ts_code"])
-    except (KeyError, ValueError, TypeError):
-        daily = pd.read_parquet(daily_path)
-    if isinstance(daily.index, pd.MultiIndex) or {
-        "trade_date",
-        "ts_code",
-    }.difference(daily.columns):
-        daily = daily.reset_index()
+    if daily_path.is_dir():
+        parts = []
+        for symbol_path in daily_path.glob("*.parquet"):
+            dates = pd.read_parquet(symbol_path, columns=["trade_date"])
+            if "trade_date" not in dates.columns:
+                dates = dates.reset_index()
+            if "trade_date" not in dates.columns:
+                raise ValueError(f"Daily file must expose trade_date: {symbol_path}")
+            parts.append(
+                pd.DataFrame(
+                    {"trade_date": dates["trade_date"].to_numpy(), "ts_code": symbol_path.stem}
+                )
+            )
+        daily = (
+            pd.concat(parts, ignore_index=True)
+            if parts
+            else pd.DataFrame(columns=["trade_date", "ts_code"])
+        )
+    else:
+        try:
+            daily = pd.read_parquet(daily_path, columns=["trade_date", "ts_code"])
+        except (KeyError, ValueError, TypeError):
+            daily = pd.read_parquet(daily_path)
+        if isinstance(daily.index, pd.MultiIndex) or {
+            "trade_date",
+            "ts_code",
+        }.difference(daily.columns):
+            daily = daily.reset_index()
     if {"trade_date", "ts_code"}.difference(daily.columns):
         raise ValueError(f"Daily file must expose trade_date and ts_code: {daily_path}")
     daily["trade_date"] = pd.to_datetime(daily["trade_date"], errors="coerce").dt.normalize()
@@ -131,23 +150,32 @@ def calculate_previous_day_factors(
         include_daily_factor_fields=True,
     )
     rows: list[pd.DataFrame] = []
-    if benchmark_present:
-        benchmark_context = contexts.get(benchmark, pd.DataFrame())
-    elif etf_daily_path.exists():
-        benchmark_contexts = build_historical_context(
-            etf_daily_path,
-            target_dates,
-            {benchmark},
-            include_daily_factor_fields=True,
-        )
-        benchmark_context = benchmark_contexts.get(benchmark, pd.DataFrame())
-    else:
-        benchmark_context = pd.DataFrame()
+    market_columns = ["_market_above_ma20", "_prev_2d_return"]
+    benchmark_context = contexts.get(benchmark, pd.DataFrame())
     benchmark_by_date = (
-        benchmark_context.set_index("trade_date")
+        benchmark_context.set_index("trade_date")[market_columns]
         if not benchmark_context.empty
-        else pd.DataFrame()
+        else pd.DataFrame(columns=market_columns)
     )
+    if etf_daily_path.exists() and etf_daily_path != daily_path:
+        missing_market_dates = [
+            date
+            for date in target_dates
+            if date not in benchmark_by_date.index
+            or benchmark_by_date.loc[date, market_columns].isna().any()
+        ]
+        if missing_market_dates:
+            etf_contexts = build_historical_context(
+                etf_daily_path,
+                missing_market_dates,
+                {benchmark},
+                include_daily_factor_fields=True,
+            )
+            etf_context = etf_contexts.get(benchmark, pd.DataFrame())
+            if not etf_context.empty:
+                benchmark_by_date = benchmark_by_date.combine_first(
+                    etf_context.set_index("trade_date")[market_columns]
+                )
     for code, context in contexts.items():
         if code not in output_codes:
             continue

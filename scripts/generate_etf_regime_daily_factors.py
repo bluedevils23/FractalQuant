@@ -112,17 +112,25 @@ def build_market_regime_daily_frame(
 def _merge_output(path: Path, requested: pd.DataFrame, overwrite: bool) -> None:
     existing = pd.read_parquet(path) if path.exists() else pd.DataFrame(columns=OUTPUT_COLUMNS)
     existing = existing.reindex(columns=OUTPUT_COLUMNS)
-    dates = set(requested["trade_date"].astype(str))
+    existing["trade_date"] = pd.to_datetime(
+        existing["trade_date"], errors="coerce"
+    ).dt.normalize()
+    requested = requested.copy()
+    requested["trade_date"] = pd.to_datetime(
+        requested["trade_date"], errors="coerce"
+    ).dt.normalize()
+    requested_dates = set(requested["trade_date"].dropna())
     if overwrite:
-        existing = existing.loc[~existing["trade_date"].astype(str).isin(dates)]
+        existing = existing.loc[~existing["trade_date"].isin(requested_dates)]
         additions = requested
     else:
-        additions = requested.loc[
-            ~requested["trade_date"].astype(str).isin(set(existing["trade_date"].astype(str)))
-        ]
+        existing_dates = set(existing["trade_date"].dropna())
+        additions = requested.loc[~requested["trade_date"].isin(existing_dates)]
     combined = pd.concat([existing, additions], ignore_index=True)
     combined = combined.drop_duplicates(["trade_date"], keep="last")
-    combined["trade_date"] = pd.to_datetime(combined["trade_date"], errors="coerce").dt.normalize()
+    combined["trade_date"] = pd.to_datetime(
+        combined["trade_date"], errors="coerce"
+    ).dt.normalize()
     combined["source_trade_date"] = pd.to_datetime(
         combined["source_trade_date"], errors="coerce"
     ).dt.normalize()
@@ -168,6 +176,10 @@ def main() -> None:
         min_training_days=args.min_training_days,
         refit_days=args.refit_days,
     )
+    # Extract diagnostic metadata immediately; DataFrame.attrs do not survive
+    # serialization (parquet/pickle) or many pandas operations.
+    _fit_failure_dates = regime.attrs.get("model_fit_failure_dates", [])
+    _insufficient_history_dates = regime.attrs.get("insufficient_history_dates", [])
     output = build_market_regime_daily_frame(
         regime,
         close_panel.index,
@@ -192,8 +204,8 @@ def main() -> None:
         "target_date_to": str(output["trade_date"].max().date()) if not output.empty else None,
         "output_rows": int(len(output)),
         "output_file": str(output_path),
-        "model_fit_failure_dates": regime.attrs.get("model_fit_failure_dates", []),
-        "insufficient_history_dates": regime.attrs.get("insufficient_history_dates", []),
+        "model_fit_failure_dates": _fit_failure_dates,
+        "insufficient_history_dates": _insufficient_history_dates,
     }
     state_counts = (
         output["regime_state"].value_counts(dropna=False).to_dict()

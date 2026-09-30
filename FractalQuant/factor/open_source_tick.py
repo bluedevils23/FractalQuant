@@ -16,6 +16,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from .open_source import add_availability_columns as _exchange_availability
+
 try:
     from numba import jit
     HAS_NUMBA = True
@@ -282,15 +284,20 @@ def _rename_columns(frame: pd.DataFrame) -> pd.DataFrame:
 
 
 def normalize_tick_transactions(
-    raw_df: pd.DataFrame, ts_code_hint: str | None = None
+    raw_df: pd.DataFrame, ts_code_hint: str | None = None, *, price_divisor: float | None = None
 ) -> pd.DataFrame:
     """Normalize canonical/parquet or the local Chinese tick schema.
 
-    Prices in the raw ``E:\\逐笔数据`` CSV files are integer ten-thousandths;
-    a conservative magnitude check converts those values to yuan.  Rows with
-    zero price/quantity or cancellation records are excluded.
+    Archive Chinese/positional schemas use integer ten-thousandths and shares;
+    canonical price/quantity schemas use yuan and shares. An explicit divisor
+    can override the schema contract. Never infer units from price magnitudes.
     """
 
+    if price_divisor is None:
+        archive_schema = bool({"成交价格", "成交价", "raw_trade_date"}.intersection(raw_df.columns))
+        price_divisor = 10000.0 if archive_schema else 1.0
+    if not np.isfinite(price_divisor) or price_divisor <= 0:
+        raise ValueError("price_divisor must be finite and positive")
     frame = _rename_columns(raw_df.copy())
     if "trade_time" not in frame.columns:
         if {"raw_trade_date", "raw_time"}.issubset(frame.columns):
@@ -314,8 +321,7 @@ def normalize_tick_transactions(
             frame[column] = pd.to_numeric(frame[column], errors="coerce")
     if "bs_flag" in frame.columns:
         frame["bs_flag"] = frame["bs_flag"].astype("string").str.strip().str.upper()
-    if frame["price"].dropna().median() > 1000:
-        frame["price"] = frame["price"] / 10000.0
+    frame["price"] = frame["price"] / price_divisor
 
     if "trade_code" in frame.columns:
         code = frame["trade_code"].astype("string").str.strip().str.upper()
@@ -332,7 +338,7 @@ def normalize_tick_transactions(
     clock_minutes = frame["trade_time"].dt.hour * 60 + frame["trade_time"].dt.minute
     session_mask = (
         (clock_minutes.ge(9 * 60 + 30) & clock_minutes.lt(11 * 60 + 30))
-        | (clock_minutes.ge(13 * 60) & clock_minutes.lt(15 * 60))
+        | (clock_minutes.ge(13 * 60) & clock_minutes.le(15 * 60))
     )
     frame = frame.loc[session_mask].copy()
     frame["trade_date"] = frame["trade_time"].dt.normalize()
@@ -376,10 +382,15 @@ def load_tick_file(path: Path, ts_code_hint: str | None = None) -> pd.DataFrame:
 
 
 def normalize_tick_orders(
-    raw_df: pd.DataFrame, ts_code_hint: str | None = None
+    raw_df: pd.DataFrame, ts_code_hint: str | None = None, *, price_divisor: float | None = None
 ) -> pd.DataFrame:
     """Normalize full-day order events without inferring missing lifecycle data."""
 
+    if price_divisor is None:
+        archive_schema = bool({"委托价格", "raw_trade_date"}.intersection(raw_df.columns))
+        price_divisor = 10000.0 if archive_schema else 1.0
+    if not np.isfinite(price_divisor) or price_divisor <= 0:
+        raise ValueError("price_divisor must be finite and positive")
     frame = raw_df.copy()
     renamed = {}
     for column in frame.columns:
@@ -400,8 +411,7 @@ def normalize_tick_orders(
     frame["quantity"] = pd.to_numeric(frame["quantity"], errors="coerce")
     if "price" in frame.columns:
         frame["price"] = pd.to_numeric(frame["price"], errors="coerce")
-        if frame["price"].dropna().median() > 1000:
-            frame["price"] = frame["price"] / 10000.0
+        frame["price"] = frame["price"] / price_divisor
     frame["side"] = frame["side"].astype("string").str.strip().str.upper()
     if "order_type" in frame.columns:
         frame["order_type"] = frame["order_type"].astype("string").str.strip().str.upper()
@@ -419,7 +429,7 @@ def normalize_tick_orders(
     clock_minutes = frame["trade_time"].dt.hour * 60 + frame["trade_time"].dt.minute
     session_mask = (
         (clock_minutes.ge(9 * 60 + 30) & clock_minutes.lt(11 * 60 + 30))
-        | (clock_minutes.ge(13 * 60) & clock_minutes.lt(15 * 60))
+        | (clock_minutes.ge(13 * 60) & clock_minutes.le(15 * 60))
     )
     frame = frame.loc[session_mask].copy()
     frame["trade_date"] = frame["trade_time"].dt.normalize()
@@ -484,7 +494,10 @@ def _daily_metrics(day: pd.DataFrame, symbol: str) -> dict[str, object]:
     if minute.empty:
         return {"trade_date": day["trade_date"].iloc[0], "ts_code": symbol}
     minute["single_trade_amount"] = minute["minute_amount"] / minute["trade_count"]
-    minute["minute_return"] = minute["minute_close"].pct_change()
+    minute["minute_return"] = minute["minute_close"].pct_change(fill_method=None)
+    minute.loc[minute.index[0], "minute_return"] = (
+        minute["minute_close"].iloc[0] / day["price"].iloc[0] - 1.0
+    )
     valid_minutes = int(len(minute))
     total_count = int(minute["trade_count"].sum())
     total_amount = float(minute["minute_amount"].sum())
@@ -817,7 +830,8 @@ def _flow_daily_metrics(
         ):
             result[f"conditional_flow_{name}_count"] = float(condition.sum())
             for bucket, bucket_mask in (
-                ("large", matched_rows["_matched_notional"].ge(NIR_ORDER_THRESHOLD)),
+                ("large", matched_rows["_matched_notional"].ge(MEDIUM_ORDER_MAX)
+                 & matched_rows["_matched_notional"].lt(LARGE_ORDER_MAX)),
                 ("small", matched_rows["_matched_notional"].lt(SMALL_ORDER_MAX)),
             ):
                 for direction, sign in (("buy", "B"), ("sell", "S")):
@@ -1213,10 +1227,12 @@ def build_open_source_tick_factor_panel(
     frame = raw_panel.copy()
     frame["trade_date"] = pd.to_datetime(frame["trade_date"], errors="coerce").dt.normalize()
     frame = frame.sort_values(["ts_code", "trade_date"], kind="mergesort").reset_index(drop=True)
-    for column in ("daily_close", "adj_factor", *FLOW_RAW_COLUMNS):
+    for column in (*RAW_TICK_COLUMNS[2:], "adj_factor", *FLOW_RAW_COLUMNS):
         if column not in frame.columns:
-            frame[column] = np.nan
-        frame[column] = pd.to_numeric(frame[column], errors="coerce")
+            frame[column] = FLOW_BUCKET_SCHEMA if column == "flow_bucket_schema" else np.nan
+        if column != "flow_bucket_schema":
+            frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    frame["flow_bucket_schema"] = frame["flow_bucket_schema"].astype("string").fillna(FLOW_BUCKET_SCHEMA)
     frame["close_to_close_return"], frame["ret20"] = _adjusted_close_returns(
         frame, window
     )
@@ -1251,7 +1267,9 @@ def build_open_source_tick_factor_panel(
         frame.loc[indices, "kaiyuan_ideal_reversal_tick_volume_m20"] = (
             _rolling_cut_difference(
                 group["daily_return"],
-                group["daily_mean_trade_volume"],
+                group["daily_mean_trade_volume"] / group["adj_factor"].where(
+                    np.isfinite(group["adj_factor"]) & group["adj_factor"].gt(0)
+                ),
                 window,
                 REVERSAL_FRACTION,
             ).to_numpy()
@@ -1365,14 +1383,16 @@ def build_open_source_tick_factor_panel(
         frame[ratio_column] = rolling_category / rolling_total_amount.where(rolling_total_amount.gt(0))
         category_ratios[category] = ratio_column
 
+    # Report 6, page 6: regress EXTRA share separately on L, M and S.
+    # Using all three shares together creates an exact sum-to-one identity.
     evl_resid, evl_count, evl_r2 = _cross_section_multi_residual(
-        frame, category_ratios["extra"], [category_ratios["large"], category_ratios["medium"], category_ratios["small"]]
+        frame, category_ratios["extra"], [category_ratios["large"]]
     )
     evm_resid, evm_count, evm_r2 = _cross_section_multi_residual(
-        frame, category_ratios["medium"], [category_ratios["extra"], category_ratios["large"], category_ratios["small"]]
+        frame, category_ratios["extra"], [category_ratios["medium"]]
     )
     evs_resid, evs_count, evs_r2 = _cross_section_multi_residual(
-        frame, category_ratios["small"], [category_ratios["extra"], category_ratios["large"], category_ratios["medium"]]
+        frame, category_ratios["extra"], [category_ratios["small"]]
     )
     frame["kaiyuan_evl_m20"] = evl_resid
     frame["kaiyuan_evm_m20"] = evm_resid
@@ -1491,11 +1511,7 @@ def build_open_source_tick_factor_panel(
 
 
 def add_availability_columns(frame: pd.DataFrame) -> pd.DataFrame:
-    result = frame.copy()
-    result["trade_date"] = pd.to_datetime(result["trade_date"], errors="coerce").dt.normalize()
-    result = result.sort_values(["ts_code", "trade_date"], kind="mergesort").reset_index(drop=True)
-    result["available_date"] = result.groupby("ts_code", sort=False)["trade_date"].shift(-1)
-    result["available_time"] = result["available_date"] + pd.Timedelta(hours=9, minutes=30)
+    result = _exchange_availability(frame).reset_index(drop=True)
     columns = ["trade_date", "available_date", "available_time", "ts_code"]
     columns += [c for c in result.columns if c not in columns]
     return result[columns]

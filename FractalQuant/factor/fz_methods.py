@@ -609,7 +609,6 @@ def cal_YongPanGaoFeng(df: pl.DataFrame):
     """
     return (
         df.lazy().sort(by=['code', 'date'])
-        .drop_nans()
         .with_columns(
             r_mean_20_ts_pl('PanDeng'),
             r_std_20_ts_pl('PanDeng')
@@ -697,8 +696,7 @@ def cal_FeiEPuHuo(df: pl.DataFrame):
             .then(pl.col('range'))
             .otherwise(-pl.col('range'))
             .alias('FanZhuanZhenFu2')
-        ).drop_nans()
-        .with_columns(
+        ).with_columns(
             (r_mean_20_ts_pl('TiaoYueDu') + r_std_20_ts_pl('TiaoYueDu'))
             .alias('TiaoYueDu'),
             r_mean_20_ts_pl('FanZhuanZhenFu'),
@@ -998,7 +996,6 @@ def cal_ShuiZhongXingZhou(df: pl.DataFrame):
     """
     return (
         df.lazy().sort(by=['code', 'date'])
-        .drop_nans()
         .with_columns(
             (r_mean_20_ts_pl('GuYanChuQun') + r_std_20_ts_pl('GuYanChuQun'))
             .alias('GuYanChuQun')
@@ -1182,7 +1179,6 @@ def cal_HuaYinLinJian(df: pl.DataFrame):
     """
     return (
         df.lazy().sort(by=['code', 'date'])
-        .drop_nans()
         .select(
             pl.col('code'),
             pl.col('date'),
@@ -1207,7 +1203,7 @@ def cal_HuaYinLinJian(df: pl.DataFrame):
 def cal_DaiZhuErJiu(df: pl.DataFrame):
     """待著而救因子计算方法"""
     return (
-        df.lazy().sort(['code', 'date']).drop_nans()
+        df.lazy().sort(['code', 'date'])
         .with_columns(
             r_mean_20_ts_pl('GenSuiXiShu'),
             r_std_20_ts_pl('GenSuiXiShu')
@@ -1322,7 +1318,7 @@ def cal_ZhenFuBoYi(df: pl.DataFrame):
 def cal_DuoKongBoYi(df: pl.DataFrame):
     """多空博弈计算方法"""
     return (
-        df.lazy().drop_nans()
+        df.lazy().sort(['code', 'date'])
         .with_columns(
             standardize_cs_pl('ChengJiaoLiangBoYi_ShouYiLv'),
             standardize_cs_pl('ChengJiaoLiangBoYi_RiNeiXiangDuiWeiZhi')
@@ -1565,7 +1561,7 @@ def cal_XieTongJiaCha(
 def cal_XieTongXiaoYing(df: pl.DataFrame):
     """协同效应计算方法"""
     return (
-        df.lazy().drop_nans()
+        df.lazy().sort(['code', 'date'])
         .with_columns(
             (
                 r_mean_20_ts_pl('ChengJiaoLiangXieTong')
@@ -1598,11 +1594,13 @@ def cal_RuoShiBanChaoXi(df: pl.DataFrame):
 
 def cal_GenSuiXiShu(df: pl.DataFrame):
     return (
-        df.lazy().sort(['code', 'date', 'time']).filter(
+        df.lazy().sort(['code', 'date', 'time']).with_columns(
+            _trade_minute_expr().alias('trade_minute')
+        ).filter(
             pl.col('time') >= 94500000
         ).with_columns(
             pl.when(pl.col('volume') >= pl.col('volume').top_k(10).min())
-            .then(pl.col('time'))
+            .then(pl.col('trade_minute'))
             .otherwise(None)
             .over(['code', 'date'])
             .alias('high_volume_moment')
@@ -1615,7 +1613,7 @@ def cal_GenSuiXiShu(df: pl.DataFrame):
             .over(['code', 'date'])
             .alias('moment_diff')
         ).with_columns(
-            pl.when(pl.col('moment_diff') < 500000)
+            pl.when(pl.col('moment_diff') < 5)
             .then(None)
             .otherwise(pl.col('advantage_moment'))
             .fill_null(0)

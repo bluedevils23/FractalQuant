@@ -122,21 +122,21 @@ class MinFreqFactor(Factor):
 
         valid_results = []
         if len(pv_data_index) > 0:
-            if need_daily_data & (n_jobs is None):  # 如果需要日频量价数据
+            if need_daily_data and n_jobs is None:  # 如果需要日频量价数据
                 daily_pv = pl.read_parquet(r'D:\QuantData\Price_volume.parquet')
                 n_jobs = 1
-            elif need_daily_data & (n_jobs is not None):
+            elif need_daily_data and n_jobs is not None:
                 daily_pv = pl.read_parquet(r'D:\QuantData\Price_volume.parquet')
                 n_jobs = n_jobs
-            elif (~need_daily_data) & (n_jobs is None):
+            elif (not need_daily_data) and n_jobs is None:
                 daily_pv = None
                 n_jobs = -1
-            elif (~need_daily_data) & (n_jobs is not None):
+            elif (not need_daily_data) and n_jobs is not None:
                 daily_pv = None
                 n_jobs = n_jobs
             else:
                 raise ValueError(
-                    f'不正确的need_daily_data或n_jobs参数值, {need_daily_data}与{n_jobs}｝'
+                    f'不正确的need_daily_data或n_jobs参数值, {need_daily_data}与{n_jobs}'
                 )
             results = Parallel(n_jobs=n_jobs)(
                 delayed(self._process_single_file)(

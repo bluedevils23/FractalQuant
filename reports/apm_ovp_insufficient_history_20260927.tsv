@@ -1,0 +1,16 @@
+ts_code	reference_index_code	etf_first_to_cutoff	etf_last_to_cutoff	etf_sessions_to_cutoff	index_first_to_cutoff	index_last_to_cutoff	overlap_sessions	reason
+159059.SZ	H30199.CSI	2026-07-20	2026-07-30	9	2026-05-06	2026-07-30	9	less than 20 sessions before cutoff
+159067.SZ	399438.SZ	2026-07-13	2026-07-30	14	2014-12-30	2026-07-30	14	less than 20 sessions before cutoff
+159069.SZ	399266.SZ	2026-07-21	2026-07-30	8	2022-09-30	2026-07-30	8	less than 20 sessions before cutoff
+159072.SZ	399365.SZ	2026-07-17	2026-07-30	10	2009-11-04	2026-07-30	10	less than 20 sessions before cutoff
+159076.SZ	399266.SZ	2026-07-08	2026-07-30	17	2022-09-30	2026-07-30	17	less than 20 sessions before cutoff
+159161.SZ	931752.CSI	2026-07-07	2026-07-30	18	2026-05-06	2026-07-30	18	less than 20 sessions before cutoff
+512410.SH	399986.SZ	2026-07-08	2026-07-30	17	2015-05-19	2026-07-30	17	less than 20 sessions before cutoff
+515040.SH	H11059.CSI	2026-07-17	2026-07-30	10	2026-05-06	2026-07-30	10	less than 20 sessions before cutoff
+516440.SH	931752.CSI	2026-07-09	2026-07-30	16	2026-05-06	2026-07-30	16	less than 20 sessions before cutoff
+561250.SH	930632.CSI	2026-07-22	2026-07-30	7	2026-05-06	2026-07-30	7	less than 20 sessions before cutoff
+561470.SH	931946.CSI	2026-07-09	2026-07-30	16	2026-05-06	2026-07-30	16	less than 20 sessions before cutoff
+589390.SH	950162.CSI	2026-07-10	2026-07-30	15	2026-05-06	2026-07-30	15	less than 20 sessions before cutoff
+589400.SH	950162.CSI	2026-07-09	2026-07-30	16	2026-05-06	2026-07-30	16	less than 20 sessions before cutoff
+589410.SH	950180.CSI	2026-07-16	2026-07-30	11	2026-05-06	2026-07-30	11	less than 20 sessions before cutoff
+589420.SH	950162.CSI	2026-07-09	2026-07-30	16	2026-05-06	2026-07-30	16	less than 20 sessions before cutoff

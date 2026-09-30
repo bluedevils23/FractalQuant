@@ -406,6 +406,22 @@ def build_benchmark_returns(path: Path | None) -> dict[str, np.ndarray]:
     return _build_tail_returns(frame)
 
 
+def build_next_trade_dates(files: list[tuple[str, Path]]) -> dict[str, str]:
+    dates: set[str] = set()
+    for _, path in files:
+        columns = pq.ParquetFile(path).schema_arrow.names
+        date_column = next(
+            (name for name in ("trade_date", "trade_time", "datetime", "__index_level_0__") if name in columns),
+            None,
+        )
+        if date_column is None:
+            raise ValueError(f"Cannot locate trading dates in {path}")
+        values = pq.read_table(path, columns=[date_column]).column(date_column).unique()
+        dates.update(pd.Timestamp(value).strftime("%Y-%m-%d") for value in values.to_pylist())
+    ordered = sorted(dates)
+    return dict(zip(ordered, ordered[1:]))
+
+
 def process_symbol(
     symbol: str,
     input_path: Path,
@@ -414,15 +430,14 @@ def process_symbol(
     date_to: str | None,
     overwrite: bool,
     benchmark_returns: dict[str, np.ndarray],
+    next_trade_dates: dict[str, str],
 ) -> tuple[Path, int, int]:
     output_path = output_root / f"{symbol}.parquet"
     frame = normalize_minute_frame(pd.read_parquet(input_path))
     dates = sorted(pd.DatetimeIndex(frame.index.normalize()).unique())
-    next_dates = {
-        dates[i].strftime("%Y-%m-%d"): dates[i + 1].strftime("%Y-%m-%d")
-        for i in range(len(dates) - 1)
-    }
     selected_dates = {day.strftime("%Y-%m-%d") for day in dates if _date_in_range(day.strftime("%Y-%m-%d"), date_from, date_to)}
+    if not selected_dates:
+        raise ValueError(f"{symbol}: no input trading dates in requested range")
     output_has_current_schema = _output_has_current_schema(output_path)
     if not overwrite and output_has_current_schema:
         selected_dates -= _existing_dates(output_path)
@@ -436,7 +451,7 @@ def process_symbol(
                 calculate_tail30_factors(
                     single,
                     symbol,
-                    next_dates,
+                    next_trade_dates,
                     benchmark_returns,
                     selected_dates={date_text},
                     asset_returns_by_date=asset_returns_by_date,
@@ -450,19 +465,25 @@ def process_symbol(
         output_path,
         requested,
         overwrite,
-        replace_dates=selected_dates if not output_has_current_schema else None,
+        replace_dates=selected_dates if overwrite or not output_has_current_schema else None,
+    )
+    combined["available_time"] = (
+        pd.to_datetime(combined["trade_date"].map(next_trade_dates), errors="coerce")
+        + pd.Timedelta(hours=9, minutes=15)
     )
     output_root.mkdir(parents=True, exist_ok=True)
     combined.to_parquet(output_path, index=False)
     return output_path, len(records), len(selected_dates) - len(records)
 
 
-def write_manifest(output_root: Path, input_root: Path, universe_file: Path) -> None:
+def write_manifest(
+    output_root: Path, input_root: Path, universe_file: Path, run_summary: dict[str, object]
+) -> None:
     manifest = {
         "source_report_interval": "211m-240m",
         "bar_window": "14:31:00-15:00:00 inclusive (30 one-minute bars)",
         "return_boundary": "30 close-to-close returns from 14:30 close through 15:00 close",
-        "availability": "next available trading day 09:15; last observed day is NaT",
+        "availability": "next market trading day 09:15; last market day is NaT",
         "units": {
             "volume": "ETF shares",
             "amount": "CNY",
@@ -487,6 +508,7 @@ def write_manifest(output_root: Path, input_root: Path, universe_file: Path) -> 
         "limitations": "Bias, residual volatility, and Maxilliq are research-compatible proxies because the report does not disclose complete mathematical specifications.",
         "input_root": str(input_root),
         "universe_file": str(universe_file),
+        **run_summary,
     }
     output_root.mkdir(parents=True, exist_ok=True)
     (output_root / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -509,26 +531,47 @@ def main() -> int:
     else:
         requested = []
     if not requested:
-        requested = [path.stem for path in sorted(args.input_root.glob("*.parquet"))]
+        raise ValueError("No ETF symbols selected")
     if args.limit is not None:
         requested = requested[: args.limit]
     files = [(symbol, args.input_root / f"{symbol}.parquet") for symbol in requested]
-    missing = [path for _, path in files if not path.exists()]
+    missing = [symbol for symbol, path in files if not path.exists()]
     if missing:
         LOGGER.warning("Skipping %s universe codes without minute files", len(missing))
     files = [(symbol, path) for symbol, path in files if path.exists()]
+    write_manifest(
+        args.output_root, args.input_root, args.universe_file,
+        {"status": "running", "requested_symbols": len(requested)},
+    )
     benchmark_path = args.input_root / f"{args.benchmark_symbol}.parquet" if args.benchmark_symbol else None
-    benchmark_returns = build_benchmark_returns(benchmark_path)
-    write_manifest(args.output_root, args.input_root, args.universe_file)
+    try:
+        benchmark_returns = build_benchmark_returns(benchmark_path)
+        calendar_files = [(path.stem, path) for path in args.input_root.glob("*.parquet")]
+        next_trade_dates = build_next_trade_dates(calendar_files)
+    except Exception as exc:
+        write_manifest(
+            args.output_root, args.input_root, args.universe_file,
+            {"status": "failed", "requested_symbols": len(requested), "error": str(exc)},
+        )
+        raise
 
-    jobs = [(symbol, path, args.output_root, date_from, date_to, args.overwrite, benchmark_returns) for symbol, path in files]
-    failures: list[tuple[str, str]] = []
+    jobs = [(symbol, path, args.output_root, date_from, date_to, args.overwrite, benchmark_returns, next_trade_dates) for symbol, path in files]
+    failures: list[tuple[str, str]] = [(symbol, "minute file missing") for symbol in missing]
     written = 0
+    processed = 0
+    successful = 0
+    skipped_total = 0
     if max(1, args.workers) == 1:
         for job in jobs:
             try:
                 output_path, row_count, skipped_dates = process_symbol(*job)
+                processed += 1
                 written += int(row_count > 0)
+                skipped_total += skipped_dates
+                if skipped_dates:
+                    failures.append((job[0], f"{skipped_dates} dates skipped"))
+                else:
+                    successful += 1
                 LOGGER.info("%s: wrote %s rows, skipped %s dates -> %s", job[0], row_count, skipped_dates, output_path)
             except Exception as exc:  # noqa: BLE001
                 failures.append((job[0], str(exc)))
@@ -540,11 +583,30 @@ def main() -> int:
                 symbol = futures[future]
                 try:
                     output_path, row_count, skipped_dates = future.result()
+                    processed += 1
                     written += int(row_count > 0)
+                    skipped_total += skipped_dates
+                    if skipped_dates:
+                        failures.append((symbol, f"{skipped_dates} dates skipped"))
+                    else:
+                        successful += 1
                     LOGGER.info("%s: wrote %s rows, skipped %s dates -> %s", symbol, row_count, skipped_dates, output_path)
                 except Exception as exc:  # noqa: BLE001
                     failures.append((symbol, str(exc)))
                     LOGGER.exception("Failed to process %s", symbol)
+    write_manifest(
+        args.output_root, args.input_root, args.universe_file,
+        {
+            "status": "complete" if not failures else "partial" if successful else "failed",
+            "requested_symbols": len(requested),
+            "processed_symbols": processed,
+            "successful_symbols": successful,
+            "written_symbols": written,
+            "skipped_dates": skipped_total,
+            "missing_input_symbols": missing,
+            "failed_symbols": [{"symbol": symbol, "reason": reason} for symbol, reason in failures],
+        },
+    )
     LOGGER.info("Completed: %s symbol files with rows, %s failures", written, len(failures))
     return 1 if failures else 0
 

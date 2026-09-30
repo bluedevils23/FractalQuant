@@ -37,7 +37,36 @@ def parse_date(value: str | None) -> pd.Timestamp | None:
     return pd.to_datetime(clean, errors="coerce").normalize()
 
 
-def fetch_all_qmt_divid_factors(symbols: list[str]) -> dict[str, dict[pd.Timestamp, float]]:
+def compute_event_multiplier(row: dict | float, prior_close: float | None) -> float:
+    """Compute robust event multiplier using standard cash dividend formula."""
+    if isinstance(row, (int, float)):
+        return float(row)
+    interest = float(row.get("interest", 0.0) or 0.0)
+    stock_bonus = float(row.get("stockBonus", 0.0) or 0.0)
+    allot_num = float(row.get("allotNum", 0.0) or 0.0)
+    allot_price = float(row.get("allotPrice", 0.0) or 0.0)
+    qmt_dr = float(row.get("dr", 1.0) or 1.0)
+
+    # Pure cash dividend: use standard formula P_{prior} / (P_{prior} - interest)
+    if interest > 0 and stock_bonus == 0 and allot_num == 0:
+        if prior_close is not None and prior_close > 0:
+            pre_close = prior_close - interest
+            if pre_close > 0:
+                return float(prior_close / pre_close)
+        return qmt_dr if qmt_dr > 1.0 else 1.0
+
+    # Event with cash dividend where QMT dr is anomalous (< 1.0)
+    if interest > 0 and qmt_dr < 1.0:
+        if prior_close is not None and prior_close > 0:
+            pre_close = (prior_close - interest + allot_num * allot_price) / (1.0 + stock_bonus + allot_num)
+            if pre_close > 0:
+                return float(prior_close / pre_close)
+        return 1.0
+
+    return qmt_dr if qmt_dr > 0 else 1.0
+
+
+def fetch_all_qmt_divid_factors(symbols: list[str]) -> dict[str, dict[pd.Timestamp, dict]]:
     """Fetch dividend / split factors from QMT's xtdata for given symbols."""
     try:
         from xtquant import xtdata
@@ -48,7 +77,7 @@ def fetch_all_qmt_divid_factors(symbols: list[str]) -> dict[str, dict[pd.Timesta
 
     LOGGER.info("Fetching get_divid_factors from QMT for %d symbols...", len(symbols))
     started = time.monotonic()
-    div_dict: dict[str, dict[pd.Timestamp, float]] = {}
+    div_dict: dict[str, dict[pd.Timestamp, dict]] = {}
     total_records = 0
 
     for idx, sym in enumerate(symbols, start=1):
@@ -56,8 +85,17 @@ def fetch_all_qmt_divid_factors(symbols: list[str]) -> dict[str, dict[pd.Timesta
             df = xtdata.get_divid_factors(sym)
             if df is not None and not df.empty and "dr" in df.columns:
                 df.index = pd.to_datetime(df.index).normalize()
-                # dr is the ex-dividend adjustment factor multiplier
-                div_dict[sym] = df["dr"].to_dict()
+                records = {}
+                for dt_idx, r in df.iterrows():
+                    records[dt_idx] = {
+                        "dr": float(pd.to_numeric(r.get("dr", 1.0), errors="coerce")),
+                        "interest": float(pd.to_numeric(r.get("interest", 0.0), errors="coerce") or 0.0),
+                        "stockBonus": (float(pd.to_numeric(r.get("stockBonus", 0.0), errors="coerce") or 0.0)
+                                       + float(pd.to_numeric(r.get("stockGift", 0.0), errors="coerce") or 0.0)),
+                        "allotNum": float(pd.to_numeric(r.get("allotNum", 0.0), errors="coerce") or 0.0),
+                        "allotPrice": float(pd.to_numeric(r.get("allotPrice", 0.0), errors="coerce") or 0.0),
+                    }
+                div_dict[sym] = records
                 total_records += len(df)
         except Exception as exc:  # noqa: BLE001
             LOGGER.warning("Error getting divid factors for %s: %s", sym, exc)
@@ -125,7 +163,10 @@ def process_symbol_recursive(
             for d in calc_dates:
                 # If date_to is specified and d > date_to, ffill without applying new events if requested
                 if d in div_map and (date_to is None or d <= date_to):
-                    curr_adj = float(curr_adj * div_map[d])
+                    prior_d_list = unique_dates_1d[unique_dates_1d < d]
+                    prior_close = float(df_1d.loc[prior_d_list[-1], "close"]) if len(prior_d_list) and "close" in df_1d.columns else None
+                    mult = compute_event_multiplier(div_map[d], prior_close)
+                    curr_adj = float(curr_adj * mult)
                 computed_adj_by_date[d] = curr_adj
 
             # Mask for 1d dataframe
@@ -140,7 +181,10 @@ def process_symbol_recursive(
             computed_adj_by_date = {t0: curr_adj}
             for d in unique_dates_1d[1:]:
                 if d in div_map:
-                    curr_adj = float(curr_adj * div_map[d])
+                    prior_d_list = unique_dates_1d[unique_dates_1d < d]
+                    prior_close = float(df_1d.loc[prior_d_list[-1], "close"]) if len(prior_d_list) and "close" in df_1d.columns else None
+                    mult = compute_event_multiplier(div_map[d], prior_close)
+                    curr_adj = float(curr_adj * mult)
                 computed_adj_by_date[d] = curr_adj
 
             mask_1d = np.ones(len(df_1d), dtype=bool)

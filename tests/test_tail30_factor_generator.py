@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -15,7 +16,9 @@ from scripts.generate_tail30_factors import (  # noqa: E402
     FACTOR_COLUMNS,
     OUTPUT_COLUMNS,
     _residual_std,
+    build_next_trade_dates,
     calculate_tail30_factors,
+    main,
     merge_symbol_output,
     process_symbol,
 )
@@ -134,6 +137,7 @@ def test_process_symbol_skips_only_incomplete_date(tmp_path: Path) -> None:
         None,
         False,
         {},
+        {"2026-03-31": "2026-04-01"},
     )
 
     result = pd.read_parquet(output_path)
@@ -163,7 +167,8 @@ def test_schema_upgrade_retries_dates_that_failed_during_upgrade(tmp_path: Path)
     output_root.mkdir()
     legacy.to_parquet(output_root / "510300.SH.parquet", index=False)
 
-    _, rows, skipped = process_symbol("510300.SH", input_path, output_root, None, None, False, {})
+    next_dates = {"2026-03-31": "2026-04-01"}
+    _, rows, skipped = process_symbol("510300.SH", input_path, output_root, None, None, False, {}, next_dates)
     after_failed_upgrade = pd.read_parquet(output_root / "510300.SH.parquet")
     assert (rows, skipped) == (1, 1)
     assert after_failed_upgrade["trade_date"].tolist() == ["2026-03-31"]
@@ -171,7 +176,7 @@ def test_schema_upgrade_retries_dates_that_failed_during_upgrade(tmp_path: Path)
     repaired = pd.concat([_day_frame("2026-03-31"), _day_frame("2026-04-01")])
     repaired["ts_code"] = "510300.SH"
     repaired.to_parquet(input_path)
-    _, rows, skipped = process_symbol("510300.SH", input_path, output_root, None, None, False, {})
+    _, rows, skipped = process_symbol("510300.SH", input_path, output_root, None, None, False, {}, next_dates)
     result = pd.read_parquet(output_root / "510300.SH.parquet")
     assert (rows, skipped) == (1, 0)
     assert result["trade_date"].tolist() == ["2026-03-31", "2026-04-01"]
@@ -228,3 +233,125 @@ def test_schema_upgrade_does_not_keep_old_factor_values(tmp_path: Path) -> None:
     assert len(merged) == 1
     assert pd.isna(merged.loc[0, "tail30_maxilliq_proxy"])
     assert merged.loc[0, "tail30_maxilliq_w3_proxy"] == 0.2
+
+
+def test_market_calendar_fills_symbol_gap_and_updates_existing_rows(tmp_path: Path) -> None:
+    input_root = tmp_path / "input"
+    output_root = tmp_path / "output"
+    input_root.mkdir()
+    first = pd.concat([_day_frame("2026-03-31"), _day_frame("2026-04-02")])
+    second = pd.concat([_day_frame("2026-03-31"), _day_frame("2026-04-01"), _day_frame("2026-04-02")])
+    first.to_parquet(input_root / "510300.SH.parquet")
+    second.to_parquet(input_root / "510500.SH.parquet")
+    files = [(code, input_root / f"{code}.parquet") for code in ("510300.SH", "510500.SH")]
+    next_dates = build_next_trade_dates(files)
+    assert next_dates["2026-03-31"] == "2026-04-01"
+    assert next_dates["2026-04-01"] == "2026-04-02"
+
+    process_symbol("510300.SH", files[0][1], output_root, None, None, False, {}, next_dates)
+    output_path = output_root / "510300.SH.parquet"
+    result = pd.read_parquet(output_path)
+    assert result.loc[0, "available_time"] == pd.Timestamp("2026-04-01 09:15")
+
+    result.loc[0, "available_time"] = pd.Timestamp("2026-04-02 09:15")
+    result.to_parquet(output_path, index=False)
+    _, rows, skipped = process_symbol("510300.SH", files[0][1], output_root, None, None, False, {}, next_dates)
+    assert (rows, skipped) == (0, 0)
+    assert pd.read_parquet(output_path).loc[0, "available_time"] == pd.Timestamp("2026-04-01 09:15")
+
+
+def test_main_uses_full_input_calendar_for_symbol_subset(tmp_path: Path, monkeypatch) -> None:
+    input_root = tmp_path / "input"
+    output_root = tmp_path / "output"
+    input_root.mkdir()
+    pd.concat([_day_frame("2026-03-31"), _day_frame("2026-04-02")]).to_parquet(input_root / "510300.SH.parquet")
+    _day_frame("2026-04-01").to_parquet(input_root / "510500.SH.parquet")
+    monkeypatch.setattr(sys, "argv", [
+        "generate_tail30_factors.py", "--input-root", str(input_root),
+        "--output-root", str(output_root), "--symbols", "510300.SH",
+        "--benchmark-symbol", "", "--workers", "1",
+    ])
+
+    assert main() == 0
+    result = pd.read_parquet(output_root / "510300.SH.parquet")
+    assert result.loc[0, "available_time"] == pd.Timestamp("2026-04-01 09:15")
+
+
+def test_overwrite_drops_stale_row_when_date_fails(tmp_path: Path) -> None:
+    input_path = tmp_path / "510300.SH.parquet"
+    output_root = tmp_path / "output"
+    complete = pd.concat([_day_frame("2026-03-31"), _day_frame("2026-04-01")])
+    complete.to_parquet(input_path)
+    next_dates = {"2026-03-31": "2026-04-01"}
+    process_symbol("510300.SH", input_path, output_root, None, None, False, {}, next_dates)
+
+    incomplete = complete.drop(pd.Timestamp("2026-04-01 14:38"))
+    incomplete.to_parquet(input_path)
+    _, rows, skipped = process_symbol("510300.SH", input_path, output_root, None, None, True, {}, next_dates)
+    assert (rows, skipped) == (1, 1)
+    assert pd.read_parquet(output_root / "510300.SH.parquet")["trade_date"].tolist() == ["2026-03-31"]
+
+
+def test_main_marks_missing_and_incomplete_symbols_failed(tmp_path: Path, monkeypatch) -> None:
+    input_root = tmp_path / "input"
+    output_root = tmp_path / "output"
+    input_root.mkdir()
+    _day_frame("2026-03-31", missing_minute=7).to_parquet(input_root / "510300.SH.parquet")
+    universe = tmp_path / "universe.txt"
+    universe.write_text("510300.SH\n510500.SH\n", encoding="utf-8")
+    monkeypatch.setattr(sys, "argv", [
+        "generate_tail30_factors.py", "--input-root", str(input_root),
+        "--output-root", str(output_root), "--universe-file", str(universe),
+        "--benchmark-symbol", "", "--workers", "1",
+    ])
+
+    assert main() == 1
+    manifest = json.loads((output_root / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["status"] == "failed"
+    assert manifest["requested_symbols"] == 2
+    assert manifest["successful_symbols"] == 0
+    assert manifest["skipped_dates"] == 1
+    assert manifest["missing_input_symbols"] == ["510500.SH"]
+    assert {item["symbol"] for item in manifest["failed_symbols"]} == {"510300.SH", "510500.SH"}
+
+
+def test_main_incremental_noop_is_complete(tmp_path: Path, monkeypatch) -> None:
+    input_root = tmp_path / "input"
+    output_root = tmp_path / "output"
+    input_root.mkdir()
+    _day_frame("2026-03-31").to_parquet(input_root / "510300.SH.parquet")
+    universe = tmp_path / "universe.txt"
+    universe.write_text("510300.SH\n", encoding="utf-8")
+    monkeypatch.setattr(sys, "argv", [
+        "generate_tail30_factors.py", "--input-root", str(input_root),
+        "--output-root", str(output_root), "--universe-file", str(universe),
+        "--benchmark-symbol", "", "--workers", "1",
+    ])
+
+    assert main() == 0
+    assert main() == 0
+    manifest = json.loads((output_root / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["status"] == "complete"
+    assert manifest["written_symbols"] == 0
+    assert manifest["processed_symbols"] == 1
+    assert manifest["failed_symbols"] == []
+
+
+def test_main_marks_mixed_success_and_missing_input_partial(tmp_path: Path, monkeypatch) -> None:
+    input_root = tmp_path / "input"
+    output_root = tmp_path / "output"
+    input_root.mkdir()
+    _day_frame("2026-03-31").to_parquet(input_root / "510300.SH.parquet")
+    universe = tmp_path / "universe.txt"
+    universe.write_text("510300.SH\n510500.SH\n", encoding="utf-8")
+    monkeypatch.setattr(sys, "argv", [
+        "generate_tail30_factors.py", "--input-root", str(input_root),
+        "--output-root", str(output_root), "--universe-file", str(universe),
+        "--benchmark-symbol", "", "--workers", "1",
+    ])
+
+    assert main() == 1
+    manifest = json.loads((output_root / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["status"] == "partial"
+    assert manifest["successful_symbols"] == 1
+    assert manifest["missing_input_symbols"] == ["510500.SH"]

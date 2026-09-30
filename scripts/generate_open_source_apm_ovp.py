@@ -4,11 +4,17 @@ from __future__ import annotations
 
 import argparse
 import logging
+import hashlib
+import json
+import tempfile
+import os
 import re
 import sys
 from pathlib import Path
 
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent
@@ -18,10 +24,15 @@ for root in (PROJECT_ROOT, PACKAGE_ROOT):
         sys.path.insert(0, str(root))
 
 from factor.open_source_crossmarket import (  # noqa: E402
+    APM_FACTOR_COLUMNS,
+    WINDOW,
+    trading_dates,
     add_availability_columns,
     build_daily_apm_raw_features,
     build_open_source_apm_panel,
 )
+
+from factor.open_source import normalize_minute_frame
 
 LOGGER = logging.getLogger("generate_open_source_apm_ovp")
 DEFAULT_INPUT_ROOT = Path(r"D:\workspace\stockdata\etf-data\etf_1min")
@@ -58,31 +69,47 @@ def load_mapping(path: Path) -> dict[str, str]:
         fund = normalize_symbol(row[fund_col])
         reference = str(row[ref_col]).strip().upper()
         if reference and reference != "NAN":
+            if fund in mapping and mapping[fund] != reference:
+                raise ValueError(f"Conflicting reference indices for {fund}")
             mapping[fund] = reference
     return mapping
 
 
 def find_parquet(root: Path, symbol: str) -> Path | None:
     direct = root / f"{symbol}.parquet"
-    if direct.exists():
-        return direct
-    code = symbol.split(".", 1)[0]
-    for path in root.glob(f"{code}.*.parquet"):
-        return path
-    return None
+    return direct if direct.is_file() else None
 
 
 def find_index_parquet(root: Path, reference: str) -> Path | None:
     reference = str(reference).strip().upper()
-    code = reference.split(".", 1)[0]
-    candidates = [reference, f"{code}.SH", f"{code}.SZ", f"{code}.CSI", f"{code}.CFE"]
-    for candidate in candidates:
-        path = root / f"{candidate}.parquet"
-        if path.exists():
-            return path
-    for path in root.glob(f"{code}.*.parquet"):
-        return path
-    return None
+    if "." in reference:
+        return find_parquet(root, reference)
+    candidates = sorted(root.glob(f"{reference}.*.parquet"))
+    if len(candidates) > 1:
+        raise ValueError(f"Ambiguous unsuffixed index {reference}: {candidates}")
+    return candidates[0] if candidates else None
+
+
+def read_minutes(path: Path, start: pd.Timestamp | None, end: pd.Timestamp | None) -> pd.DataFrame:
+    schema = pq.read_schema(path)
+    time_col = next((c for c in ("trade_time", "datetime") if c in schema.names and pa.types.is_timestamp(schema.field(c).type)), None)
+    filters = []
+    if time_col and start is not None:
+        filters.append((time_col, ">=", start))
+    if time_col and end is not None:
+        filters.append((time_col, "<", end + pd.Timedelta(days=1)))
+    frame = normalize_minute_frame(pd.read_parquet(path, filters=filters or None))
+    if start is not None:
+        frame = frame.loc[frame.index >= start]
+    if end is not None:
+        frame = frame.loc[frame.index < end + pd.Timedelta(days=1)]
+    return frame
+
+
+def atomic_json(path: Path, data: dict) -> None:
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    temporary.replace(path)
 
 
 def parse_date(value: str | None) -> pd.Timestamp | None:
@@ -98,6 +125,7 @@ def main() -> int:
     parser.add_argument("--symbols", nargs="*")
     parser.add_argument("--symbols-file", type=Path)
     parser.add_argument("--limit", type=int)
+    parser.add_argument("--universe-file", type=Path, help="Fixed calculation universe; defaults to all mapped funds. --symbols/--limit only select outputs.")
     parser.add_argument("--date-from")
     parser.add_argument("--date-to")
     parser.add_argument("--overwrite", action="store_true")
@@ -116,72 +144,118 @@ def main() -> int:
         symbols = symbols[: max(0, args.limit)]
     date_from = parse_date(args.date_from)
     date_to = parse_date(args.date_to)
+    if date_from is not None and date_to is not None and date_from > date_to:
+        parser.error("--date-from must not exceed --date-to")
+    universe = read_symbols_file(args.universe_file) if args.universe_file else sorted(mapping)
+    if not requested:
+        symbols = universe[:max(0, args.limit)] if args.limit is not None else universe
+    if not universe or not symbols or not set(symbols).issubset(universe):
+        parser.error("Output symbols must be a nonempty subset of the fixed calculation universe")
+    history_start = None
+    if date_from is not None:
+        history = trading_dates(date_from - pd.Timedelta(days=120), date_from)
+        prior = history[history < date_from]
+        if len(prior) < WINDOW:
+            parser.error("Insufficient calendar history for warmup")
+        history_start = prior[-WINDOW]
     args.output_root.mkdir(parents=True, exist_ok=True)
-    for stale in args.output_root.glob("._raw_*.parquet"):
-        stale.unlink(missing_ok=True)
-    written = 0
-    for symbol in symbols:
-        output_path = args.output_root / f"{symbol}.parquet"
-        if output_path.exists() and not args.overwrite:
-            LOGGER.info("skip existing %s", output_path.name)
-            continue
-        reference = mapping.get(symbol)
-        asset_path = find_parquet(args.input_root, symbol)
-        index_path = find_index_parquet(args.index_root, reference) if reference else None
-        if not reference or asset_path is None or index_path is None:
-            LOGGER.warning("skip %s: mapping or parquet missing (reference=%s)", symbol, reference)
-            continue
-        try:
-            asset = pd.read_parquet(asset_path)
-            benchmark = pd.read_parquet(index_path)
-            if date_from is not None or date_to is not None:
-                def _slice_dates(frame: pd.DataFrame) -> pd.DataFrame:
-                    if isinstance(frame.index, pd.MultiIndex):
-                        names = set(frame.index.names)
-                        date_values = frame.index.get_level_values("trade_date") if "trade_date" in names else None
-                        if date_values is not None:
-                            dates = pd.to_datetime(date_values, errors="coerce").normalize()
-                            mask = pd.Series(True, index=frame.index)
-                            if date_from is not None:
-                                mask &= dates >= date_from - pd.Timedelta(days=30)
-                            if date_to is not None:
-                                mask &= dates <= date_to
-                            return frame.loc[mask.to_numpy()]
-                    if "trade_time" in frame.columns:
-                        dates = pd.to_datetime(frame["trade_time"], errors="coerce").dt.normalize()
-                        mask = pd.Series(True, index=frame.index)
-                        if date_from is not None:
-                            mask &= dates >= date_from - pd.Timedelta(days=30)
-                        if date_to is not None:
-                            mask &= dates <= date_to
-                        return frame.loc[mask]
-                    return frame
-                asset = _slice_dates(asset)
-                benchmark = _slice_dates(benchmark)
-            raw = build_daily_apm_raw_features(asset, benchmark, symbol, reference)
+    lock_path = args.output_root / ".apm_generation.lock"
+    try:
+        lock = lock_path.open("x")
+    except FileExistsError:
+        LOGGER.error("Output directory is locked: %s", lock_path)
+        return 1
+    report = {"version": 2, "status": "failed", "failures": {}, "written": [],
+              "mapping_pit": False, "mapping_policy": "static snapshot; ETF mapped-index adaptation"}
+    try:
+        lock.write(str(os.getpid()))
+        lock.close()
+        sources = {}
+        for symbol in universe:
+            reference = mapping.get(symbol)
+            asset_path = find_parquet(args.input_root, symbol)
+            index_path = find_index_parquet(args.index_root, reference) if reference else None
+            if not reference or asset_path is None or index_path is None:
+                report["failures"][symbol] = f"Missing mapping/input/index: {reference}"
+            else:
+                sources[symbol] = (reference, asset_path, index_path)
+        if report["failures"]:
+            raise ValueError("Incomplete fixed universe; see run_report.json")
+        paths = sorted({path for _, asset, benchmark in sources.values() for path in (asset, benchmark)})
+        config = {"version": 2, "universe": sorted(universe),
+                  "date_from": str(date_from), "date_to": str(date_to),
+                  "mapping_sha256": hashlib.sha256(args.mapping.read_bytes()).hexdigest(),
+                  "sources": {str(p.resolve()): [p.stat().st_size, p.stat().st_mtime_ns] for p in paths}}
+        signature = hashlib.sha256(json.dumps(config, sort_keys=True).encode()).hexdigest()
+        manifest_path = args.output_root / "manifest.json"
+        existing = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.exists() else {}
+        existing_symbols = {p.stem for p in args.output_root.glob("*.parquet")}
+        if existing_symbols and existing.get("signature") != signature:
+            if not (args.overwrite and existing_symbols.issubset(symbols)):
+                raise ValueError("Existing outputs have incompatible/unverified provenance; use a new directory or overwrite every existing symbol")
+        write_symbols = {symbol for symbol in symbols if args.overwrite or not (args.output_root / f"{symbol}.parquet").exists()}
+        report.update({"signature": signature, "config": config, "requested": symbols,
+                       "skipped": sorted(set(symbols) - write_symbols)})
+        if not write_symbols:
+            report["status"] = "complete"
+            return 0
+        # All universe members participate, including those with existing output.
+        # A private staging directory plus an exclusive lock prevents writer races.
+        with tempfile.TemporaryDirectory(prefix=".apm_", dir=args.output_root) as temporary:
+            staging = Path(temporary)
+            for symbol, (reference, asset_path, index_path) in sources.items():
+                try:
+                    raw = build_daily_apm_raw_features(
+                        read_minutes(asset_path, history_start, date_to),
+                        read_minutes(index_path, history_start, date_to), symbol, reference)
+                    if raw.empty:
+                        raise ValueError("No daily observations in the requested interval")
+                    raw.to_parquet(staging / f"{symbol}.parquet", index=False)
+                except Exception as exc:
+                    report["failures"][symbol] = str(exc)
+                    LOGGER.exception("failed %s", symbol)
+            if report["failures"]:
+                raise ValueError("Failed universe members; no factor outputs published")
+            panel = pd.concat([pd.read_parquet(staging / f"{s}.parquet") for s in universe], ignore_index=True)
+            result = add_availability_columns(build_open_source_apm_panel(panel))
             if date_from is not None:
-                raw = raw.loc[pd.to_datetime(raw["trade_date"]).ge(date_from)]
+                result = result.loc[result["trade_date"].ge(date_from)]
             if date_to is not None:
-                raw = raw.loc[pd.to_datetime(raw["trade_date"]).le(date_to)]
-            if raw.empty:
-                continue
-            # Cross-sectional residualization must see all selected symbols.
-            # The single-symbol files are therefore staged and finalized below.
-            raw.to_parquet(args.output_root / f"._raw_{symbol}.parquet", index=False)
-        except Exception as exc:  # pragma: no cover - batch diagnostics
-            LOGGER.exception("failed %s: %s", symbol, exc)
-    raw_paths = sorted(args.output_root.glob("._raw_*.parquet"))
-    if raw_paths:
-        panel = pd.concat([pd.read_parquet(path) for path in raw_paths], ignore_index=True)
-        result = add_availability_columns(build_open_source_apm_panel(panel))
-        for symbol, group in result.groupby("ts_code", sort=True):
-            output_path = args.output_root / f"{symbol}.parquet"
-            group.sort_values("trade_date", kind="mergesort").to_parquet(output_path, index=False)
-            written += 1
-        for path in raw_paths:
-            path.unlink(missing_ok=True)
-    LOGGER.info("wrote %d symbols to %s", written, args.output_root)
-    return 0
+                result = result.loc[result["trade_date"].le(date_to)]
+            report["coverage"] = {}
+            for symbol in sorted(write_symbols):
+                group = result.loc[result["ts_code"].eq(symbol)].sort_values("trade_date").reset_index(drop=True)
+                valid = group[list(APM_FACTOR_COLUMNS)].notna().sum().astype(int).to_dict()
+                report["coverage"][symbol] = {"rows": len(group), "first_date": str(group["trade_date"].min()),
+                    "last_date": str(group["trade_date"].max()), "nonnull": valid}
+                if group.empty or not any(valid.values()):
+                    report["failures"][symbol] = "No valid factor values in requested output interval"
+                    continue
+                staged = staging / f"output_{symbol}.parquet"
+                group.to_parquet(staged, index=False)
+                pd.testing.assert_frame_equal(pd.read_parquet(staged), group)
+            if report["failures"]:
+                raise ValueError("Empty factor outputs; see coverage in run_report.json")
+            current_sources = {str(p.resolve()): [p.stat().st_size, p.stat().st_mtime_ns] for p in paths}
+            if current_sources != config["sources"] or hashlib.sha256(args.mapping.read_bytes()).hexdigest() != config["mapping_sha256"]:
+                raise ValueError("Inputs changed during generation; no outputs published")
+            for symbol in sorted(write_symbols):
+                (staging / f"output_{symbol}.parquet").replace(args.output_root / f"{symbol}.parquet")
+                report["written"].append(symbol)
+        atomic_json(manifest_path, {"signature": signature, "config": config})
+        report["status"] = "complete"
+        LOGGER.info("wrote %d symbols to %s", len(report["written"]), args.output_root)
+        return 0
+    except Exception as exc:
+        report["error"] = str(exc)
+        LOGGER.exception("APM generation failed")
+        return 1
+    finally:
+        try:
+            atomic_json(args.output_root / "run_report.json", report)
+        finally:
+            lock.close()
+            lock_path.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":
