@@ -157,7 +157,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--overwrite",
         action="store_true",
-        help="Overwrite existing output files.",
+        help=(
+            "Replace existing output files entirely. Without it, existing files "
+            "are skipped, or, when --date-from/--date-to is given, the requested "
+            "range is merged into them."
+        ),
     )
     parser.add_argument(
         "--workers",
@@ -471,7 +475,9 @@ def process_file(
     date_to: pd.Timestamp | None = None,
 ) -> tuple[str, Path, int | None, int | None]:
     output_path = output_root / input_path.name
-    if output_path.exists() and not overwrite:
+    has_date_range = date_from is not None or date_to is not None
+    merge_existing = output_path.exists() and not overwrite and has_date_range
+    if output_path.exists() and not overwrite and not has_date_range:
         return ("skipped", output_path, None, None)
 
     raw_df = read_minute_source(input_path, date_from, date_to)
@@ -500,10 +506,27 @@ def process_file(
     ]
     result_df = result_df[ordered_columns + remaining_columns]
 
-    output_root.mkdir(parents=True, exist_ok=True)
-    result_df.to_parquet(output_path)
+    if merge_existing:
+        # Incremental update: the requested date range replaces the same range
+        # in the existing output; dates outside it are kept.
+        existing = pd.read_parquet(output_path)
+        in_range = pd.Series(True, index=existing.index)
+        if date_from is not None:
+            in_range &= existing.index >= date_from
+        if date_to is not None:
+            in_range &= existing.index <= date_to
+        result_df = pd.concat([existing.loc[~in_range.to_numpy()], result_df])
+        result_df = result_df.sort_index()
 
-    return ("written", output_path, len(result_df), len(result_df.columns))
+    output_root.mkdir(parents=True, exist_ok=True)
+    # Write to a temp file first so an interrupted run never leaves a
+    # truncated parquet that later runs would treat as complete.
+    tmp_path = output_path.with_name(output_path.name + ".tmp")
+    result_df.to_parquet(tmp_path)
+    os.replace(tmp_path, output_path)
+
+    status = "merged" if merge_existing else "written"
+    return (status, output_path, len(result_df), len(result_df.columns))
 
 
 def main() -> int:

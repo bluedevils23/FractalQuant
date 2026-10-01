@@ -12,6 +12,7 @@ from scripts.generate_etf_cicc_minute_factors import (
     build_factor_registry,
     filter_minute_frame,
     normalize_date_arg,
+    process_file,
 )
 import MinuteFrequentFactorCalculateMethodsCICC as cicc_methods
 from MinuteFrequentFactorCalculateMethodsCICC import cal_mmt_pm
@@ -194,3 +195,161 @@ def test_trade_bottom_ratios_are_independent_of_other_trade_dates() -> None:
 
         assert np.isclose(isolated_value, combined_value)
         assert np.isclose(isolated_value, 10.0 / 110.0 * 0.1)
+
+
+def _end_labeled_times() -> list[int]:
+    """241 end-labeled bars: 09:30 auction, 09:31-11:30, 13:01-15:00."""
+    minutes = [9 * 60 + 30]
+    minutes += list(range(9 * 60 + 31, 11 * 60 + 31))
+    minutes += list(range(13 * 60 + 1, 15 * 60 + 1))
+    return [(m // 60) * 10000000 + (m % 60) * 100000 for m in minutes]
+
+
+def _full_day(**overrides: list[float]) -> pl.DataFrame:
+    times = _end_labeled_times()
+    n = len(times)
+    data = {
+        "code": ["510300.SH"] * n,
+        "date": [dt.date(2026, 1, 2)] * n,
+        "time": times,
+        "open": [100.0] * n,
+        "high": [100.0] * n,
+        "low": [100.0] * n,
+        "close": [100.0] * n,
+        "volume": [1.0] * n,
+    }
+    data.update(overrides)
+    return pl.DataFrame(data)
+
+
+def _set_at(times: list[int], values: dict[int, float], default: float) -> list[float]:
+    return [values.get(t, default) for t in times]
+
+
+def test_trade_top_ratios_survive_zero_volume_bars() -> None:
+    times = _end_labeled_times()
+    # One zero-volume bar inside the first-20 window, one positive and one
+    # negative bar return; daily volume = 241 - 1 = 240.
+    volume = _set_at(times, {93500000: 0.0}, 1.0)
+    close = _set_at(times, {93100000: 101.0, 93200000: 99.0}, 100.0)
+    frame = _full_day(volume=volume, close=close)
+
+    top20 = cicc_methods.cal_trade_top20retRatio(frame)["trade_top20retRatio"][0]
+    top50 = cicc_methods.cal_trade_top50retRatio(frame)["trade_top50retRatio"][0]
+    neg = cicc_methods.cal_trade_topNeg20retRatio(frame)["trade_topNeg20retRatio"][0]
+    pos = cicc_methods.cal_trade_topPos20retRatio(frame)["trade_topPos20retRatio"][0]
+
+    share = 1.0 / 240.0
+    assert np.isclose(top20, (0.01 - 0.01) * share)
+    assert np.isclose(top50, (0.01 - 0.01) * share)
+    assert np.isclose(neg, 0.01 * share)
+    assert np.isclose(pos, 0.01 * share)
+
+
+def test_session_momentum_windows_match_end_labeled_bars() -> None:
+    times = _end_labeled_times()
+    open_ = _set_at(
+        times, {93000000: 100.0, 100100000: 101.0, 143100000: 104.0}, 999.0
+    )
+    close = _set_at(
+        times, {113000000: 110.0, 143000000: 111.0, 145900000: 114.4}, 999.0
+    )
+    frame = _full_day(open=open_, close=close)
+
+    assert np.isclose(cicc_methods.cal_mmt_am(frame)["mmt_am"][0], 1.10)
+    assert np.isclose(
+        cicc_methods.cal_mmt_between(frame)["mmt_between"][0], 111.0 / 101.0
+    )
+    assert np.isclose(cicc_methods.cal_mmt_last30(frame)["mmt_last30"][0], 1.10)
+
+
+def test_closing_volume_windows_match_end_labeled_bars() -> None:
+    times = _end_labeled_times()
+    # 14:57 bar is continuous trading (14:56-14:57); the call auction
+    # bars are 14:58-15:00.
+    volume = _set_at(
+        times, {145700000: 10.0, 145800000: 0.0, 145900000: 0.0, 150000000: 30.0}, 0.0
+    )
+    volume[0] = 60.0  # 09:30 bar
+    frame = _full_day(volume=volume)
+
+    closevol = cicc_methods.cal_liq_closevol(frame)["liq_closevol"][0]
+    prevol = cicc_methods.cal_liq_closeprevol(frame)["liq_closeprevol"][0]
+    last_call = cicc_methods.cal_liq_lastCallR(frame)["liq_lastCallR"][0]
+
+    assert np.isclose(closevol, 30.0)
+    assert np.isclose(prevol, 70.0)
+    assert np.isclose(last_call, 30.0 / 100.0)
+
+
+def test_trade_tail_ratio_uses_last_30_bars() -> None:
+    times = _end_labeled_times()
+    volume = _set_at(times, {143000000: 1000.0}, 1.0)
+    frame = _full_day(volume=volume)
+
+    tail = cicc_methods.cal_trade_tailRatio(frame)["trade_tailRatio"][0]
+
+    assert np.isclose(tail, 30.0 / (240.0 + 1000.0))
+
+
+def _write_minute_source(path, days: list[str]) -> None:
+    frames = []
+    for day in days:
+        times = pd.to_datetime(
+            [
+                f"{day} {t // 10000000:02d}:{t // 100000 % 100:02d}"
+                for t in _end_labeled_times()
+            ]
+        )
+        n = len(times)
+        rng = np.random.default_rng(len(frames))
+        close = 100.0 + rng.normal(0, 0.05, n).cumsum()
+        frames.append(
+            pd.DataFrame(
+                {
+                    "ts_code": "510300.SH",
+                    "open": close - 0.01,
+                    "high": close + 0.02,
+                    "low": close - 0.03,
+                    "close": close,
+                    "vol": rng.integers(1, 1000, n).astype(float),
+                    "trade_date": times.normalize(),
+                    "trade_time": times,
+                }
+            )
+        )
+    pd.concat(frames).set_index(["trade_date", "trade_time"]).to_parquet(path)
+
+
+def test_process_file_merges_date_range_into_existing_output(tmp_path) -> None:
+    source = tmp_path / "in" / "510300.SH.parquet"
+    source.parent.mkdir()
+    _write_minute_source(source, ["2026-01-05", "2026-01-06"])
+    out_root = tmp_path / "out"
+    day1, day2 = normalize_date_arg("2026-01-05"), normalize_date_arg("2026-01-06")
+
+    status1, out_path, *_ = process_file(source, out_root, False, day1, day1)
+    status2, *_ = process_file(source, out_root, False, day2, day2)
+    status3, *_ = process_file(source, out_root, False, day2, day2)
+    merged = pd.read_parquet(out_path)
+
+    assert (status1, status2, status3) == ("written", "merged", "merged")
+    assert merged.index.tolist() == [day1, day2]
+    assert not list(out_root.glob("*.tmp"))
+
+    full = tmp_path / "full"
+    process_file(source, full, False)
+    pd.testing.assert_frame_equal(
+        merged, pd.read_parquet(full / source.name), check_freq=False
+    )
+
+
+def test_process_file_without_date_range_still_skips_existing(tmp_path) -> None:
+    source = tmp_path / "510300.SH.parquet"
+    _write_minute_source(source, ["2026-01-05"])
+    out_root = tmp_path / "out"
+
+    process_file(source, out_root, False)
+    status, *_ = process_file(source, out_root, False)
+
+    assert status == "skipped"
