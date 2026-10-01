@@ -328,12 +328,13 @@ def test_opening_window_bar_counts() -> None:
 
 def test_trade_tail_ratio_uses_last_30_bars() -> None:
     times = _end_labeled_times()
-    volume = _set_at(times, {143000000: 1000.0}, 1.0)
+    # 14:27 is just outside the 14:28-14:57 window; 14:28 is the first bar inside.
+    volume = _set_at(times, {142700000: 1000.0, 142800000: 5.0}, 1.0)
     frame = _full_day(volume=volume)
 
     tail = cicc_methods.cal_trade_tailRatio(frame)["trade_tailRatio"][0]
 
-    assert np.isclose(tail, 30.0 / (240.0 + 1000.0))
+    assert np.isclose(tail, 34.0 / (239.0 + 1000.0 + 5.0))
 
 
 def _write_minute_source(path, days: list[str]) -> None:
@@ -413,3 +414,43 @@ def test_open_volume_factors_use_first_continuous_minute_bar() -> None:
 
         assert np.isclose(openvol, 7.0)
         assert np.isclose(first_r, 7.0 / total)
+
+
+def test_closing_window_factors_exclude_auction_bars_and_count_bars() -> None:
+    frame = _full_day()
+    n = frame.height
+    # Every bar returns +1% with unit volume: the weighted sum is
+    # bars_in_window * 0.01 / 241.
+    counted = frame.with_columns(pl.Series("close", [101.0] * n))
+    bottom20 = cicc_methods.cal_trade_bottom20retRatio(counted)[
+        "trade_bottom20retRatio"
+    ][0]
+    bottom50 = cicc_methods.cal_trade_bottom50retRatio(counted)[
+        "trade_bottom50retRatio"
+    ][0]
+    tail = cicc_methods.cal_trade_tailRatio(frame)["trade_tailRatio"][0]
+
+    assert np.isclose(bottom20, 20 * 0.01 / 241)
+    assert np.isclose(bottom50, 50 * 0.01 / 241)
+    assert np.isclose(tail, 30 / 241)
+
+    # Big volume/return only in the 14:58-15:00 auction bars must not leak in.
+    times = _end_labeled_times()
+    auction = {145800000: 1000.0, 145900000: 1000.0, 150000000: 1000.0}
+    leaky = _full_day(
+        volume=_set_at(times, auction, 1.0),
+        close=_set_at(times, {t: 110.0 for t in auction}, 100.0),
+    )
+    total = 238.0 + 3000.0
+
+    assert np.isclose(
+        cicc_methods.cal_trade_bottom20retRatio(leaky)["trade_bottom20retRatio"][0],
+        0.0,
+    )
+    assert np.isclose(
+        cicc_methods.cal_trade_bottom50retRatio(leaky)["trade_bottom50retRatio"][0],
+        0.0,
+    )
+    assert np.isclose(
+        cicc_methods.cal_trade_tailRatio(leaky)["trade_tailRatio"][0], 30.0 / total
+    )
