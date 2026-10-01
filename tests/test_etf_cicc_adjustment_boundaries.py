@@ -353,3 +353,19 @@ def test_process_file_without_date_range_still_skips_existing(tmp_path) -> None:
     status, *_ = process_file(source, out_root, False)
 
     assert status == "skipped"
+
+
+def test_open_volume_factors_use_first_continuous_minute_bar() -> None:
+    times = _end_labeled_times()
+    # 09:30 bar differs by exchange (SH: auction only, SZ: auction + early
+    # continuous trading); 09:31 is the comparable first continuous minute.
+    volume = _set_at(times, {93000000: 500.0, 93100000: 7.0}, 1.0)
+    frame = _full_day(volume=volume)
+    total = 500.0 + 7.0 + 239.0
+
+    for data in (frame, frame.reverse()):
+        openvol = cicc_methods.cal_liq_openvol(data)["liq_openvol"][0]
+        first_r = cicc_methods.cal_liq_firstCallR(data)["liq_firstCallR"][0]
+
+        assert np.isclose(openvol, 7.0)
+        assert np.isclose(first_r, 7.0 / total)
