@@ -263,23 +263,67 @@ def test_session_momentum_windows_match_end_labeled_bars() -> None:
     assert np.isclose(cicc_methods.cal_mmt_last30(frame)["mmt_last30"][0], 1.10)
 
 
-def test_closing_volume_windows_match_end_labeled_bars() -> None:
+def test_closing_volume_windows_use_only_continuous_trading_bars() -> None:
     times = _end_labeled_times()
-    # 14:57 bar is continuous trading (14:56-14:57); the call auction
-    # bars are 14:58-15:00.
+    # SZSE closes with a call auction (14:58-15:00 bars) while SSE ETFs keep
+    # trading continuously, so only bars up to 14:57 are comparable.
     volume = _set_at(
-        times, {145700000: 10.0, 145800000: 0.0, 145900000: 0.0, 150000000: 30.0}, 0.0
+        times,
+        {
+            145500000: 3.0,
+            145600000: 3.0,
+            145700000: 4.0,
+            145800000: 20.0,
+            145900000: 20.0,
+            150000000: 30.0,
+        },
+        0.0,
     )
-    volume[0] = 60.0  # 09:30 bar
+    volume[1] = 60.0  # 09:31 bar
     frame = _full_day(volume=volume)
 
-    closevol = cicc_methods.cal_liq_closevol(frame)["liq_closevol"][0]
-    prevol = cicc_methods.cal_liq_closeprevol(frame)["liq_closeprevol"][0]
-    last_call = cicc_methods.cal_liq_lastCallR(frame)["liq_lastCallR"][0]
+    for data in (frame, frame.reverse()):
+        closevol = cicc_methods.cal_liq_closevol(data)["liq_closevol"][0]
+        prevol = cicc_methods.cal_liq_closeprevol(data)["liq_closeprevol"][0]
+        last_call = cicc_methods.cal_liq_lastCallR(data)["liq_lastCallR"][0]
 
-    assert np.isclose(closevol, 30.0)
-    assert np.isclose(prevol, 70.0)
-    assert np.isclose(last_call, 30.0 / 100.0)
+        assert np.isclose(closevol, 10.0)
+        assert np.isclose(prevol, 60.0)
+        assert np.isclose(last_call, 10.0 / (10.0 + 70.0 + 60.0))
+
+
+def test_opening_window_factors_exclude_the_0930_bar() -> None:
+    times = _end_labeled_times()
+    # Only the 09:30 bar carries a big return/volume; it must not leak in.
+    volume = _set_at(times, {93000000: 500.0}, 1.0)
+    close = _set_at(times, {93000000: 110.0}, 100.0)
+    frame = _full_day(volume=volume, close=close)
+
+    top20 = cicc_methods.cal_trade_top20retRatio(frame)["trade_top20retRatio"][0]
+    top50 = cicc_methods.cal_trade_top50retRatio(frame)["trade_top50retRatio"][0]
+    pos = cicc_methods.cal_trade_topPos20retRatio(frame)["trade_topPos20retRatio"][0]
+    head = cicc_methods.cal_trade_headRatio(frame)["trade_headRatio"][0]
+
+    assert np.isclose(top20, 0.0)
+    assert np.isclose(top50, 0.0)
+    assert np.isclose(pos, 0.0)
+    assert np.isclose(head, 30.0 / (500.0 + 240.0))
+
+
+def test_opening_window_bar_counts() -> None:
+    frame = _full_day()
+    # Unit volume everywhere, every bar returns +1%: the weighted sum equals
+    # the number of bars in the window times 0.01 / 241.
+    close = [101.0] * frame.height
+    frame = frame.with_columns(pl.Series("close", close))
+
+    top20 = cicc_methods.cal_trade_top20retRatio(frame)["trade_top20retRatio"][0]
+    top50 = cicc_methods.cal_trade_top50retRatio(frame)["trade_top50retRatio"][0]
+    head = cicc_methods.cal_trade_headRatio(frame)["trade_headRatio"][0]
+
+    assert np.isclose(top20, 20 * 0.01 / 241)
+    assert np.isclose(top50, 50 * 0.01 / 241)
+    assert np.isclose(head, 30 / 241)
 
 
 def test_trade_tail_ratio_uses_last_30_bars() -> None:
