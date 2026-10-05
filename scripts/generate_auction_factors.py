@@ -621,6 +621,46 @@ def load_open_transaction_match(
     }
 
 
+def _filter_qmt_heartbeat_frames(frame: pd.DataFrame) -> pd.DataFrame:
+    """Drop consecutive QMT snapshots with unchanged price and amount."""
+    ordered = (
+        frame.sort_values("trade_time", kind="mergesort")
+        .drop_duplicates("trade_time", keep="last")
+        .reset_index(drop=True)
+    )
+    if ordered.empty or "amount" not in ordered.columns:
+        return ordered
+
+    day_key = (
+        ordered["trade_date"]
+        if "trade_date" in ordered.columns
+        else ordered["trade_time"].dt.normalize()
+    )
+    price = pd.to_numeric(ordered["last_price"], errors="coerce")
+    amount = pd.to_numeric(ordered["amount"], errors="coerce")
+    previous_price = price.groupby(day_key, sort=False).shift(1)
+    previous_amount = amount.groupby(day_key, sort=False).shift(1)
+    trade_same = price.eq(previous_price) & amount.eq(previous_amount)
+    state_columns = [
+        "last_price",
+        "amount",
+        "previous_close",
+        *[f"ask_price{level}" for level in range(1, 4)],
+        *[f"ask_vol{level}" for level in range(1, 4)],
+        *[f"bid_price{level}" for level in range(1, 4)],
+        *[f"bid_vol{level}" for level in range(1, 4)],
+    ]
+    previous = ordered[state_columns].groupby(day_key, sort=False).shift(1)
+    same_state = (
+        ordered[state_columns].eq(previous)
+        | (ordered[state_columns].isna() & previous.isna())
+    ).all(axis=1)
+    # QMT often publishes 0/0 before the opening match.  Keep rows where the
+    # auction book changes; only remove true unchanged heartbeat snapshots.
+    heartbeat = trade_same & same_state
+    return ordered.loc[~heartbeat].reset_index(drop=True)
+
+
 def load_qmt_quote_frame(tick_path: Path) -> pd.DataFrame:
     """Normalize QMT tick snapshots to the opening-auction quote contract."""
     columns = [
@@ -631,7 +671,9 @@ def load_qmt_quote_frame(tick_path: Path) -> pd.DataFrame:
         *[f"bid_price{level}" for level in range(1, 4)],
         *[f"bid_vol{level}" for level in range(1, 4)],
     ]
-    frame = pd.read_parquet(tick_path, columns=columns).reset_index()
+    available_columns = set(pq.read_schema(tick_path).names)
+    read_columns = columns + (["amount"] if "amount" in available_columns else [])
+    frame = pd.read_parquet(tick_path, columns=read_columns).reset_index()
     required = {"trade_date", "trade_time"}
     if not required.issubset(frame.columns):
         raise ValueError(f"QMT tick file must expose trade_date and trade_time: {tick_path}")
@@ -642,6 +684,7 @@ def load_qmt_quote_frame(tick_path: Path) -> pd.DataFrame:
         (clock >= pd.Timestamp("09:15").time())
         & (clock < pd.Timestamp("09:25").time())
     ].copy()
+    frame = _filter_qmt_heartbeat_frames(frame)
     result = pd.DataFrame({"trade_time": frame["trade_time"]})
     result["trade_price"] = pd.to_numeric(frame["last_price"], errors="coerce")
     result["trade_volume"] = 0.0
@@ -872,10 +915,13 @@ def _reconstruct_sh_events(
     ].copy()
     if auction.empty:
         return _empty_event_frame(), False
-    known_types = auction["order_type"].isin(["A", "D"])
+    trade_orders = auction.loc[auction["order_type"].ne("S")].copy()
+    if trade_orders.empty:
+        return _empty_event_frame(), False
+    known_types = trade_orders["order_type"].isin(["A", "D"])
     valid = bool(known_types.all())
-    adds = auction.loc[auction["order_type"].eq("A")].copy()
-    cancellations = auction.loc[auction["order_type"].eq("D")].copy()
+    adds = trade_orders.loc[trade_orders["order_type"].eq("A")].copy()
+    cancellations = trade_orders.loc[trade_orders["order_type"].eq("D")].copy()
     events, linked = _finalize_event_frame(adds, cancellations)
     valid &= linked
     valid &= not bool(cancellations["trade_time"].ge(split_time).any())
@@ -2104,8 +2150,10 @@ def build_historical_context(
     valid_adj_factor = work["adj_factor"].where(work["adj_factor"].gt(0))
     work["_adj_close"] = valid_close * valid_adj_factor
     # The source row mapped to a target auction date is the prior session.
-    # Its raw close is the fallback when the target daily file has no pre_close.
+    # Keep both raw and adjusted forms: QMT daily files omit pre_close, so the
+    # prior close must be converted into the target day's price basis.
     work["_auction_previous_close"] = valid_close
+    work["_auction_previous_close_adjusted"] = work["_adj_close"]
     work["_previous_day_high_adjusted"] = valid_high * valid_adj_factor
     work["previous_day_volume_shares"] = work["vol"].where(work["vol"].gt(0)) * 100.0
     work["previous_day_high"] = valid_high
@@ -2115,17 +2163,20 @@ def build_historical_context(
     # float_share and free_share are in 万股 (10k shares), convert to shares
     work["previous_day_float_share"] = work["float_share"].where(work["float_share"].gt(0)) * 10000.0
     work["previous_day_free_share"] = work["free_share"].where(work["free_share"].gt(0)) * 10000.0
+    prior_intraday_return = (
+        work["_adj_close"]
+        / work.groupby("ts_code", sort=False)["_adj_close"].shift(1)
+        - 1.0
+    )
+    work["prevday_intraday_return_from_prev_close"] = prior_intraday_return
+    work["pre_return"] = prior_intraday_return
+    work["previous_return"] = prior_intraday_return
     if include_daily_factor_fields:
         work["prevday_intraday_drawdown_from_session_high"] = (
             valid_close / valid_high - 1.0
         )
         work["prevday_intraday_rebound_from_session_low"] = (
             valid_close / valid_low - 1.0
-        )
-        work["prevday_intraday_return_from_prev_close"] = (
-            work["_adj_close"]
-            / work.groupby("ts_code", sort=False)["_adj_close"].shift(1)
-            - 1.0
         )
 
     available_daily_dates = np.sort(work["trade_date"].dropna().unique())
@@ -2214,6 +2265,10 @@ def build_historical_context(
         "trade_date",
         "ts_code",
         "_auction_previous_close",
+        "_auction_previous_close_adjusted",
+        "prevday_intraday_return_from_prev_close",
+        "pre_return",
+        "previous_return",
         "previous_day_volume_shares",
         "previous_day_high",
         "_previous_day_high_adjusted",
@@ -2228,7 +2283,6 @@ def build_historical_context(
             [
                 "prevday_intraday_drawdown_from_session_high",
                 "prevday_intraday_rebound_from_session_low",
-                "prevday_intraday_return_from_prev_close",
                 "prev_2d_return_rank_cs",
                 "prev_20d_return_rank_cs",
                 "prev_skew_long_60d",
@@ -2265,12 +2319,24 @@ def build_historical_context(
         how="left",
         validate="one_to_one",
     )
+    target_adj_factor = context["_target_adj_factor"].where(
+        context["_target_adj_factor"].gt(0)
+    )
+    adjusted_previous_close = (
+        context["_auction_previous_close_adjusted"] / target_adj_factor
+    )
+    fallback_previous_close = adjusted_previous_close.where(
+        adjusted_previous_close.gt(0), context["_auction_previous_close"]
+    )
     context["previous_close"] = context["_target_previous_close"].where(
-        context["_target_previous_close"].gt(0),
-        context["_auction_previous_close"],
+        context["_target_previous_close"].gt(0), fallback_previous_close
     )
     context = context.drop(
-        columns=["_target_previous_close", "_auction_previous_close"]
+        columns=[
+            "_target_previous_close",
+            "_auction_previous_close",
+            "_auction_previous_close_adjusted",
+        ]
     )
     context["source_trade_date"] = context["trade_date"]
     context["trade_date"] = context.pop("target_date").dt.strftime("%Y-%m-%d")
@@ -3104,7 +3170,10 @@ def build_qmt_benchmark_context(
     historical_context: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     if tick_path is None or minute_path is None:
-        return build_benchmark_context(benchmark_ts_code, [], target_dates, historical_context)
+        raise FileNotFoundError(
+            f"QMT benchmark data missing for {benchmark_ts_code}: tick_path={tick_path}, minute_path={minute_path}. "
+            "QMT auction factor generation strictly requires QMT benchmark data and cannot fall back to local data."
+        )
     quotes = load_qmt_quote_frame(tick_path)
     matches = load_qmt_0930_matches(minute_path)
     tick_matches = load_qmt_0925_tick_matches(tick_path)
@@ -3401,18 +3470,18 @@ def run_qmt_auction_generation(
     tick_index = build_universe_index(args.qmt_tick_root)
     minute_index = build_universe_index(args.qmt_minute_root)
     qmt_daily_root = getattr(args, "qmt_daily_root", DEFAULT_QMT_DAILY_ROOT)
-    daily_index = (
-        build_universe_index(qmt_daily_root)
-        if qmt_daily_root.exists()
-        else {}
-    )
-    if daily_index:
-        selected_codes = sorted(set(tick_index) & set(minute_index) & set(daily_index))
-    else:
-        existing_codes = existing_output_codes(args.etf_output_root)
-        selected_codes = sorted(
-            set(tick_index) & set(minute_index) & (existing_codes or set(tick_index))
+    if not qmt_daily_root.exists():
+        raise FileNotFoundError(
+            f"QMT daily directory does not exist: {qmt_daily_root}. "
+            "QMT auction factor calculation strictly requires QMT daily data and cannot fall back to local data."
         )
+    daily_index = build_universe_index(qmt_daily_root)
+    if not daily_index:
+        raise FileNotFoundError(
+            f"No QMT daily parquet files found in: {qmt_daily_root}. "
+            "QMT auction factor calculation strictly requires QMT daily data."
+        )
+    selected_codes = sorted(set(tick_index) & set(minute_index) & set(daily_index))
     if requested_codes is not None:
         selected_codes = [code for code in selected_codes if code in requested_codes]
         missing = sorted(requested_codes - set(selected_codes))
@@ -3457,11 +3526,7 @@ def run_qmt_auction_generation(
         date.strftime("%Y-%m-%d") for date in pd.bdate_range(min_date, max_date)
     ]
     requested_symbols = {tick_index[code] for code in selected_codes}
-    daily_context_path = (
-        qmt_daily_root
-        if qmt_daily_root.exists()
-        else args.etf_daily_path
-    )
+    daily_context_path = qmt_daily_root
     historical_context = build_historical_context(
         daily_context_path,
         target_dates,

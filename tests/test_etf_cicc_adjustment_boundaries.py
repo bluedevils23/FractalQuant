@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 import polars as pl
 
-from scripts.generate_etf_cicc_minute_factors import (
+from scripts.generate_etf_cicc_daily_factors import (
     _cal_corr_prvr,
     _cal_liq_amihud_1min,
     build_factor_registry,

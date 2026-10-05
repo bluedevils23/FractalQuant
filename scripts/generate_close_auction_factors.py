@@ -5,7 +5,8 @@ source reports do not disclose their exact numerator and denominator.  They
 measure the closing-match notional against orders submitted in that window,
 linked by exchange order identifier. Full-day orders establish linkage; delayed
 matches before 15:05 are included, while post-close fixed-price trades are not.
-Shanghai ETFs before 2026-07-06 have no closing auction and are not applicable.
+Shanghai ETFs before 2026-07-06 use a separately labelled continuous-trading
+tail calculation because the closing auction did not yet exist.
 """
 
 from __future__ import annotations
@@ -277,14 +278,24 @@ def calculate_daily_close_auction_factors(
         }
     )
     exchange = ts_code.rsplit(".", 1)[-1].upper()
-    # SSE fund closing auction took effect on 2026-07-06; earlier closes
-    # are continuous trading, not missing auction observations.
-    if asset_type == "etf" and exchange == "SH" and trade_day < pd.Timestamp("2026-07-06"):
-        row.update(auction_applicable=False, auction_status="not_applicable")
-        return row
-    history = orders.loc[orders["trade_time"].ge(trade_day) & orders["trade_time"].lt(close_time)]
-    all_adds, order_cancellations, unique_ids = _valid_orders(history, exchange)
-    adds = all_adds.loc[all_adds["trade_time"].ge(window_start)].copy()
+    # SSE fund closing auction took effect on 2026-07-06.  Before that date,
+    # preserve the historical tail-trading calculation so the factor panel
+    # remains populated, while labelling it separately from auction data.
+    legacy_continuous = (
+        asset_type == "etf" and exchange == "SH" and trade_day < pd.Timestamp("2026-07-06")
+    )
+    if legacy_continuous:
+        row.update(auction_applicable=False, auction_status="legacy_continuous")
+        history = orders.loc[
+            orders["trade_time"].ge(window_start)
+            & orders["trade_time"].lt(close_time)
+        ]
+        all_adds, order_cancellations, unique_ids = _valid_orders(history, exchange)
+        adds = all_adds
+    else:
+        history = orders.loc[orders["trade_time"].ge(trade_day) & orders["trade_time"].lt(close_time)]
+        all_adds, order_cancellations, unique_ids = _valid_orders(history, exchange)
+        adds = all_adds.loc[all_adds["trade_time"].ge(window_start)].copy()
     if not unique_ids:
         raise ValueError(f"Duplicate close-auction order identifiers for {ts_code}")
     if exchange == "SZ":
@@ -301,9 +312,12 @@ def calculate_daily_close_auction_factors(
     work = transactions.copy()
     work["price"] = pd.to_numeric(work["price"], errors="coerce")
     work["quantity"] = pd.to_numeric(work["quantity"], errors="coerce")
+    match_end = close_time + (
+        pd.Timedelta(minutes=1) if legacy_continuous else pd.Timedelta(minutes=5)
+    )
     matches = work.loc[
         work["trade_time"].ge(close_time)
-        & work["trade_time"].lt(close_time + pd.Timedelta(minutes=5))
+        & work["trade_time"].lt(match_end)
         & ~work["trade_code"].eq("C")
         & work["price"].gt(0)
         & work["quantity"].gt(0)
@@ -320,11 +334,23 @@ def calculate_daily_close_auction_factors(
         matches[id_column].isin(all_adds.loc[all_adds["side"].eq(side), "order_id"]).all()
         for side, id_column in (("B", "bid_order_id"), ("S", "ask_order_id"))
     )
-    valid = bool(unique_ids and cancellation_ok and cancel_shape_ok and linkage_ok
-                 and not matches.empty and matches["price"].nunique() == 1)
+    valid = bool(
+        unique_ids
+        and cancellation_ok
+        and cancel_shape_ok
+        and linkage_ok
+        and not matches.empty
+        and matches["price"].nunique() == 1
+    )
+    if legacy_continuous:
+        # The old tail-trading definition does not require a 15:00 auction
+        # print. Its diagnostics remain explicit, but its order/cancel factors
+        # are retained even when the match slice is empty.
+        valid = False
     if not matches.empty:
         row["source_available_time"] = matches["trade_time"].max()
-    row["auction_status"] = "ok" if valid else "invalid_event_coverage"
+    if not legacy_continuous:
+        row["auction_status"] = "ok" if valid else "invalid_event_coverage"
 
     row.update(
         {
@@ -366,7 +392,7 @@ def calculate_daily_close_auction_factors(
     row["close_auction_match_to_submitted_notional_proxy"] = _safe_ratio(
         attributed_total, submitted_total
     )
-    if not row["close_auction_event_reconstruction_ok"]:
+    if not row["close_auction_event_reconstruction_ok"] and not legacy_continuous:
         # Unknown event coverage must not masquerade as a valid zero signal.
         for column in FACTOR_COLUMNS + REFERENCE_COLUMNS[1:] + DIAGNOSTIC_COLUMNS[:3]:
             row[column] = np.nan

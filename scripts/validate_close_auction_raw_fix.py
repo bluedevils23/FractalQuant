@@ -30,7 +30,8 @@ def main():
             passed &= row["close_auction_match_count"] == int(mask.sum())
             passed &= bool(np.isclose(row["close_auction_matched_notional"], expected, rtol=1e-12, atol=1e-6))
         else:
-            passed &= row["auction_status"] == "not_applicable" and pd.isna(row["close_auction_matched_notional"])
+            passed &= row["auction_status"] == "legacy_continuous"
+            passed &= pd.notna(row["close_auction_order_imbalance"])
         results.append(dict(day=day, asset=code, status=row["auction_status"], passed=bool(passed),
                             raw_matches=int(mask.sum()), raw_notional=expected,
                             generated_notional=row["close_auction_matched_notional"]))

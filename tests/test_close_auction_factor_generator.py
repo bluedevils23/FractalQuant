@@ -65,10 +65,12 @@ def test_sh_fund_session_switch(day, asset_type, applicable):
     trades = _transactions((day + " 15:00:01.350", "", 10., 50., 2, 1))
     row = calculate_daily_close_auction_factors(orders, trades, "510300.SH", None, asset_type=asset_type)
     assert row["auction_applicable"] == applicable
-    assert row["close_auction_event_reconstruction_ok"] == applicable
     if not applicable:
-        assert row["auction_status"] == "not_applicable"
-        assert pd.isna(row["close_auction_order_imbalance"])
+        assert row["auction_status"] == "legacy_continuous"
+        assert not row["close_auction_event_reconstruction_ok"]
+        assert not pd.isna(row["close_auction_order_imbalance"])
+    else:
+        assert row["close_auction_event_reconstruction_ok"]
 
 
 def test_delayed_match_old_order_linkage_and_postclose_exclusion():

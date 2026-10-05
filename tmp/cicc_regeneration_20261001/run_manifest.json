@@ -1,0 +1,21 @@
+{
+  "generator_exit_code": 0,
+  "started_at": "2026-10-01T14:59:50+08:00",
+  "finished_at": "2026-10-01T15:26:00+08:00",
+  "date_from": "2022-01-01",
+  "date_to": "2026-09-18",
+  "workers": 2,
+  "input_root": "D:\\workspace\\stockdata\\etf-data\\etf_1min",
+  "staging_root": "D:\\workspace\\stockdata\\etf-data\\etf_cicc_daily_factors_1267_20261001",
+  "target_root": "D:\\workspace\\stockdata\\etf-factors\\etf_cicc_daily_factors",
+  "files_sha256": {
+    "D:\\workspace\\stock-fractalquant\\FractalQuant\\scripts\\generate_etf_cicc_daily_factors.py": "b5fd6eb7d21a04fc4cb659670b01738aecfd4ba34f52c5c1bae86829b4238ed1",
+    "D:\\workspace\\stock-fractalquant\\Replication-of-Minute-Frequency-Factor-refer-CICC\\MinuteFrequentFactorCalculateMethodsCICC.py": "565ba5138a15524c559e4fb0440af0ad6b63884d7284dc9c822f0ed3e2b12313",
+    "D:\\workspace\\stockdata\\etf-factors\\etf_universe\\non_day_turnover_stock_index_universe.txt": "f99ae38ba1b7324c30eff38562952726253ae0b41a5415b1e1ba09995d8fe807"
+  },
+  "status": "complete",
+  "published_root": "D:\\workspace\\stockdata\\etf-factors\\etf_cicc_daily_factors",
+  "backup_root": "D:\\workspace\\stockdata\\etf-factors\\etf_cicc_daily_factors_backup_20261001",
+  "published_sha256_verified_files": 1267,
+  "validation_report": "D:\\workspace\\stock-fractalquant\\FractalQuant\\tmp\\cicc_regeneration_20261001\\audit.json"
+}

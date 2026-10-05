@@ -327,6 +327,49 @@ def test_order_notional_buckets_use_fill_amount_for_flow() -> None:
     assert row["daily_flow_total_sell"] == 200.0
 
 
+def test_sh_immediate_execution_taker_orders_inferred_for_flow() -> None:
+    # Simulates Shanghai Level-2 where resting maker orders are in the order stream,
+    # but immediate-execution taker orders are not in the order stream.
+    times = pd.date_range("2025-01-02 09:30", periods=3, freq="min")
+    transactions = pd.DataFrame(
+        {
+            "trade_time": times,
+            "price": [10.0, 10.0, 10.0],
+            "quantity": [5_000, 5_000, 20_000],  # 50,000, 50,000, 200,000 yuan
+            "ts_code": "510050.SH",
+            "bs_flag": ["B", "B", "S"],
+            # Taker order 101 executes two fills: 50,000 + 50,000 = 100,000 yuan (medium)
+            # Taker order 102 executes one fill: 200,000 yuan (large)
+            "buy_order_id": [101, 101, 201],
+            "sell_order_id": [301, 302, 102],
+        }
+    )
+    # Orders stream only has passive maker orders (301, 302, 201), NOT taker orders (101, 102)
+    orders = pd.DataFrame(
+        {
+            "trade_time": times.tolist(),
+            "side": ["S", "S", "B"],
+            "order_type": "0",
+            "order_id": [301, 302, 201],
+            "price": [10.0, 10.0, 10.0],
+            "quantity": [5_000, 5_000, 20_000],
+            "ts_code": "510050.SH",
+        }
+    )
+    result = build_daily_flow_raw_features(transactions, orders, "510050.SH")
+    row = result.iloc[0]
+    assert row["flow_classification_valid"]
+    assert row["active_order_match_amount_coverage"] == 1.0
+    # Order 101 has total notional 100,000 yuan -> medium order bucket [40k, 200k)
+    # Both fills (50,000 + 50,000 = 100,000) go to daily_flow_medium_buy
+    assert row["daily_flow_medium_buy"] == 100_000.0
+    assert row["daily_flow_small_buy"] == 0.0
+    # Order 102 has total notional 200,000 yuan -> large order bucket [200k, 1M)
+    assert row["daily_flow_large_sell"] == 200_000.0
+    assert row["daily_flow_total_buy"] == 100_000.0
+    assert row["daily_flow_total_sell"] == 200_000.0
+
+
 def test_flow_factors_require_cross_section_and_keep_unmatched_days_null() -> None:
     raw_frames = []
     for symbol_index in range(20):

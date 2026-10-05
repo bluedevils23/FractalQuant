@@ -769,7 +769,30 @@ def _flow_daily_metrics(
             .set_index("order_id")["order_notional"]
             .to_dict()
         )
-    matched_notional = active_id.map(order_notional_map)
+    matched_notional = (
+        active_id.map(order_notional_map)
+        if order_notional_map
+        else pd.Series(np.nan, index=trades.index, dtype=float)
+    )
+    # For orders not found in the order stream (e.g. SSE immediate-execution taker orders,
+    # which do not generate an order record in Level-2 逐笔委托), infer the active order's
+    # total executed notional by aggregating fills sharing the same active_id.
+    unmapped_mask = (
+        directional
+        & active_id.notna()
+        & active_id.gt(0)
+        & (matched_notional.isna() | matched_notional.le(0))
+    )
+    if unmapped_mask.any():
+        trade_notionals = (
+            amount.loc[unmapped_mask]
+            .groupby(active_id.loc[unmapped_mask])
+            .sum()
+        )
+        inferred_notional = active_id.map(trade_notionals)
+        matched_notional = matched_notional.where(
+            matched_notional.gt(0), inferred_notional
+        )
     matched = directional & matched_notional.gt(0) & matched_notional.notna()
     matched_amount = float(amount.where(matched, 0.0).sum())
     result["active_order_match_amount_coverage"] = matched_amount / directional_amount

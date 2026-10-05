@@ -16,7 +16,7 @@
 | 标准分钟因子 | `generate_etf_minute_factors.py` | ETF/分钟 | base 58 / multi 162 | `D:\workspace\stockdata\etf-data\etf_1min_factors*` |
 | Session Path | `generate_etf_minute_factors.py --write-session-path-factors` | 股票 + ETF/分钟 | 3 | `*_intraday_session_path_factors` |
 | FZ 日频因子 | `generate_fz_daily_factors.py` | 股票 + ETF/日 | 38 | 按 `--asset-type` 选择默认目录 |
-| CICC 日频因子 | `generate_etf_cicc_minute_factors.py` | ETF/日 | 58 | `D:\workspace\stockdata\etf-data\etf_cicc_daily_factors` |
+| CICC 日频因子 | `generate_etf_cicc_daily_factors.py` | ETF/日 | 58 | `D:\workspace\stockdata\etf-factors\etf_cicc_daily_factor` |
 | Advanced 因子 | `generate_stock_advanced_factor.py` / `generate_etf_advanced_factor.py` | 股票 / ETF/分钟 | 46 | `stock_advanced_factors` / `etf_1min_advanced_factors` |
 | Orderbook 因子 | `generate_stock_orderbook_factors.py` | 股票 + ETF/分钟 | base 84 / multi 156 | `stock_1min_orderbook_factors*` / `etf_1min_orderbook_factors*` |
 | ETF Orderbook 专用入口 | `generate_etf_orderbook_factors.py` | ETF/分钟 | base 84 / multi 156 | `etf_1min_orderbook_factors*` |
@@ -186,16 +186,16 @@ uv run python scripts/generate_fz_daily_factors.py --asset-type stock --strict-s
 
 ### 3.3 CICC 日频因子
 
-入口：`scripts/generate_etf_cicc_minute_factors.py`  
+入口：`scripts/generate_etf_cicc_daily_factors.py`  
 实现来源：项目同级 `Replication-of-Minute-Frequency-Factor-refer-CICC`
 
 CICC 函数从分钟行情计算日级暴露，直接输出一行一个 `trade_date/ts_code` 的日频结果，
 不再合并回原始分钟行。脚本文件名保留 `minute` 是历史兼容命名，当前默认输出目录为
-`D:\workspace\stockdata\etf-data\etf_cicc_daily_factors`。该脚本注册 58 个 CICC
+`D:\workspace\stockdata\etf-factors\etf_cicc_daily_factor`。该脚本注册 58 个 CICC
 因子，按名称前缀分为动量、波动、分布形态、流动性、价量相关、日内分布和交易时段。
 
 ```powershell
-uv run python scripts/generate_etf_cicc_minute_factors.py --workers 5
+uv run python scripts/generate_etf_cicc_daily_factors.py --workers 5
 ```
 
 同样是文件级跳过；需要补充或修复已有标的时必须使用 `--overwrite`。
@@ -503,7 +503,7 @@ uv run python scripts/generate_etf_advanced_factor.py --symbols 510300.SH --work
 ```powershell
 uv run python scripts/generate_etf_minute_factors.py --workers 5
 uv run python scripts/generate_fz_daily_factors.py --asset-type etf --workers 5
-uv run python scripts/generate_etf_cicc_minute_factors.py --workers 5
+uv run python scripts/generate_etf_cicc_daily_factors.py --workers 5
 uv run python scripts/generate_etf_advanced_factor.py --workers 5
 uv run python scripts/generate_etf_orderbook_factors.py --workers 5
 uv run python scripts/generate_intraday_strategy_factors.py --asset-type etf --workers 5

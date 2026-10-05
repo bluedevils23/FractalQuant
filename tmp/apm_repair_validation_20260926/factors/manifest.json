@@ -1,0 +1,167 @@
+{
+  "signature": "caca530e46c3fcfab5624d87aa5914f94079668cfcda907c3644ff44f131ac91",
+  "config": {
+    "version": 2,
+    "universe": [
+      "159238.SZ",
+      "159300.SZ",
+      "159330.SZ",
+      "159393.SZ",
+      "159673.SZ",
+      "159919.SZ",
+      "159925.SZ",
+      "510300.SH",
+      "510310.SH",
+      "510320.SH",
+      "510330.SH",
+      "510350.SH",
+      "510360.SH",
+      "510370.SH",
+      "510380.SH",
+      "510390.SH",
+      "515130.SH",
+      "515310.SH",
+      "515330.SH",
+      "515350.SH",
+      "515360.SH",
+      "515380.SH",
+      "515390.SH",
+      "515660.SH",
+      "561000.SH",
+      "561300.SH",
+      "561930.SH",
+      "561990.SH",
+      "562070.SH",
+      "563520.SH"
+    ],
+    "date_from": "2026-07-01 00:00:00",
+    "date_to": "2026-08-07 00:00:00",
+    "mapping_sha256": "8041636ae153ff93e328810d28c5761d4b2b5f83d187bc31f91f51eedd1745c0",
+    "sources": {
+      "D:\\workspace\\stockdata\\etf-data\\etf_1min\\159238.SZ.parquet": [
+        1227555,
+        1790159400786013300
+      ],
+      "D:\\workspace\\stockdata\\etf-data\\etf_1min\\159300.SZ.parquet": [
+        3182708,
+        1790159405591171100
+      ],
+      "D:\\workspace\\stockdata\\etf-data\\etf_1min\\159330.SZ.parquet": [
+        2633662,
+        1790159409265682700
+      ],
+      "D:\\workspace\\stockdata\\etf-data\\etf_1min\\159393.SZ.parquet": [
+        1957584,
+        1790159414903440500
+      ],
+      "D:\\workspace\\stockdata\\etf-data\\etf_1min\\159673.SZ.parquet": [
+        3142442,
+        1790159449016148800
+      ],
+      "D:\\workspace\\stockdata\\etf-data\\etf_1min\\159919.SZ.parquet": [
+        17882696,
+        1790159519777319900
+      ],
+      "D:\\workspace\\stockdata\\etf-data\\etf_1min\\159925.SZ.parquet": [
+        11537745,
+        1790159523389467200
+      ],
+      "D:\\workspace\\stockdata\\etf-data\\etf_1min\\510300.SH.parquet": [
+        20085432,
+        1790159834088449700
+      ],
+      "D:\\workspace\\stockdata\\etf-data\\etf_1min\\510310.SH.parquet": [
+        14434008,
+        1790159835002546300
+      ],
+      "D:\\workspace\\stockdata\\etf-data\\etf_1min\\510320.SH.parquet": [
+        1362480,
+        1790159835112543500
+      ],
+      "D:\\workspace\\stockdata\\etf-data\\etf_1min\\510330.SH.parquet": [
+        15177796,
+        1790159835993494500
+      ],
+      "D:\\workspace\\stockdata\\etf-data\\etf_1min\\510350.SH.parquet": [
+        6437379,
+        1790159836470209200
+      ],
+      "D:\\workspace\\stockdata\\etf-data\\etf_1min\\510360.SH.parquet": [
+        10006514,
+        1790159837204327800
+      ],
+      "D:\\workspace\\stockdata\\etf-data\\etf_1min\\510370.SH.parquet": [
+        3798342,
+        1790159837557981200
+      ],
+      "D:\\workspace\\stockdata\\etf-data\\etf_1min\\510380.SH.parquet": [
+        4444108,
+        1790159838113188900
+      ],
+      "D:\\workspace\\stockdata\\etf-data\\etf_1min\\510390.SH.parquet": [
+        7945008,
+        1790159838663582700
+      ],
+      "D:\\workspace\\stockdata\\etf-data\\etf_1min\\515130.SH.parquet": [
+        5223280,
+        1790159943234129100
+      ],
+      "D:\\workspace\\stockdata\\etf-data\\etf_1min\\515310.SH.parquet": [
+        5280129,
+        1790159948962491800
+      ],
+      "D:\\workspace\\stockdata\\etf-data\\etf_1min\\515330.SH.parquet": [
+        6074554,
+        1790159949766901000
+      ],
+      "D:\\workspace\\stockdata\\etf-data\\etf_1min\\515350.SH.parquet": [
+        5085191,
+        1790159950170302200
+      ],
+      "D:\\workspace\\stockdata\\etf-data\\etf_1min\\515360.SH.parquet": [
+        4017468,
+        1790159950575392300
+      ],
+      "D:\\workspace\\stockdata\\etf-data\\etf_1min\\515380.SH.parquet": [
+        7125681,
+        1790159951052187100
+      ],
+      "D:\\workspace\\stockdata\\etf-data\\etf_1min\\515390.SH.parquet": [
+        6234580,
+        1790159951501232200
+      ],
+      "D:\\workspace\\stockdata\\etf-data\\etf_1min\\515660.SH.parquet": [
+        4469398,
+        1790159956113460300
+      ],
+      "D:\\workspace\\stockdata\\etf-data\\etf_1min\\561000.SH.parquet": [
+        2940440,
+        1790160022319991100
+      ],
+      "D:\\workspace\\stockdata\\etf-data\\etf_1min\\561300.SH.parquet": [
+        4980486,
+        1790160026252588200
+      ],
+      "D:\\workspace\\stockdata\\etf-data\\etf_1min\\561930.SH.parquet": [
+        1993194,
+        1790160033339669100
+      ],
+      "D:\\workspace\\stockdata\\etf-data\\etf_1min\\561990.SH.parquet": [
+        4919358,
+        1790160034323816400
+      ],
+      "D:\\workspace\\stockdata\\etf-data\\etf_1min\\562070.SH.parquet": [
+        672830,
+        1790160035400450400
+      ],
+      "D:\\workspace\\stockdata\\etf-data\\etf_1min\\563520.SH.parquet": [
+        1746626,
+        1790160048455769000
+      ],
+      "D:\\workspace\\stockdata\\指数数据\\index_1min\\000300.SH.parquet": [
+        42764180,
+        1786615735087503500
+      ]
+    }
+  }
+}

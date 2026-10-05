@@ -15,11 +15,11 @@
 
 ### 2.1 脚本名称与路径
 
-- **脚本**：`scripts/generate_etf_cicc_minute_factors.py`（名称未改，保持兼容）
+- **脚本**：`scripts/generate_etf_cicc_daily_factors.py`（名称与日频输出一致）
 - **日志名称**：`generate_etf_cicc_daily_factors`
-- **输出目录**：`D:\workspace\stockdata\etf-data\etf_cicc_daily_factors`
+- **输出目录**：`D:\workspace\stockdata\etf-factors\etf_cicc_daily_factor`
   - 原输出：`etf_1min_cicc_factors`（分钟级，每个文件几万行）
-  - 新输出：`etf_cicc_daily_factors`（日级，每个文件几百行）
+  - 新输出：`etf_cicc_daily_factor`（日级，每个文件几百行）
 
 ### 2.2 代码修改
 
@@ -67,13 +67,13 @@ def process_file(input_path, output_root, overwrite):
 
 ```bash
 # 生成所有ETF的日级因子
-python -m scripts.generate_etf_cicc_minute_factors
+python -m scripts.generate_etf_cicc_daily_factors
 
 # 只生成指定ETF
-python -m scripts.generate_etf_cicc_minute_factors --symbols 510300.SH 159001.SZ
+python -m scripts.generate_etf_cicc_daily_factors --symbols 510300.SH 159001.SZ
 
 # 并行处理（8个worker）
-python -m scripts.generate_etf_cicc_minute_factors --workers 8 --overwrite
+python -m scripts.generate_etf_cicc_daily_factors --workers 8 --overwrite
 ```
 
 ### 3.2 读取因子
@@ -82,7 +82,7 @@ python -m scripts.generate_etf_cicc_minute_factors --workers 8 --overwrite
 import pandas as pd
 
 # 读取单个ETF的日级因子
-df = pd.read_parquet("D:/workspace/stockdata/etf-data/etf_cicc_daily_factors/510300.SH.parquet")
+df = pd.read_parquet("D:/workspace/stockdata/etf-factors/etf_cicc_daily_factor/510300.SH.parquet")
 # Index: trade_date (datetime)
 # Columns: ts_code, mmt_pm, mmt_last30, corr_pv, shape_skew, ...
 
@@ -97,7 +97,7 @@ df['shape_skew_avg_20d'] = df['shape_skew'].rolling(20, min_periods=10).mean()
 from pathlib import Path
 import pandas as pd
 
-factor_root = Path("D:/workspace/stockdata/etf-data/etf_cicc_daily_factors")
+factor_root = Path("D:/workspace/stockdata/etf-factors/etf_cicc_daily_factor")
 files = sorted(factor_root.glob("*.parquet"))
 
 # 读取所有ETF并拼接
@@ -150,7 +150,7 @@ FractalQuant/factor/cicc_daily_aggregator.py
 
 ```bash
 # 1. 生成单个ETF
-python -m scripts.generate_etf_cicc_minute_factors --symbols 510300.SH --overwrite
+python -m scripts.generate_etf_cicc_daily_factors --symbols 510300.SH --overwrite
 
 # 2. 检查输出
 python test_cicc_daily_output.py
@@ -175,7 +175,7 @@ old_df = pd.read_parquet("etf_1min_cicc_factors/510300.SH.parquet")
 old_daily = old_df.groupby(old_df.index.normalize()).first()
 
 # 读取新版本
-new_df = pd.read_parquet("etf_cicc_daily_factors/510300.SH.parquet")
+new_df = pd.read_parquet("etf_cicc_daily_factor/510300.SH.parquet")
 
 # 比对因子列
 factor_cols = [c for c in new_df.columns if c != 'ts_code']
@@ -193,7 +193,7 @@ assert len(comparison) == 0, "Factor values changed!"
 ### P1：中期规划
 - ☐ 实现20日滚动平滑特征生成器
   ```python
-  # 输入：etf_cicc_daily_factors/*.parquet
+  # 输入：etf_cicc_daily_factor/*.parquet
   # 输出：etf_cicc_daily_smoothed/*.parquet（额外58列）
   corr_pv_avg_20d, corr_pv_std_20d, corr_pv_trend_20d, ...
   ```

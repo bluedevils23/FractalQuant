@@ -1,0 +1,92 @@
+{
+  "schema_version": 1,
+  "generated_at_utc": "2026-08-09T07:15:56.346176+00:00",
+  "asset_type": "stock",
+  "output_schema": {
+    "index": "factor_date",
+    "columns": [
+      "ts_code",
+      "YaoYanBoDongLv",
+      "YaoYanShouYiLv",
+      "ShiDuMaoXian",
+      "QiangShiBanChaoXi",
+      "RuoShiBanChaoXi",
+      "ChaoXi",
+      "MoHuGuanLianDu",
+      "MoHuJinEBi",
+      "MoHuJiaCha",
+      "YunKaiWuSan",
+      "PanDeng",
+      "YongPanGaoFeng",
+      "TiaoYueDu",
+      "FeiEPuHuo",
+      "RiBoDongLv",
+      "CaoMuJieBing",
+      "GuYanChuQun",
+      "GaoDiECha",
+      "SuiBoZhuLiu",
+      "ShuiZhongXingZhou",
+      "ZhaoMoChenWu",
+      "WuBiGuMu",
+      "YeMianShuangLu_t_intercept",
+      "YeMianShuangLu",
+      "HuaYinLinJian",
+      "GenSuiXiShu",
+      "DaiZhuErJiu",
+      "ChengJiaoLiangBoYi_ShouYiLv",
+      "ChengJiaoLiangBoYi_RiNeiXiangDuiWeiZhi",
+      "ZhenFuBoYi",
+      "DuoKongBoYi",
+      "ChengJiaoLiangXieTong",
+      "XieTongJiaCha",
+      "XieTongXiaoYing",
+      "ChongJian",
+      "ZaiHouChongJian",
+      "YueYaoYanBoDongLv",
+      "YueYaoYanShouYiLv"
+    ],
+    "factor_count": 38,
+    "column_count": 39
+  },
+  "factor_availability": {
+    "CaoMuJieBing": {
+      "status": "unavailable",
+      "required_fields": [
+        "retail_trade_ratio",
+        "csi_all_share_return"
+      ],
+      "missing_fields": [
+        "retail_trade_ratio",
+        "csi_all_share_return"
+      ],
+      "null_rows": {},
+      "checked_rows": 549,
+      "retail_trade_ratio_definition": "mean(individual-investor buy amount, sell amount) for trades below CNY 40000 divided by total daily amount",
+      "benchmark": "CSI All Share 000985.CSI daily return"
+    }
+  },
+  "calculation_universe": {
+    "mode": "target_symbols",
+    "symbol_count": 10,
+    "symbols_file": null,
+    "warning": "Cross-sectional and market-relative values use only the selected target symbols; a static symbols file may introduce survivorship bias."
+  },
+  "factor_date_range": {
+    "from": "2022-01-01",
+    "to": "2022-02-28"
+  },
+  "timing": {
+    "factor_date": "construction date using the complete daily minute panel",
+    "usable_from": "next trading day (d+1)"
+  },
+  "input_validation": {
+    "expected_minute_rows": 241,
+    "invalid_code_dates": 0,
+    "reason_counts": {}
+  },
+  "outputs": {
+    "written_symbols": 10,
+    "skipped_existing_symbols": 0,
+    "failed_symbols": 0
+  }
+}

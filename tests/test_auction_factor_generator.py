@@ -233,6 +233,34 @@ def test_qmt_tick_mapping_and_auction_window(tmp_path: Path) -> None:
     assert result["open_price"].isna().all()
 
 
+def test_qmt_quote_frame_filters_heartbeats_but_keeps_book_changes(
+    tmp_path: Path,
+) -> None:
+    tick_path = tmp_path / "000001.SZ.parquet"
+    _write_qmt_tick(
+        tick_path,
+        [
+            "2026-03-31 09:15:00",
+            "2026-03-31 09:15:03",
+            "2026-03-31 09:15:06",
+            "2026-03-31 09:24:59",
+        ],
+    )
+    frame = pd.read_parquet(tick_path)
+    frame["last_price"] = [0.0, 0.0, 10.05, 10.05]
+    frame["amount"] = [0.0, 0.0, 100.0, 100.0]
+    frame["ask_vol1"] = [100.0, 100.0, 200.0, 300.0]
+    frame.to_parquet(tick_path)
+
+    result = load_qmt_quote_frame(tick_path)
+
+    assert result["trade_time"].dt.strftime("%H:%M:%S").tolist() == [
+        "09:15:00",
+        "09:15:06",
+        "09:24:59",
+    ]
+
+
 def test_previous_close_prefers_daily_reference_and_uses_stable_quote_fallback() -> None:
     quotes = _auction_quotes()
     quotes.loc[0, "previous_close"] = 100.0
@@ -1300,6 +1328,42 @@ def test_historical_context_uses_prior_day_and_full_universe_ranks(tmp_path) -> 
     assert np.isnan(suspended_context["_market_above_ma20"])
 
 
+def test_historical_context_reconstructs_qmt_previous_close_from_adj_factor(tmp_path) -> None:
+    rows = [
+        {
+            "trade_date": pd.Timestamp("2026-07-17"),
+            "ts_code": "588110.SH",
+            "close": 2.511,
+            "high": 2.771,
+            "low": 2.470,
+            "pre_close": np.nan,
+            "adj_factor": 1.0,
+            "vol": 234163.0,
+            "up_limit": 2.0,
+            "down_limit": 2.0,
+        },
+        {
+            "trade_date": pd.Timestamp("2026-07-20"),
+            "ts_code": "588110.SH",
+            "close": 0.582,
+            "high": 0.647,
+            "low": 0.562,
+            "pre_close": np.nan,
+            "adj_factor": 3.9984,
+            "vol": 594781.0,
+            "up_limit": 2.0,
+            "down_limit": 2.0,
+        },
+    ]
+    daily_path = tmp_path / "qmt_daily.parquet"
+    pd.DataFrame(rows).set_index(["trade_date", "ts_code"]).to_parquet(daily_path)
+
+    context = build_historical_context(
+        daily_path, ["2026-07-20"], {"588110.SH"}, include_daily_factor_fields=False
+    )["588110.SH"].iloc[0]
+
+    assert np.isclose(context["previous_close"], 2.511 / 3.9984)
+
 def test_cross_day_price_factors_use_adjusted_context_without_changing_raw_references(
     tmp_path,
 ) -> None:
@@ -1757,6 +1821,53 @@ def test_invalid_or_stage2_cancellation_marks_reconstruction_failed(tmp_path) ->
     assert ok is False
     assert row["auction_event_reconstruction_ok"] is False
     assert all(np.isnan(row[column]) for column in EVENT_FACTOR_COLUMNS[:-1])
+
+
+def test_sh_system_status_broadcast_ignored_during_reconstruction(tmp_path) -> None:
+    raw_dir = tmp_path / "510050.SH"
+    raw_dir.mkdir()
+    _write_raw_order_file(
+        raw_dir,
+        [
+            {
+                "自然日": 20260331,
+                "时间": 91500000,
+                "交易所委托号": 0,
+                "委托类型": "S",
+                "委托代码": "",
+                "委托价格": 0,
+                "委托数量": 0,
+            },
+            _raw_order(91500000, 1, "A", "B", 100),
+            _raw_order(91800000, 1, "D", "B", 20),
+        ],
+    )
+    events, ok = load_auction_event_frame(raw_dir, "510050.SH")
+    assert ok is True
+    assert len(events) == 2
+    assert set(events["event_type"]) == {"A", "C"}
+
+
+def test_sh_system_status_only_fails_reconstruction(tmp_path) -> None:
+    raw_dir = tmp_path / "510050.SH"
+    raw_dir.mkdir()
+    _write_raw_order_file(
+        raw_dir,
+        [
+            {
+                "自然日": 20260331,
+                "时间": 91500000,
+                "交易所委托号": 0,
+                "委托类型": "S",
+                "委托代码": "",
+                "委托价格": 0,
+                "委托数量": 0,
+            },
+        ],
+    )
+    events, ok = load_auction_event_frame(raw_dir, "510050.SH")
+    assert ok is False
+    assert events.empty
 
 
 def test_duplicate_and_over_cancelled_orders_fail_reconstruction(tmp_path) -> None:

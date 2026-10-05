@@ -1,0 +1,17 @@
+{
+  "files": 30,
+  "rows": 840,
+  "date_min": "2026-07-01 00:00:00",
+  "date_max": "2026-08-07 00:00:00",
+  "nonnull": {
+    "kaiyuan_apmnew_m20": 840,
+    "kaiyuan_apmraw_m20": 840,
+    "kaiyuan_ovp_m20": 840,
+    "kaiyuan_avp_m20": 840
+  },
+  "cross_section_min": 30,
+  "cross_section_max": 30,
+  "null_available_time": 0,
+  "duplicates": 0,
+  "last_available": "2026-08-10 09:30:00"
+}

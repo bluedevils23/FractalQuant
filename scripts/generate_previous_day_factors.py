@@ -30,17 +30,23 @@ DEFAULT_STOCK_DAILY_PATH = Path(
     r"D:\workspace\stockdata\stock-data\行情数据\stock_daily.parquet"
 )
 DEFAULT_ETF_DAILY_PATH = Path(r"D:\workspace\stockdata\etf-data\etf_daily.parquet")
+DEFAULT_QMT_DAILY_ROOT = Path(r"D:\workspace\stockdata\etf-data\etf_1d_qmt")
 DEFAULT_STOCK_OUTPUT_ROOT = Path(
     r"D:\workspace\stockdata\stock-factors\stock_daily_context_factors"
 )
 DEFAULT_ETF_OUTPUT_ROOT = Path(
     r"D:\workspace\stockdata\etf-factors\etf_daily_context_factors"
 )
+DEFAULT_QMT_OUTPUT_ROOT = Path(
+    r"D:\workspace\stockdata\etf-factors\etf_daily_context_factors_qmt"
+)
 DEFAULT_BENCHMARK_TS_CODE = "510300.SH"
 DAILY_FACTOR_COLUMNS = [
     "prevday_intraday_drawdown_from_session_high",
     "prevday_intraday_rebound_from_session_low",
     "prevday_intraday_return_from_prev_close",
+    "pre_return",
+    "previous_return",
     "prev_2d_return_rank_cs",
     "prev_20d_return_rank_cs",
     "prev_skew_long_60d",
@@ -83,7 +89,8 @@ def calculate_previous_day_factors(
     date_from: str | None = None,
     date_to: str | None = None,
     benchmark_ts_code: str = DEFAULT_BENCHMARK_TS_CODE,
-    etf_daily_path: Path = DEFAULT_ETF_DAILY_PATH,
+    etf_daily_path: Path | None = None,
+    is_qmt: bool = False,
 ) -> pd.DataFrame:
     """Return one row per available symbol and target date.
 
@@ -96,7 +103,18 @@ def calculate_previous_day_factors(
         raise FileNotFoundError(f"Daily file does not exist: {daily_path}")
     if daily_path.is_dir():
         parts = []
-        for symbol_path in daily_path.glob("*.parquet"):
+        target_files = (
+            [
+                daily_path / f"{code}.parquet"
+                for code in requested_codes
+                if (daily_path / f"{code}.parquet").exists()
+            ]
+            if requested_codes
+            else list(daily_path.glob("*.parquet"))
+        )
+        if not target_files:
+            target_files = list(daily_path.glob("*.parquet"))
+        for symbol_path in target_files:
             dates = pd.read_parquet(symbol_path, columns=["trade_date"])
             if "trade_date" not in dates.columns:
                 dates = dates.reset_index()
@@ -157,7 +175,7 @@ def calculate_previous_day_factors(
         if not benchmark_context.empty
         else pd.DataFrame(columns=market_columns)
     )
-    if etf_daily_path.exists() and etf_daily_path != daily_path:
+    if not is_qmt and etf_daily_path is not None and etf_daily_path.exists() and etf_daily_path != daily_path:
         missing_market_dates = [
             date
             for date in target_dates
@@ -176,6 +194,17 @@ def calculate_previous_day_factors(
                 benchmark_by_date = benchmark_by_date.combine_first(
                     etf_context.set_index("trade_date")[market_columns]
                 )
+    elif is_qmt and benchmark_by_date.empty:
+        # Strictly use QMT daily path for benchmark if not already in context
+        bench_contexts = build_historical_context(
+            daily_path,
+            target_dates,
+            {benchmark},
+            include_daily_factor_fields=True,
+        )
+        bench_ctx = bench_contexts.get(benchmark, pd.DataFrame())
+        if not bench_ctx.empty:
+            benchmark_by_date = bench_ctx.set_index("trade_date")[market_columns]
     for code, context in contexts.items():
         if code not in output_codes:
             continue
@@ -193,6 +222,16 @@ def calculate_previous_day_factors(
             "prev_rel_skew_rank_cs",
         ):
             factor_frame[column] = context[column] if column in context.columns else np.nan
+        factor_frame["pre_return"] = (
+            context["pre_return"]
+            if "pre_return" in context.columns
+            else factor_frame["prevday_intraday_return_from_prev_close"]
+        )
+        factor_frame["previous_return"] = (
+            context["previous_return"]
+            if "previous_return" in context.columns
+            else factor_frame["prevday_intraday_return_from_prev_close"]
+        )
         factor_frame["market_above_ma20_prevclose"] = np.nan
         factor_frame["market_momentum_2d_prevclose"] = np.nan
         if not benchmark_by_date.empty:
@@ -249,6 +288,9 @@ def write_outputs(frame: pd.DataFrame, output_root: Path, overwrite: bool) -> in
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--asset-type", choices=("stock", "etf", "both"), default="both")
+    parser.add_argument("--qmt", action="store_true", help="Use QMT daily input and QMT output directory for ETFs.")
+    parser.add_argument("--qmt-daily-root", type=Path, default=DEFAULT_QMT_DAILY_ROOT)
+    parser.add_argument("--qmt-output-root", type=Path, default=DEFAULT_QMT_OUTPUT_ROOT)
     parser.add_argument("--stock-daily-path", type=Path, default=DEFAULT_STOCK_DAILY_PATH)
     parser.add_argument("--etf-daily-path", type=Path, default=DEFAULT_ETF_DAILY_PATH)
     parser.add_argument("--stock-output-root", type=Path, default=DEFAULT_STOCK_OUTPUT_ROOT)
@@ -266,6 +308,40 @@ def main() -> None:
     args = parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     requested = _read_symbols(args.symbols_file, args.symbols)
+
+    if args.qmt:
+        if not args.qmt_daily_root.exists():
+            raise FileNotFoundError(
+                f"QMT daily directory does not exist: {args.qmt_daily_root}. "
+                "QMT factor calculation strictly requires QMT daily data and cannot fall back to local data."
+            )
+        jobs = [("etf_qmt", args.qmt_daily_root, args.qmt_output_root)]
+        for asset_type, daily_path, output_root in jobs:
+            frame = calculate_previous_day_factors(
+                daily_path,
+                requested_codes=requested,
+                date_from=args.date_from,
+                date_to=args.date_to,
+                benchmark_ts_code=args.benchmark_ts_code,
+                etf_daily_path=None,
+                is_qmt=True,
+            )
+            count = write_outputs(frame, output_root, args.overwrite)
+            LOGGER.info(
+                "%s: wrote %s symbols and %s rows to %s",
+                asset_type,
+                count,
+                len(frame),
+                output_root,
+            )
+        return
+
+    # Local mode: strictly enforce local data files
+    if args.asset_type in ("stock", "both") and not args.stock_daily_path.exists():
+        raise FileNotFoundError(f"Local stock daily path does not exist: {args.stock_daily_path}")
+    if args.asset_type in ("etf", "both") and not args.etf_daily_path.exists():
+        raise FileNotFoundError(f"Local ETF daily path does not exist: {args.etf_daily_path}")
+
     jobs = (
         [("stock", args.stock_daily_path, args.stock_output_root)]
         if args.asset_type == "stock"
@@ -284,6 +360,7 @@ def main() -> None:
             date_to=args.date_to,
             benchmark_ts_code=args.benchmark_ts_code,
             etf_daily_path=args.etf_daily_path,
+            is_qmt=False,
         )
         count = write_outputs(frame, output_root, args.overwrite)
         LOGGER.info(

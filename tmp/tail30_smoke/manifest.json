@@ -1,0 +1,18 @@
+{
+  "source_report_interval": "211m-240m",
+  "bar_window": "14:31:00-15:00:00 inclusive (30 one-minute bars)",
+  "availability": "next available trading day 09:15; last observed day is NaT",
+  "factor_definitions": {
+    "tail30_return": "last close / first open - 1",
+    "tail30_bias_proxy": "last close relative to volume-weighted average close",
+    "tail30_daily_reverse": "0.5 * tail30_return + 0.5 * tail30_bias_proxy",
+    "tail30_dastd": "sample std of 30 within-window log returns",
+    "tail30_residual_volatility_proxy": "OLS residual std versus benchmark when available; otherwise demeaned intraday return proxy",
+    "tail30_maxilliq_proxy": "absolute return of the maximum-amount minute divided by that minute amount",
+    "tail30_daily_volatility": "0.5 * tail30_dastd + 0.5 * tail30_residual_volatility_proxy",
+    "tail30_daily_milliq": "tail30_maxilliq_proxy"
+  },
+  "limitations": "Bias, residual volatility, and Maxilliq are research-compatible proxies because the report does not disclose complete mathematical specifications.",
+  "input_root": "D:\\workspace\\stockdata\\etf-data\\etf_1min",
+  "universe_file": "D:\\workspace\\stockdata\\etf-factors\\etf_universe\\non_day_turnover_stock_index_universe.txt"
+}

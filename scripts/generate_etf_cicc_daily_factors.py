@@ -44,7 +44,7 @@ import MinuteFrequentFactorCalculateMethodsCICC as cicc_methods  # noqa: E402
 LOGGER = logging.getLogger("generate_etf_cicc_daily_factors")
 
 DEFAULT_INPUT_ROOT = Path(r"D:\workspace\stockdata\etf-data\etf_1min")
-DEFAULT_OUTPUT_ROOT = Path(r"D:\workspace\stockdata\etf-data\etf_cicc_daily_factors")
+DEFAULT_OUTPUT_ROOT = Path(r"D:\workspace\stockdata\etf-factors\etf_cicc_daily_factor")
 REQUIRED_COLUMNS = ("open", "high", "low", "close", "volume")
 FACTOR_FUNCTION_NAMES = (
     "cal_mmt_pm",

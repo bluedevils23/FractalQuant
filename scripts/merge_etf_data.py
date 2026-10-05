@@ -161,6 +161,44 @@ def _validate_arrow_schema(
         )
 
 
+def _validate_compatible_table_schema(
+    actual: pa.Schema,
+    expected: pa.Schema,
+    label: str,
+) -> None:
+    """Accept Arrow's equivalent string/timestamp physical representations."""
+    actual_fields = actual.remove_metadata()
+    expected_fields = expected.remove_metadata()
+    if actual_fields.names != expected_fields.names:
+        raise ValueError(
+            f"{label} has incompatible parquet fields: "
+            f"{actual_fields.names} != {expected_fields.names}"
+        )
+
+    incompatible: list[str] = []
+    for actual_field, expected_field in zip(actual_fields, expected_fields):
+        if actual_field.type == expected_field.type:
+            continue
+        strings = pa.types.is_string(actual_field.type) and pa.types.is_large_string(
+            expected_field.type
+        )
+        reverse_strings = pa.types.is_large_string(
+            actual_field.type
+        ) and pa.types.is_string(expected_field.type)
+        timestamps = pa.types.is_timestamp(actual_field.type) and pa.types.is_timestamp(
+            expected_field.type
+        )
+        if not (strings or reverse_strings or timestamps):
+            incompatible.append(
+                f"{actual_field.name}: {actual_field.type} != {expected_field.type}"
+            )
+    if incompatible:
+        raise ValueError(
+            f"{label} has incompatible parquet schema: "
+            + "; ".join(incompatible)
+        )
+
+
 def load_minute_source(source_path: Path) -> pd.DataFrame:
     frame = pd.read_parquet(source_path)
     if frame.columns.tolist() != list(MINUTE_SOURCE_COLUMNS):
@@ -626,7 +664,11 @@ def merge_table_dataset(
         return result
 
     target_schema = pq.ParquetFile(target_path).schema_arrow
-    _validate_arrow_schema(target_schema, source_schema, str(target_path))
+    _validate_compatible_table_schema(
+        target_schema,
+        source_schema,
+        str(target_path),
+    )
     scan = _scan_sorted_unique_target(target_path, spec.key_columns)
     existing_window = _load_table_target_window(
         target_path,

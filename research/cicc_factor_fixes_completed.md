@@ -178,10 +178,10 @@ import datetime
 
 ```bash
 # 重新生成 ETF 日级因子
-python -m scripts.generate_etf_cicc_minute_factors --overwrite --workers 8
+python -m scripts.generate_etf_cicc_daily_factors --overwrite --workers 8
 
 # 输出目录
-D:\workspace\stockdata\etf-data\etf_cicc_daily_factors\
+D:\workspace\stockdata\etf-factors\etf_cicc_daily_factor\
 ```
 
 **预期改善**：

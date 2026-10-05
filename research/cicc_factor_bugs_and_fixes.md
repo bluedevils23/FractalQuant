@@ -174,7 +174,7 @@ pl.col('up_return').std().fill_null(0) / pl.col('return').std()
 
 ## 5. 时间格式转换潜在问题
 
-**位置**：`generate_etf_cicc_minute_factors.py` Line 289-294
+**位置**：`generate_etf_cicc_daily_factors.py` Line 289-294
 
 ```python
 def convert_time_to_cicc_int(index: pd.DatetimeIndex) -> pd.Series:
@@ -219,7 +219,7 @@ CICC因子假设：
 - `product()` 计算累积收益时，如果有NaN会传播
 
 **建议**：
-在 `generate_etf_cicc_minute_factors.py` 的 `normalize_minute_frame` 中添加：
+在 `generate_etf_cicc_daily_factors.py` 的 `normalize_minute_frame` 中添加：
 ```python
 def normalize_minute_frame(raw_df: pd.DataFrame) -> pd.DataFrame:
     df = raw_df.copy()
