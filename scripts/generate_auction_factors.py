@@ -43,6 +43,9 @@ DEFAULT_STOCK_OUTPUT_ROOT = Path(
     r"D:\workspace\stockdata\stock-factors\stock_auction_factors"
 )
 DEFAULT_ETF_OUTPUT_ROOT = Path(r"D:\workspace\stockdata\etf-factors\etf_auction_factors")
+DEFAULT_ETF_INDEX_MAPPING_PATH = Path(
+    r"D:\workspace\stockdata\etf-data\exchange_fund_index_mapping.csv"
+)
 DEFAULT_QMT_DAILY_ROOT = Path(r"D:\workspace\stockdata\etf-data\etf_1d_qmt")
 DEFAULT_QMT_OUTPUT_ROOT = Path(
     r"D:\workspace\stockdata\etf-factors\etf_auction_factors_qmt"
@@ -326,6 +329,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--etf-output-root", type=Path, default=DEFAULT_ETF_OUTPUT_ROOT)
     parser.add_argument("--qmt-output-root", type=Path, default=DEFAULT_QMT_OUTPUT_ROOT)
     parser.add_argument(
+        "--etf-index-mapping-path",
+        type=Path,
+        default=DEFAULT_ETF_INDEX_MAPPING_PATH,
+        help="ETF-to-tracking-index mapping used for cross-sectional excess factors.",
+    )
+    parser.add_argument(
         "--use-qmt-auction-source",
         action="store_true",
         help="Generate ETF auction factors from QMT ticks and the 09:30 minute match bar.",
@@ -523,6 +532,118 @@ def existing_output_codes(output_root: Path) -> set[str]:
         for path in output_root.glob("*.parquet")
         if (code := numeric_code(path.stem)) is not None
     }
+
+
+def normalize_index_group(value: object) -> str | None:
+    text = str(value).strip().upper()
+    if not text or text in {"NAN", "NONE", "NULL"}:
+        return None
+    return text.split(".", 1)[0] or None
+
+
+def load_etf_index_group_mapping(mapping_path: Path) -> dict[str, str]:
+    if not mapping_path.exists():
+        raise FileNotFoundError(f"ETF index mapping does not exist: {mapping_path}")
+    frame = pd.read_csv(mapping_path, dtype=str, keep_default_na=False)
+    required = {"fund_code", "tracking_index_code", "reference_index_code"}
+    missing = required - set(frame.columns)
+    if missing:
+        raise ValueError(f"ETF index mapping missing columns: {sorted(missing)}")
+    codes = frame["fund_code"].map(numeric_code)
+    if codes.isna().any():
+        raise ValueError("ETF index mapping contains invalid fund_code values")
+    duplicated = codes[codes.duplicated(keep=False)].unique().tolist()
+    if duplicated:
+        raise ValueError(f"ETF index mapping contains duplicate fund_code: {duplicated[:10]}")
+    groups = frame["tracking_index_code"].map(normalize_index_group)
+    fallback = frame["reference_index_code"].map(normalize_index_group)
+    groups = groups.where(groups.notna(), fallback)
+    missing_groups = int(groups.isna().sum())
+    if missing_groups:
+        LOGGER.warning("ETF index mapping has %d funds without an index group", missing_groups)
+    result = {code: group for code, group in zip(codes, groups) if group is not None}
+    LOGGER.info("Loaded ETF index mapping: %d funds, %d grouped", len(codes), len(result))
+    return result
+
+
+def _leave_one_out_median(values: pd.Series) -> pd.Series:
+    valid = pd.to_numeric(values, errors="coerce")
+    total = int(valid.notna().sum())
+    if total <= 1:
+        return pd.Series(np.nan, index=values.index, dtype=float)
+    result = pd.Series(np.nan, index=values.index, dtype=float)
+    for idx, value in valid.items():
+        if pd.isna(value) or total <= 1:
+            continue
+        peers = valid.drop(index=idx).dropna()
+        if not peers.empty:
+            result.loc[idx] = float(peers.median())
+    return result
+
+
+def apply_index_group_cross_sectional_excess(
+    output_root: Path,
+    mapping_path: Path,
+    date_from: str | None = None,
+    date_to: str | None = None,
+) -> dict[str, int]:
+    """Overwrite the two legacy excess columns with same-index leave-one-out excess."""
+    mapping = load_etf_index_group_mapping(mapping_path)
+    files = sorted(output_root.glob("*.parquet")) if output_root.exists() else []
+    frames: dict[Path, pd.DataFrame] = {}
+    rows: list[pd.DataFrame] = []
+    group_sizes: dict[str, int] = {}
+    for path in files:
+        code = numeric_code(path.stem)
+        if code is None:
+            continue
+        group = mapping.get(code)
+        if group is not None:
+            group_sizes[group] = group_sizes.get(group, 0) + 1
+        frame = pd.read_parquet(path)
+        if "trade_date" not in frame.columns:
+            continue
+        dates = frame["trade_date"].astype(str).str.replace(r"\D", "", regex=True).str[:8]
+        mask = dates.notna()
+        if date_from is not None:
+            mask &= dates >= date_from
+        if date_to is not None:
+            mask &= dates <= date_to
+        subset = frame.loc[mask, ["trade_date", "auction_overnight_return", "auction_return_stage2"]].copy()
+        if subset.empty:
+            continue
+        subset["_row"] = subset.index
+        subset["_path"] = str(path)
+        subset["_code"] = code
+        subset["_group"] = group
+        rows.append(subset)
+        frames[path] = frame
+    if not rows:
+        return {"files": 0, "rows": 0, "updated": 0, "nan": 0}
+    panel = pd.concat(rows, ignore_index=True)
+    panel["_date"] = panel["trade_date"].astype(str).str.replace(r"\D", "", regex=True).str[:8]
+    for raw, target in (("auction_overnight_return", "auction_gap_excess_benchmark"),
+                        ("auction_return_stage2", "auction_stage2_excess_return_benchmark")):
+        peer = panel.groupby(["_date", "_group"], dropna=False)[raw].transform(_leave_one_out_median)
+        result = pd.to_numeric(panel[raw], errors="coerce") - peer
+        singleton = panel["_group"].map(group_sizes).eq(1)
+        result = result.mask(singleton & panel[raw].notna(), 0.0)
+        result = result.mask(panel["_group"].isna() | (peer.isna() & ~singleton))
+        panel[target] = result
+    updated = 0
+    nan_count = 0
+    for path, frame in frames.items():
+        part = panel[panel["_path"] == str(path)]
+        for target in ("auction_gap_excess_benchmark", "auction_stage2_excess_return_benchmark"):
+            if target not in frame.columns:
+                frame[target] = np.nan
+            for _, row in part.iterrows():
+                frame.at[row["_row"], target] = row[target]
+                updated += 1
+                nan_count += int(pd.isna(row[target]))
+        frame.to_parquet(path, index=False)
+    LOGGER.info("Applied ETF index-group excess factors: files=%d rows=%d updated=%d nan=%d", len(frames), len(panel), updated, nan_count)
+    return {"files": len(frames), "rows": len(panel), "updated": updated, "nan": nan_count}
 
 
 def discover_trade_date_dirs(tick_root: Path, date_to: str | None) -> list[Path]:
@@ -3614,6 +3735,16 @@ def run_qmt_auction_generation(
         for symbol, error in failures[:20]:
             LOGGER.error("%s: %s", symbol, error)
         return 1
+    try:
+        apply_index_group_cross_sectional_excess(
+            args.qmt_output_root,
+            args.etf_index_mapping_path,
+            date_from,
+            date_to,
+        )
+    except Exception:
+        LOGGER.exception("Failed to apply QMT ETF index-group excess factors")
+        return 1
     return 0
 
 
@@ -3916,6 +4047,17 @@ def main() -> int:
         for symbol, error in failures[:20]:
             LOGGER.error("%s: %s", symbol, error)
         return 1
+    if any(kind == "etf" for kind, _, _, _ in tasks):
+        try:
+            apply_index_group_cross_sectional_excess(
+                args.etf_output_root,
+                args.etf_index_mapping_path,
+                date_from,
+                date_to,
+            )
+        except Exception:
+            LOGGER.exception("Failed to apply ETF index-group excess factors")
+            return 1
     return 0
 
 
