@@ -273,6 +273,25 @@ def test_calculate_retail_trade_ratio_uses_only_matched_buy_sell_ticks(
     assert result == pytest.approx((1_000 + 2_000) / (2 * 113_000))
 
 
+def test_calculate_retail_trade_ratio_supports_shanghai_empty_trade_code(
+    tmp_path: Path,
+) -> None:
+    tick_path = tmp_path / "逐笔成交.csv"
+    pd.DataFrame(
+        {
+            "成交代码": [None, float("nan"), None],
+            "BS标志": ["B", "S", "B"],
+            "成交价格": [100_000, 100_000, 100_000],
+            "成交数量": [100, 200, 5_000],
+        }
+    ).to_csv(tick_path, index=False, encoding="gb18030")
+
+    result = fz.calculate_retail_trade_ratio(tick_path)
+
+    assert result == pytest.approx((1_000 + 2_000) / (2 * 53_000))
+
+
+
 def test_build_and_merge_cao_mu_source_from_ticks_and_index_daily(
     tmp_path: Path,
 ) -> None:

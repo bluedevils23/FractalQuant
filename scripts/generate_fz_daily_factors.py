@@ -746,7 +746,13 @@ def calculate_retail_trade_ratio(tick_path: Path) -> float | None:
     side = ticks["BS标志"].fillna("").astype(str).str.strip()
     price = pd.to_numeric(ticks["成交价格"], errors="coerce")
     quantity = pd.to_numeric(ticks["成交数量"], errors="coerce")
-    matched = trade_code.eq("0") & side.isin(("B", "S")) & (price > 0) & (quantity > 0)
+    matched = (
+        trade_code.isin(("0", ""))
+        & ~trade_code.isin(("C", "4"))
+        & side.isin(("B", "S"))
+        & (price > 0)
+        & (quantity > 0)
+    )
     if not matched.any():
         return None
 
