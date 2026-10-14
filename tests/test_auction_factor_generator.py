@@ -6,7 +6,13 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from scripts.auction_tick_cache import AuctionTickCache
+from scripts.auction_tick_cache import (
+    AuctionTickCache,
+    ensure_stage2_quote_anchor,
+    filter_quote_heartbeats,
+    resolve_data_source,
+)
+from scripts.generate_auction_factors import load_auction_quotes
 from scripts.generate_auction_factors import (
     CONTEXT_SUPPLEMENT_FACTOR_COLUMNS,
     EVENT_FACTOR_COLUMNS,
@@ -24,6 +30,7 @@ from scripts.generate_auction_factors import (
     build_asset_universe,
     build_benchmark_context,
     build_historical_context,
+    build_qmt_benchmark_context,
     build_session_path_factor_frame,
     calculate_daily_auction_factors,
     calculate_supplemental_auction_fields,
@@ -37,9 +44,11 @@ from scripts.generate_auction_factors import (
     load_qmt_quote_frame,
     load_quote_frame,
     merge_symbol_output,
+    normalize_qmt_tick_frame,
     process_qmt_symbol_series,
     process_symbol_series,
     process_session_path_only,
+    select_qmt_auction_match,
     _missing_dates_with_warmup,
 )
 
@@ -153,6 +162,20 @@ def _write_qmt_minutes(path: Path, rows: list[tuple[str, float, float, float]]) 
     ).to_parquet(path)
 
 
+def _write_qmt_auction_quotes(path: Path, rows: list[dict[str, object]]) -> None:
+    frame = pd.DataFrame(rows).rename(
+        columns={
+            f"{side}_qty{level}": f"{side}_vol{level}"
+            for side in ("ask", "bid")
+            for level in range(1, 4)
+        }
+    )
+    frame["last_price"] = 0.0
+    frame["amount"] = 0.0
+    frame["trade_date"] = frame["trade_time"].dt.normalize()
+    frame.set_index(["trade_date", "trade_time"]).to_parquet(path)
+
+
 def _event(
     timestamp: str,
     event_type: str,
@@ -233,6 +256,36 @@ def test_qmt_tick_mapping_and_auction_window(tmp_path: Path) -> None:
     assert result["open_price"].isna().all()
 
 
+def test_public_qmt_normalization_and_match_selection() -> None:
+    rows = []
+    for timestamp, price in (("2026-03-31 09:15:00", 1.0), ("2026-03-31 09:20:00", 1.01)):
+        row = {"trade_time": timestamp, "last_price": price, "previous_close": 1.0, "amount": 0.0}
+        for side in ("ask", "bid"):
+            for level in range(1, 4):
+                row[f"{side}_price{level}"] = price
+                row[f"{side}_vol{level}"] = 10.0
+        rows.append(row)
+    normalized = normalize_qmt_tick_frame(pd.DataFrame(rows))
+    assert normalized["trade_time"].tolist() == [
+        pd.Timestamp("2026-03-31 09:15:00"),
+        pd.Timestamp("2026-03-31 09:20:00"),
+    ]
+    assert normalized["ask_qty1"].tolist() == [10.0, 10.0]
+
+    ticks = pd.DataFrame({
+        "trade_time": pd.to_datetime(["2026-03-31 09:25:01"]),
+        "last_price": [1.02], "volume": [1000.0], "amount": [1020.0],
+    })
+    minutes = pd.DataFrame({
+        "trade_date": pd.to_datetime(["2026-03-31"]),
+        "trade_time": pd.to_datetime(["2026-03-31 09:30:00"]),
+        "open": [1.01], "vol": [2000.0], "amount": [2020.0],
+    })
+    match = select_qmt_auction_match(ticks, minutes, pd.Timestamp("2026-03-31"))
+    assert match is not None and match["source"] == "qmt_tick_0925"
+    assert match["open_price"] == 1.02
+
+
 def test_qmt_quote_frame_filters_heartbeats_but_keeps_book_changes(
     tmp_path: Path,
 ) -> None:
@@ -259,6 +312,233 @@ def test_qmt_quote_frame_filters_heartbeats_but_keeps_book_changes(
         "09:15:06",
         "09:24:59",
     ]
+
+
+def test_qmt_heartbeat_filter_preserves_stage2_return_and_twap(
+    tmp_path: Path,
+) -> None:
+    tick_path = tmp_path / "000001.SZ.parquet"
+    _write_qmt_auction_quotes(
+        tick_path,
+        [
+            _quote_row("2026-03-31 09:19:57", 10.0, 600, 400),
+            _quote_row("2026-03-31 09:20:00", 10.0, 600, 400),
+            _quote_row("2026-03-31 09:20:03", 10.0, 600, 400),
+            _quote_row("2026-03-31 09:21:00", 10.1, 600, 400),
+            _quote_row("2026-03-31 09:24:00", 10.2, 600, 400),
+            _quote_row("2026-03-31 09:24:59", 10.2, 600, 400),
+        ],
+    )
+
+    quotes = load_qmt_quote_frame(tick_path)
+    row = calculate_daily_auction_factors(quotes, "000001.SZ")
+    supplement = calculate_supplemental_auction_fields(quotes, "000001.SZ")
+
+    assert row["auction_return_stage2"] == pytest.approx(0.02)
+    assert row["auction_stage2_twap_price"] == pytest.approx(10.1)
+    assert row["auction_stage2_twap_coverage_ratio"] == 1.0
+    assert row["snapshot_count_stage1"] == 1
+    assert row["snapshot_count_stage2"] == 2
+    assert row["auction_snapshot_count_total"] == 3
+    assert supplement["auction_snapshot_count_total"] == 3
+    assert row["auction_stage2_up_step_ratio"] == 1.0
+    assert row["auction_up_step_ratio"] == 1.0
+    assert row["auction_stage2_mid_mean_return"] == pytest.approx(0.015)
+    assert row["auction_stage2_total_variation_bps"] == pytest.approx(200.0)
+    assert row["auction_stage2_end_time"] == pd.Timestamp("2026-03-31 09:24:59")
+    assert pd.Timestamp("2026-03-31 09:20:03") not in quotes["trade_time"].tolist()
+    assert list(row) == OUTPUT_COLUMNS
+
+
+def test_qmt_constant_stage2_heartbeats_are_states_not_updates(
+    tmp_path: Path,
+) -> None:
+    tick_path = tmp_path / "000001.SZ.parquet"
+    _write_qmt_auction_quotes(
+        tick_path,
+        [
+            _quote_row("2026-03-31 09:15:00", 10.0, 600, 400),
+            _quote_row("2026-03-31 09:19:57", 10.0, 600, 400),
+            _quote_row("2026-03-31 09:20:03", 10.0, 600, 400),
+            _quote_row("2026-03-31 09:21:03", 10.0, 600, 400),
+            _quote_row("2026-03-31 09:24:03", 10.0, 600, 400),
+        ],
+    )
+
+    quotes = load_qmt_quote_frame(tick_path)
+    row = calculate_daily_auction_factors(quotes, "000001.SZ")
+
+    assert row["auction_return_stage2"] == 0.0
+    assert row["auction_return_stage1"] == 0.0
+    assert row["auction_stage2_twap_price"] == 10.0
+    assert row["auction_l3_imbalance_twap_stage2"] == pytest.approx(0.2)
+    assert row["auction_stage2_twap_coverage_ratio"] == 0.99
+    assert row["auction_stage2_mid_mean_return"] == 0.0
+    assert row["auction_stage2_range_ratio"] == 0.0
+    assert row["auction_stage2_efficiency_ratio"] == 0.0
+    assert row["auction_stage2_total_variation_bps"] == 0.0
+    assert row["auction_commitment_shift"] == 0.0
+    assert row["snapshot_count_stage1"] == 1
+    assert row["snapshot_count_stage2"] == 0
+    assert row["auction_snapshot_count_total"] == 1
+    assert row["auction_stage1_end_time"] == pd.Timestamp("2026-03-31 09:19:57")
+    assert row["auction_stage2_end_time"] == pd.Timestamp("2026-03-31 09:24:03")
+    assert len(quotes) == 4
+
+
+def test_qmt_heartbeat_stage_anchors_do_not_fill_invalid_book_intervals(
+    tmp_path: Path,
+) -> None:
+    tick_path = tmp_path / "000001.SZ.parquet"
+    _write_qmt_auction_quotes(
+        tick_path,
+        [
+            _quote_row("2026-03-31 09:19:57", 10.0, 600, 400),
+            _quote_row("2026-03-31 09:20:00", 10.0, 600, 400),
+            _quote_row("2026-03-31 09:21:00", 0.0, 0, 0),
+            _quote_row("2026-03-31 09:21:03", 0.0, 0, 0),
+            _quote_row("2026-03-31 09:24:00", 10.2, 600, 400),
+            _quote_row("2026-03-31 09:24:59", 10.2, 600, 400),
+        ],
+    )
+
+    row = calculate_daily_auction_factors(load_qmt_quote_frame(tick_path), "000001.SZ")
+
+    assert row["auction_stage2_twap_coverage_ratio"] == pytest.approx(0.4)
+    assert np.isnan(row["auction_stage2_twap_price"])
+    assert np.isnan(row["auction_l3_imbalance_twap_stage2"])
+
+
+def test_qmt_heartbeat_stage_anchors_do_not_cross_dates(tmp_path: Path) -> None:
+    tick_path = tmp_path / "000001.SZ.parquet"
+    _write_qmt_auction_quotes(
+        tick_path,
+        [
+            _quote_row("2026-03-31 09:15:00", 10.0, 600, 400),
+            _quote_row("2026-03-31 09:19:57", 10.0, 600, 400),
+            _quote_row("2026-03-31 09:20:00", 10.0, 600, 400),
+            _quote_row("2026-03-31 09:24:59", 10.0, 600, 400),
+            _quote_row("2026-04-01 09:15:00", 10.0, 600, 400),
+            _quote_row("2026-04-01 09:19:57", 10.0, 600, 400),
+        ],
+    )
+    quotes = load_qmt_quote_frame(tick_path)
+    rows = [
+        calculate_daily_auction_factors(group.reset_index(drop=True), "000001.SZ")
+        for _, group in quotes.groupby(quotes["trade_time"].dt.normalize())
+    ]
+
+    assert rows[0]["auction_return_stage2"] == 0.0
+    assert rows[0]["auction_stage2_twap_coverage_ratio"] == 1.0
+    assert rows[1]["snapshot_count_stage1"] == 1
+    assert rows[1]["snapshot_count_stage2"] == 0
+    assert np.isnan(rows[1]["auction_return_stage2"])
+    assert rows[1]["auction_stage2_twap_coverage_ratio"] == 0.0
+
+
+def test_qmt_stage_anchors_preserve_valid_endpoints_before_invalid_book(
+    tmp_path: Path,
+) -> None:
+    tick_path = tmp_path / "000001.SZ.parquet"
+    _write_qmt_auction_quotes(
+        tick_path,
+        [
+            _quote_row("2026-03-31 09:19:57", 10.0, 600, 400),
+            _quote_row("2026-03-31 09:20:00", 10.0, 600, 400),
+            _quote_row("2026-03-31 09:20:30", 10.0, 600, 400),
+            _quote_row("2026-03-31 09:21:00", 0.0, 0, 0),
+            _quote_row("2026-03-31 09:24:59", 0.0, 0, 0),
+        ],
+    )
+
+    row = calculate_daily_auction_factors(load_qmt_quote_frame(tick_path), "000001.SZ")
+
+    assert row["auction_return_stage2"] == 0.0
+    assert row["auction_stage2_end_time"] == pd.Timestamp("2026-03-31 09:20:30")
+    assert row["auction_stage2_twap_coverage_ratio"] == pytest.approx(0.2)
+    assert np.isnan(row["auction_stage2_twap_price"])
+    assert row["snapshot_count_stage2"] == 0
+
+
+def test_qmt_single_stage2_observation_remains_insufficient(tmp_path: Path) -> None:
+    tick_path = tmp_path / "000001.SZ.parquet"
+    _write_qmt_auction_quotes(
+        tick_path,
+        [
+            _quote_row("2026-03-31 09:19:57", 10.0, 600, 400),
+            _quote_row("2026-03-31 09:24:59", 10.0, 600, 400),
+        ],
+    )
+
+    row = calculate_daily_auction_factors(load_qmt_quote_frame(tick_path), "000001.SZ")
+
+    assert np.isnan(row["auction_return_stage2"])
+    assert np.isnan(row["auction_stage2_twap_price"])
+    assert row["auction_stage2_twap_coverage_ratio"] == pytest.approx(1 / 300)
+    assert row["snapshot_count_stage2"] == 0
+
+
+def test_qmt_stage_anchors_reach_generated_parquet_and_benchmark(tmp_path: Path) -> None:
+    tick_path = tmp_path / "000001.SZ.parquet"
+    minute_path = tmp_path / "000001.SZ.1min.parquet"
+    _write_qmt_auction_quotes(
+        tick_path,
+        [
+            _quote_row("2026-03-31 09:15:00", 10.0, 600, 400),
+            _quote_row("2026-03-31 09:19:57", 10.0, 600, 400),
+            _quote_row("2026-03-31 09:20:00", 10.0, 600, 400),
+            _quote_row("2026-03-31 09:24:59", 10.0, 600, 400),
+        ],
+    )
+    _write_qmt_minutes(minute_path, [("2026-03-31 09:30:00", 10.05, 1000, 10050)])
+    benchmark = build_qmt_benchmark_context(
+        "000001.SZ", tick_path, minute_path, ["2026-03-31"]
+    )
+    _, output_path, count = process_qmt_symbol_series(
+        "000001.SZ", tick_path, minute_path, tmp_path / "factors",
+        "20260331", "20260331", False, benchmark_context=benchmark,
+    )
+    result = pd.read_parquet(output_path)
+
+    assert count == 1
+    assert list(result.columns) == OUTPUT_COLUMNS
+    assert result["trade_date"].tolist() == ["2026-03-31"]
+    assert result["ts_code"].tolist() == ["000001.SZ"]
+    assert not result.duplicated(["trade_date", "ts_code"]).any()
+    assert result.loc[0, "auction_return_stage2"] == 0.0
+    assert result.loc[0, "auction_stage2_twap_price"] == 10.0
+    assert result.loc[0, "auction_stage2_twap_coverage_ratio"] == 1.0
+    assert result.loc[0, "auction_snapshot_count_total"] == 1
+    assert result.loc[0, "snapshot_count_stage2"] == 0
+    assert result.loc[0, "auction_match_source"] == "qmt_0930_minute"
+    assert result.loc[0, "auction_open_price"] == 10.05
+    assert result.loc[0, "auction_amount"] == 10050
+    assert result.loc[0, "auction_matched_volume"] == 1000
+    assert benchmark.loc[0, "_benchmark_auction_return_stage2"] == 0.0
+    assert bool(benchmark.loc[0, "benchmark_auction_has_match"])
+    assert "_qmt_state_anchor" not in result.columns
+
+
+def test_qmt_heartbeat_filter_preserves_last60s_start_state(tmp_path: Path) -> None:
+    tick_path = tmp_path / "000001.SZ.parquet"
+    _write_qmt_auction_quotes(
+        tick_path,
+        [
+            _quote_row("2026-03-31 09:19:57", 10.0, 600, 400),
+            _quote_row("2026-03-31 09:20:00", 10.0, 600, 400),
+            _quote_row("2026-03-31 09:23:00", 10.1, 600, 400),
+            _quote_row("2026-03-31 09:24:00", 10.1, 600, 400),
+            _quote_row("2026-03-31 09:24:30", 10.1, 600, 400),
+            _quote_row("2026-03-31 09:24:59", 10.2, 600, 400),
+        ],
+    )
+
+    row = calculate_daily_auction_factors(load_qmt_quote_frame(tick_path), "000001.SZ")
+
+    assert row["auction_last60s_price_return"] == pytest.approx(10.2 / 10.1 - 1.0)
+    assert row["auction_snapshot_count_total"] == 3
+    assert row["snapshot_count_stage2"] == 2
+    assert row["auction_stage2_up_step_ratio"] == 1.0
 
 
 def test_previous_close_prefers_daily_reference_and_uses_stable_quote_fallback() -> None:
@@ -2310,3 +2590,152 @@ def test_existing_session_path_range_skips_minute_read(tmp_path) -> None:
     )
     assert output_path == output_root / "000001.SZ.parquet"
     assert row_count == 0
+
+
+def test_load_quote_frame_restores_stage2_anchor_for_inactive_symbols(tmp_path: Path) -> None:
+    raw_dir = tmp_path / "2026" / "202603" / "20260331" / "159837.SZ"
+    raw_dir.mkdir(parents=True)
+    quote_path = raw_dir / "行情.csv"
+    pd.DataFrame(
+        [
+            _raw_quote(91500000, 5130),
+            _raw_quote(91724000, 5130),
+            _raw_quote(92457000, 5120),
+            _raw_quote(92500000, 5110),
+        ]
+    ).to_csv(quote_path, index=False, encoding="gbk")
+
+    quotes = load_quote_frame(raw_dir)
+    assert pd.Timestamp("2026-03-31 09:20:00") in quotes["trade_time"].values
+    anchor_row = quotes.loc[quotes["trade_time"].eq(pd.Timestamp("2026-03-31 09:20:00"))].iloc[0]
+    assert anchor_row["_qmt_state_anchor"] is True or anchor_row["_qmt_state_anchor"] == 1
+    assert anchor_row["ask_price1"] == pytest.approx(0.513)
+    assert anchor_row["bid_price1"] == pytest.approx(0.513)
+
+    row = calculate_daily_auction_factors(quotes, "159837.SZ")
+    assert row["auction_stage2_twap_coverage_ratio"] == 1.0
+    assert row["auction_stage2_twap_price"] == pytest.approx(0.51299, rel=1e-4)
+    assert row["auction_return_stage2"] == pytest.approx(0.512 / 0.513 - 1.0, rel=1e-4)
+    assert row["snapshot_count_stage1"] == 1
+    assert row["snapshot_count_stage2"] == 1
+
+
+def test_ensure_stage2_quote_anchor_idempotent_and_respects_empty_stage2() -> None:
+    df_with_0920 = pd.DataFrame(
+        [
+            {"trade_time": pd.Timestamp("2026-03-31 09:15:00"), "ask_price1": 10.0, "bid_price1": 10.0},
+            {"trade_time": pd.Timestamp("2026-03-31 09:20:00"), "ask_price1": 10.0, "bid_price1": 10.0},
+            {"trade_time": pd.Timestamp("2026-03-31 09:24:59"), "ask_price1": 10.1, "bid_price1": 10.1},
+        ]
+    )
+    result = ensure_stage2_quote_anchor(df_with_0920)
+    assert len(result) == 3
+    assert "_qmt_state_anchor" not in result.columns
+
+    df_no_stage2 = pd.DataFrame(
+        [
+            {"trade_time": pd.Timestamp("2026-03-31 09:15:00"), "ask_price1": 10.0, "bid_price1": 10.0},
+            {"trade_time": pd.Timestamp("2026-03-31 09:18:00"), "ask_price1": 10.0, "bid_price1": 10.0},
+        ]
+    )
+    result_no_stage2 = ensure_stage2_quote_anchor(df_no_stage2)
+    assert len(result_no_stage2) == 2
+
+    df_invalid_stage1 = pd.DataFrame(
+        [
+            {"trade_time": pd.Timestamp("2026-03-31 09:15:00"), "ask_price1": 0.0, "bid_price1": 0.0},
+            {"trade_time": pd.Timestamp("2026-03-31 09:24:59"), "ask_price1": 10.1, "bid_price1": 10.1},
+        ]
+    )
+    result_invalid = ensure_stage2_quote_anchor(df_invalid_stage1)
+    assert len(result_invalid) == 2
+
+
+def test_filter_quote_heartbeats_filters_consecutive_unchanged_snapshots() -> None:
+    df = pd.DataFrame(
+        [
+            # 09:15:00 - Initial quote
+            {"trade_time": pd.Timestamp("2026-03-31 09:15:00"), "ask_price1": 10.0, "bid_price1": 10.0, "ask_qty1": 100, "bid_qty1": 100, "trade_volume": 0.0, "trade_amount": 0.0, "open_price": np.nan, "previous_close": 10.0},
+            # 09:15:03 - Same state, no trade -> heartbeat
+            {"trade_time": pd.Timestamp("2026-03-31 09:15:03"), "ask_price1": 10.0, "bid_price1": 10.0, "ask_qty1": 100, "bid_qty1": 100, "trade_volume": 0.0, "trade_amount": 0.0, "open_price": np.nan, "previous_close": 10.0},
+            # 09:15:06 - Same state, no trade -> heartbeat
+            {"trade_time": pd.Timestamp("2026-03-31 09:15:06"), "ask_price1": 10.0, "bid_price1": 10.0, "ask_qty1": 100, "bid_qty1": 100, "trade_volume": 0.0, "trade_amount": 0.0, "open_price": np.nan, "previous_close": 10.0},
+            # 09:16:00 - Price changed -> keep
+            {"trade_time": pd.Timestamp("2026-03-31 09:16:00"), "ask_price1": 10.1, "bid_price1": 10.1, "ask_qty1": 100, "bid_qty1": 100, "trade_volume": 0.0, "trade_amount": 0.0, "open_price": np.nan, "previous_close": 10.0},
+            # 09:16:03 - Same prices, but volume > 0 -> trade occurred -> keep
+            {"trade_time": pd.Timestamp("2026-03-31 09:16:03"), "ask_price1": 10.1, "bid_price1": 10.1, "ask_qty1": 100, "bid_qty1": 100, "trade_volume": 50.0, "trade_amount": 505.0, "open_price": np.nan, "previous_close": 10.0},
+            # 09:16:06 - Same state, no trade -> heartbeat
+            {"trade_time": pd.Timestamp("2026-03-31 09:16:06"), "ask_price1": 10.1, "bid_price1": 10.1, "ask_qty1": 100, "bid_qty1": 100, "trade_volume": 0.0, "trade_amount": 0.0, "open_price": np.nan, "previous_close": 10.0},
+        ]
+    )
+    filtered = filter_quote_heartbeats(df)
+    assert len(filtered) == 3
+    assert filtered["trade_time"].tolist() == [
+        pd.Timestamp("2026-03-31 09:15:00"),
+        pd.Timestamp("2026-03-31 09:16:00"),
+        pd.Timestamp("2026-03-31 09:16:03"),
+    ]
+
+
+def test_load_quote_frame_filters_heartbeats_and_restores_anchor(tmp_path: Path) -> None:
+    raw_dir = tmp_path / "2026" / "202603" / "20260331" / "000001.SZ"
+    raw_dir.mkdir(parents=True)
+    quote_path = raw_dir / "行情.csv"
+    pd.DataFrame(
+        [
+            _raw_quote(91500000, 100000),
+            _raw_quote(91503000, 100000),  # heartbeat
+            _raw_quote(91724000, 100000),  # heartbeat
+            _raw_quote(92457000, 101000),  # stage 2 quote update
+            _raw_quote(92458000, 101000),  # heartbeat
+        ]
+    ).to_csv(quote_path, index=False, encoding="gbk")
+
+    quotes = load_quote_frame(raw_dir)
+    assert pd.Timestamp("2026-03-31 09:20:00") in quotes["trade_time"].values
+    assert len(quotes) == 3  # 09:15:00, 09:20:00 (anchor), 09:24:57
+
+    row = calculate_daily_auction_factors(quotes, "000001.SZ")
+    assert row["snapshot_count_stage1"] == 1
+    assert row["snapshot_count_stage2"] == 1
+    assert row["auction_stage2_twap_coverage_ratio"] == 1.0
+
+
+def test_resolve_data_source_auto_and_explicit() -> None:
+    # Auto resolution based on path
+    assert resolve_data_source(Path(r"E:\逐笔数据\2026\202609\20260924\159837.SZ")) == "wind"
+    assert resolve_data_source(Path(r"D:\workspace\stock-miniqmt\outputs\auction_factor_input_test\2026\202609\20260924\159837.SZ")) == "clickhouse"
+    assert resolve_data_source(Path(r"D:\workspace\stockdata\etf-data\etf_tick_qmt\159837.SZ.parquet")) == "qmt"
+
+    # Explicit override
+    assert resolve_data_source(Path(r"E:\逐笔数据\test"), explicit_source="clickhouse") == "clickhouse"
+    assert resolve_data_source(Path(r"custom/path"), explicit_source="wind") == "wind"
+    assert resolve_data_source(Path(r"custom/path"), explicit_source="qmt") == "qmt"
+
+
+def test_load_auction_quotes_unified_loader(tmp_path: Path) -> None:
+    # 1. Level-2 directory format
+    raw_dir = tmp_path / "2026" / "202603" / "20260331" / "000001.SZ"
+    raw_dir.mkdir(parents=True)
+    pd.DataFrame([_raw_quote(91500000, 100000), _raw_quote(92500000, 100000)]).to_csv(
+        raw_dir / "行情.csv", index=False, encoding="gbk"
+    )
+    quotes_ch = load_auction_quotes(raw_dir, data_source="clickhouse")
+    assert not quotes_ch.empty
+    assert "trade_time" in quotes_ch.columns
+
+    quotes_wind = load_auction_quotes(raw_dir, data_source="wind")
+    assert not quotes_wind.empty
+
+    # 2. QMT parquet format
+    tick_path = tmp_path / "000001.SZ.parquet"
+    _write_qmt_auction_quotes(
+        tick_path,
+        [
+            _quote_row("2026-03-31 09:15:00", 10.0, 600, 400),
+            _quote_row("2026-03-31 09:20:00", 10.0, 600, 400),
+        ],
+    )
+    quotes_qmt = load_auction_quotes(tick_path, data_source="qmt")
+    assert not quotes_qmt.empty
+    assert "_qmt_state_anchor" in quotes_qmt.columns

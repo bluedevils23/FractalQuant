@@ -1,0 +1,199 @@
+{
+  "model_path": "D:\\workspace\\stock-miniqmt\\models\\auction_16_lgbm_recent_150_30_next_close\\model.txt",
+  "model_sha256": "A22042778363E0CAF21C1AF1DE817106F5EA75F499FFE86C85E02FCABEA89AC0",
+  "model_trees": 75,
+  "features": [
+    "auction_stage2_mid_mean_return",
+    "auction_open_to_prev_high",
+    "auction_last60s_price_return",
+    "auction_final_vs_stage2_twap",
+    "auction_open_to_prev7d_close_max",
+    "auction_stage2_up_step_ratio",
+    "auction_unmatched_imbalance",
+    "auction_l3_buy_share_final",
+    "auction_l3_buy_share_change_stage2",
+    "auction_imbalance_relative_change_stage2",
+    "auction_stage_reversal_strength_bps",
+    "auction_l3_imbalance_twap_stage2",
+    "auction_stage2_range_ratio",
+    "auction_commitment_shift",
+    "auction_range_ratio",
+    "auction_stage2_range_ratio_mean_20d"
+  ],
+  "factor_roots": {
+    "ordinary": "D:\\workspace\\stockdata\\etf-factors\\etf_auction_factors",
+    "qmt": "D:\\workspace\\stockdata\\etf-factors\\etf_auction_factors_qmt"
+  },
+  "common_symbol_files": 1267,
+  "common_rows": 68060,
+  "common_dates": 54,
+  "date_from": "2026-07-13",
+  "date_to": "2026-09-24",
+  "liquidity_policy": "Each source's persisted previous_20d_average_daily_amount > 5000000 CNY; missing/nonfinite amounts excluded",
+  "nan_policy": "LightGBM native NaNs, not complete-case filtering except explicit finite16 sensitivity scope",
+  "candidate_policy": "Same code/date output intersection as previous comparison; only add liquidity filter, no live eligibility/order simulation",
+  "tie_break": "score descending, ts_code ascending",
+  "threshold_equal_rows_o": 0,
+  "threshold_equal_rows_q": 0,
+  "liquidity_pass_o": 49684,
+  "liquidity_pass_q": 49684,
+  "liquidity_mismatch_rows": 0,
+  "scopes": {
+    "unfiltered": {
+      "days": 54,
+      "ordinary_candidates_mean": 1260.3703703703704,
+      "qmt_candidates_mean": 1260.3703703703704,
+      "ordinary_candidates_min": 1183,
+      "qmt_candidates_min": 1183,
+      "rank_spearman_mean": 0.9841456388805794,
+      "rank_spearman_min": 0.922921820997647,
+      "top5": {
+        "days": 54,
+        "mean_overlap": 4.018518518518518,
+        "mean_overlap_rate": 0.8037037037037034,
+        "median_overlap": 4.0,
+        "min_overlap": 1,
+        "max_overlap": 5,
+        "identical_set_days": 18,
+        "identical_order_days": 9
+      },
+      "top10": {
+        "days": 54,
+        "mean_overlap": 8.25925925925926,
+        "mean_overlap_rate": 0.8259259259259258,
+        "median_overlap": 9.0,
+        "min_overlap": 3,
+        "max_overlap": 10,
+        "identical_set_days": 5,
+        "identical_order_days": 1
+      },
+      "top100": {
+        "days": 54,
+        "mean_overlap": 91.35185185185185,
+        "mean_overlap_rate": 0.9135185185185185,
+        "median_overlap": 93.0,
+        "min_overlap": 59,
+        "max_overlap": 98,
+        "identical_set_days": 0,
+        "identical_order_days": 0
+      }
+    },
+    "source_liquidity": {
+      "days": 54,
+      "ordinary_candidates_mean": 920.074074074074,
+      "qmt_candidates_mean": 920.074074074074,
+      "ordinary_candidates_min": 833,
+      "qmt_candidates_min": 833,
+      "rank_spearman_mean": 0.9834913520634099,
+      "rank_spearman_min": 0.8889691275420998,
+      "top5": {
+        "days": 54,
+        "mean_overlap": 4.0,
+        "mean_overlap_rate": 0.7999999999999998,
+        "median_overlap": 4.0,
+        "min_overlap": 1,
+        "max_overlap": 5,
+        "identical_set_days": 15,
+        "identical_order_days": 9
+      },
+      "top10": {
+        "days": 54,
+        "mean_overlap": 8.462962962962964,
+        "mean_overlap_rate": 0.8462962962962961,
+        "median_overlap": 9.0,
+        "min_overlap": 3,
+        "max_overlap": 10,
+        "identical_set_days": 6,
+        "identical_order_days": 2
+      },
+      "top100": {
+        "days": 54,
+        "mean_overlap": 91.81481481481481,
+        "mean_overlap_rate": 0.9181481481481482,
+        "median_overlap": 94.0,
+        "min_overlap": 61,
+        "max_overlap": 97,
+        "identical_set_days": 0,
+        "identical_order_days": 0
+      }
+    },
+    "both_liquidity": {
+      "days": 54,
+      "ordinary_candidates_mean": 920.074074074074,
+      "qmt_candidates_mean": 920.074074074074,
+      "ordinary_candidates_min": 833,
+      "qmt_candidates_min": 833,
+      "rank_spearman_mean": 0.9834913520634099,
+      "rank_spearman_min": 0.8889691275420998,
+      "top5": {
+        "days": 54,
+        "mean_overlap": 4.0,
+        "mean_overlap_rate": 0.7999999999999998,
+        "median_overlap": 4.0,
+        "min_overlap": 1,
+        "max_overlap": 5,
+        "identical_set_days": 15,
+        "identical_order_days": 9
+      },
+      "top10": {
+        "days": 54,
+        "mean_overlap": 8.462962962962964,
+        "mean_overlap_rate": 0.8462962962962961,
+        "median_overlap": 9.0,
+        "min_overlap": 3,
+        "max_overlap": 10,
+        "identical_set_days": 6,
+        "identical_order_days": 2
+      },
+      "top100": {
+        "days": 54,
+        "mean_overlap": 91.81481481481481,
+        "mean_overlap_rate": 0.9181481481481482,
+        "median_overlap": 94.0,
+        "min_overlap": 61,
+        "max_overlap": 97,
+        "identical_set_days": 0,
+        "identical_order_days": 0
+      }
+    },
+    "both_liquidity_finite16": {
+      "days": 54,
+      "ordinary_candidates_mean": 403.3333333333333,
+      "qmt_candidates_mean": 403.3333333333333,
+      "ordinary_candidates_min": 0,
+      "qmt_candidates_min": 0,
+      "rank_spearman_mean": 0.9929048614065259,
+      "rank_spearman_min": 0.8664546411730392,
+      "top5": {
+        "days": 50,
+        "mean_overlap": 4.52,
+        "mean_overlap_rate": 0.904,
+        "median_overlap": 5.0,
+        "min_overlap": 3,
+        "max_overlap": 5,
+        "identical_set_days": 29,
+        "identical_order_days": 16
+      },
+      "top10": {
+        "days": 50,
+        "mean_overlap": 9.12,
+        "mean_overlap_rate": 0.912,
+        "median_overlap": 9.0,
+        "min_overlap": 7,
+        "max_overlap": 10,
+        "identical_set_days": 19,
+        "identical_order_days": 6
+      },
+      "top100": {
+        "days": 50,
+        "mean_overlap": 97.08,
+        "mean_overlap_rate": 0.9708000000000001,
+        "median_overlap": 98.0,
+        "min_overlap": 84,
+        "max_overlap": 100,
+        "identical_set_days": 3,
+        "identical_order_days": 0
+      }
+    }
+  }
+}

@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
+import numpy as np
 import pandas as pd
 
 
@@ -211,6 +212,147 @@ def _normalize_transactions(frame: pd.DataFrame) -> pd.DataFrame:
     return frame
 
 
+def resolve_data_source(
+    symbol_path: Path | str | None = None,
+    explicit_source: str = "auto",
+) -> str:
+    """Resolve data source type among 'clickhouse', 'wind', 'qmt'."""
+    explicit = (explicit_source or "auto").strip().lower()
+    if explicit in ("clickhouse", "wind", "qmt"):
+        return explicit
+    if explicit in ("e_drive", "l2_filtered", "edrive"):
+        return "wind"
+    if explicit in ("l2_raw", "ch", "miniqmt"):
+        return "clickhouse"
+
+    if symbol_path is not None:
+        p_str = str(symbol_path).replace("\\", "/").lower()
+        if "etf_tick_qmt" in p_str or p_str.endswith(".parquet"):
+            return "qmt"
+        if p_str.startswith("e:/") or "逐笔数据" in p_str or "wind" in p_str:
+            return "wind"
+        if "clickhouse" in p_str or "miniqmt" in p_str or "outputs" in p_str:
+            return "clickhouse"
+
+    return "clickhouse"
+
+
+def filter_quote_heartbeats(
+    frame: pd.DataFrame,
+    *,
+    data_source: str = "auto",
+    symbol_path: Path | None = None,
+) -> pd.DataFrame:
+    """Filter heartbeat snapshots based on specific data source format.
+
+    Supported data sources:
+    - 'clickhouse': Raw Level-2 snapshots with dense 3s (09:15-09:25) and
+      60s (09:25-09:30) heartbeat snapshots. Filter consecutive unchanged
+      states where volume/turnover deltas are 0 across all auction phases.
+    - 'wind': Vendor Level-2 snapshots where 09:15-09:25 heartbeats were
+      pre-filtered upstream, but 09:25-09:30 silent-period heartbeats remain.
+      Filter consecutive unchanged snapshots during 09:25-09:30 and any
+      auction duplicates, preparing the stream for 09:20 anchor restoration.
+    - 'qmt': QMT 5-level tick snapshots. Skipped if already processed by
+      load_qmt_quote_frame (checked via `_qmt_state_anchor`), or delegates
+      to QMT cumulative volume/amount heartbeat filtering.
+    """
+    if frame.empty or "_qmt_state_anchor" in frame.columns:
+        return frame
+
+    source = resolve_data_source(symbol_path, data_source)
+
+    ordered = (
+        frame.sort_values("trade_time", kind="mergesort")
+        .drop_duplicates("trade_time", keep="last")
+        .reset_index(drop=True)
+    )
+    if ordered.empty:
+        return ordered
+
+    day_key = (
+        ordered["trade_date"]
+        if "trade_date" in ordered.columns
+        else ordered["trade_time"].dt.normalize()
+    )
+
+    state_columns = [
+        "open_price",
+        "previous_close",
+        *[f"ask_price{level}" for level in range(1, 4)],
+        *[f"ask_qty{level}" for level in range(1, 4)],
+        *[f"bid_price{level}" for level in range(1, 4)],
+        *[f"bid_qty{level}" for level in range(1, 4)],
+    ]
+    avail_cols = [c for c in state_columns if c in ordered.columns]
+    previous = ordered[avail_cols].groupby(day_key, sort=False).shift(1)
+    same_state = (
+        ordered[avail_cols].eq(previous)
+        | (ordered[avail_cols].isna() & previous.isna())
+    ).all(axis=1)
+
+    vol = pd.to_numeric(ordered.get("trade_volume", 0), errors="coerce").fillna(0)
+    amt = pd.to_numeric(ordered.get("trade_amount", 0), errors="coerce").fillna(0)
+    prev_vol = vol.groupby(day_key, sort=False).shift(1)
+    prev_amt = amt.groupby(day_key, sort=False).shift(1)
+    no_trade = (vol.le(0) & amt.le(0)) | (vol.eq(prev_vol) & amt.eq(prev_amt))
+
+    first_row = ordered.groupby(day_key, sort=False).cumcount().eq(0)
+    heartbeat = same_state & no_trade & ~first_row
+    keep = ~heartbeat
+    return ordered.loc[keep].reset_index(drop=True)
+
+
+def ensure_stage2_quote_anchor(quotes: pd.DataFrame) -> pd.DataFrame:
+    """Ensure stage 2 (09:20:00) has an initial state anchor if stage 1 has valid quotes.
+
+    Carries forward the latest valid stage 1 quote (ask_price1 > 0 and bid_price1 > 0)
+    as a zero-order hold state anchor at 09:20:00 tagged with ``_qmt_state_anchor = True``.
+    This preserves the 09:20:00 baseline and stage 2 duration for TWAP and return
+    calculations without inflating event / snapshot counts.
+    """
+    if quotes.empty or "trade_time" not in quotes.columns:
+        return quotes
+
+    first_time = quotes["trade_time"].iloc[0]
+    if pd.isna(first_time):
+        return quotes
+    trade_day = pd.Timestamp(first_time).normalize()
+    split_time = trade_day + pd.Timedelta(hours=9, minutes=20)
+
+    # An exact 09:20:00 snapshot already exists
+    if quotes["trade_time"].eq(split_time).any():
+        return quotes
+
+    stage1 = quotes.loc[quotes["trade_time"].lt(split_time)]
+    if stage1.empty:
+        return quotes
+
+    valid_mask = stage1["ask_price1"].gt(0) & stage1["bid_price1"].gt(0)
+    valid_stage1 = stage1.loc[valid_mask]
+    if valid_stage1.empty:
+        return quotes
+    stage2 = quotes.loc[quotes["trade_time"].ge(split_time)]
+    if stage2.empty or stage2["trade_time"].iloc[0] <= split_time:
+        return quotes
+
+    last_valid = valid_stage1.iloc[-1]
+    anchor = last_valid.to_dict()
+    anchor["trade_time"] = split_time
+    anchor["_qmt_state_anchor"] = True
+    anchor["trade_volume"] = 0.0
+    anchor["trade_amount"] = 0.0
+    anchor["open_price"] = np.nan
+    if "trade_price" in anchor:
+        anchor["trade_price"] = np.nan
+    if "raw_time" in anchor:
+        anchor["raw_time"] = "092000000"
+
+    augmented = pd.concat([quotes, pd.DataFrame([anchor])], ignore_index=True)
+    augmented["_qmt_state_anchor"] = augmented["_qmt_state_anchor"].eq(True)
+    return augmented.sort_values("trade_time", kind="mergesort").reset_index(drop=True)
+
+
 @dataclass
 class CacheStats:
     hits: int = 0
@@ -299,8 +441,10 @@ class AuctionTickCache:
         self.stats.rebuilds += 1
         return frame
 
-    def load_quote(self, symbol_dir: Path) -> pd.DataFrame:
-        return self._load(
+    def load_quote(
+        self, symbol_dir: Path, *, data_source: str = "auto"
+    ) -> pd.DataFrame:
+        frame = self._load(
             symbol_dir,
             "quote",
             "行情.csv",
@@ -309,6 +453,11 @@ class AuctionTickCache:
             "09:30",
             False,
             _normalize_quote,
+        )
+        return ensure_stage2_quote_anchor(
+            filter_quote_heartbeats(
+                frame, data_source=data_source, symbol_path=symbol_dir
+            )
         )
 
     def load_orders(self, symbol_dir: Path) -> pd.DataFrame:
