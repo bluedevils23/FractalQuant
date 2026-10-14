@@ -485,3 +485,159 @@ def test_cli_subset_preserves_nonempty_tgd(tmp_path: Path, monkeypatch) -> None:
     expected = expected.loc[expected["ts_code"].eq(symbols[0]), "kaiyuan_tgd_m20"].reset_index(drop=True)
     assert output["kaiyuan_tgd_m20"].notna().sum() == 6
     pd.testing.assert_series_equal(output["kaiyuan_tgd_m20"], expected)
+
+
+@pytest.mark.parametrize("damage", ["truncated", "wrong_grid", "missing_price"])
+def test_incomplete_day_cannot_publish_factors(damage: str) -> None:
+    source = _minute_frame(days=25)
+    last = source["trade_time"].dt.normalize().max()
+    last_day = source["trade_time"].dt.normalize().eq(last)
+    if damage == "truncated":
+        source = source.loc[~(last_day & source["trade_time"].dt.hour.ge(11))]
+    elif damage == "wrong_grid":
+        row = source.index[last_day][-2]
+        source.loc[row, "trade_time"] -= pd.Timedelta(seconds=30)
+    else:
+        source.loc[source.index[last_day][-2], "close"] = np.nan
+    raw = build_daily_raw_features(source, "510300.SH")
+    assert raw.iloc[-1][["daily_close", "daily_amplitude", "daily_amount"]].isna().all()
+    assert not raw.iloc[-1]["amount_available"]
+    assert pd.isna(raw.iloc[-1]["smart_money_vwap_gap_m10"])
+    assert pd.isna(raw.iloc[-1]["extreme_return_m20"])
+    assert pd.isna(raw.iloc[-1]["extreme_prior_return_m20"])
+    panel = build_open_source_factor_panel(raw)
+    assert panel.iloc[-1][list(OPEN_SOURCE_FACTOR_COLUMNS)].isna().all()
+
+
+@pytest.mark.parametrize("bad_amount", [np.nan, np.inf, -1.0])
+def test_partial_daily_amount_is_unknown(bad_amount: float) -> None:
+    source = _minute_frame(days=20)
+    source.loc[source.index[-2], "amount"] = bad_amount
+    raw = build_daily_raw_features(source, "510300.SH")
+    last = raw.iloc[-1]
+    assert not last["amount_available"]
+    assert pd.isna(last["daily_amount"])
+    assert pd.isna(last["ideal_turnover_raw"])
+    assert np.isfinite(last["_ideal_amplitude"])
+
+
+def test_real_zero_amount_and_optional_opening_bar_remain_valid() -> None:
+    source = _minute_frame(days=1)
+    source["amount"] = 0.0
+    for frame in (source, source.iloc[1:]):
+        raw = build_daily_raw_features(frame, "510300.SH")
+        assert raw.iloc[0]["amount_available"]
+        assert raw.iloc[0]["daily_amount"] == 0.0
+        assert np.isfinite(raw.iloc[0]["daily_close"])
+
+
+@pytest.mark.parametrize("event_position", [10, 20])
+def test_missing_event_amount_does_not_become_zero(event_position: int) -> None:
+    history = [_state_session(100.0 + i, 0.01) for i in range(20)]
+    current = _state_session(100.0, 0.01)
+    current.iloc[[10, 20, 21], current.columns.get_loc("volume")] = 1000.0
+    assert _state_daily_metrics(current, history)["volume_peak_ridge_amount_ratio_raw"] == pytest.approx(0.5)
+    current.iloc[event_position, current.columns.get_loc("amount")] = np.nan
+    assert np.isnan(_state_daily_metrics(current, history)["volume_peak_ridge_amount_ratio_raw"])
+    current.iloc[event_position, current.columns.get_loc("amount")] = 0.0
+    assert np.isfinite(_state_daily_metrics(current, history)["volume_peak_ridge_amount_ratio_raw"])
+
+
+def test_zero_follow_amount_is_a_real_observation() -> None:
+    history = [_state_session(100.0 + i, 0.01) for i in range(20)]
+    current = _state_session(100.0, 0.01)
+    current.iloc[[10, 20], current.columns.get_loc("volume")] = 1000.0
+    current.iloc[11, current.columns.get_loc("amount")] = 0.0
+    current.iloc[21, current.columns.get_loc("amount")] = 200.0
+    assert _state_daily_metrics(current, history)["volume_eruption_follow_ratio_raw"] == pytest.approx(1.0)
+    current.iloc[11, current.columns.get_loc("amount")] = np.nan
+    assert _state_daily_metrics(current, history)["volume_eruption_follow_ratio_raw"] == pytest.approx(2.0)
+
+
+def _cli_inputs(tmp_path: Path, monkeypatch) -> Path:
+    input_root, output_root = tmp_path / "input", tmp_path / "output"
+    input_root.mkdir()
+    for symbol in ("510300.SH", "510500.SH"):
+        _minute_frame(days=2, symbol=symbol).to_parquet(input_root / f"{symbol}.parquet")
+    monkeypatch.setattr(sys, "argv", ["generate_open_source_factors.py", "--input-root", str(input_root),
+                                     "--output-root", str(output_root), "--workers", "1"])
+    return output_root
+
+
+def test_output_outside_calculation_pool_fails_before_extraction(tmp_path: Path, monkeypatch) -> None:
+    output_root = _cli_inputs(tmp_path, monkeypatch)
+    pool = tmp_path / "pool.txt"
+    pool.write_text("510300.SH\n", encoding="utf-8")
+    sys.argv.extend(["--calculation-symbols-file", str(pool), "--symbols", "510500.SH"])
+    monkeypatch.setattr(generate_open_source_factors, "build_raw_panel", lambda *args: pytest.fail("extraction started"))
+    with pytest.raises(ValueError, match="outside calculation universe.*510500.SH"):
+        generate_open_source_factors.main()
+    assert not output_root.exists()
+
+
+def test_empty_output_date_range_is_not_success(tmp_path: Path, monkeypatch) -> None:
+    output_root = _cli_inputs(tmp_path, monkeypatch)
+    sys.argv.extend(["--date-from", "20260201"])
+    with pytest.raises(ValueError, match="No output rows"):
+        generate_open_source_factors.main()
+    assert not output_root.exists()
+
+
+@pytest.mark.parametrize("existing", [False, True])
+def test_staging_failure_preserves_batch_and_allows_retry(tmp_path: Path, monkeypatch, existing: bool) -> None:
+    output_root = _cli_inputs(tmp_path, monkeypatch)
+    if existing:
+        assert generate_open_source_factors.main() == 0
+        sys.argv.append("--overwrite")
+    before = {p.name: p.read_bytes() for p in output_root.glob("*")}
+    original = pd.DataFrame.to_parquet
+
+    def fail_second(frame, path, *args, **kwargs):
+        if Path(path).name == "510500.SH.parquet":
+            raise OSError("simulated write failure")
+        return original(frame, path, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(pd.DataFrame, "to_parquet", fail_second)
+        with pytest.raises(OSError, match="simulated write failure"):
+            generate_open_source_factors.main()
+    assert {p.name: p.read_bytes() for p in output_root.glob("*")} == before
+    assert generate_open_source_factors.main() == 0
+    assert len(list(output_root.glob("*.parquet"))) == 2
+    assert (output_root / "manifest.json").exists()
+
+
+def test_publish_failure_restores_existing_directory(tmp_path: Path, monkeypatch) -> None:
+    output_root = _cli_inputs(tmp_path, monkeypatch)
+    assert generate_open_source_factors.main() == 0
+    before = {p.name: p.read_bytes() for p in output_root.glob("*")}
+    sys.argv.append("--overwrite")
+    original = Path.rename
+
+    def fail_publish(path, target):
+        if path.name == "staging":
+            raise OSError("simulated publish failure")
+        return original(path, target)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "rename", fail_publish)
+        with pytest.raises(OSError, match="simulated publish failure"):
+            generate_open_source_factors.main()
+    assert {p.name: p.read_bytes() for p in output_root.glob("*")} == before
+    assert generate_open_source_factors.main() == 0
+
+
+def test_next_run_recovers_interrupted_directory_swap(tmp_path: Path, monkeypatch) -> None:
+    import json
+    output_root = _cli_inputs(tmp_path, monkeypatch)
+    assert generate_open_source_factors.main() == 0
+    before = {p.name: p.read_bytes() for p in output_root.glob("*")}
+    transaction = generate_open_source_factors._transaction_path(output_root)
+    transaction.mkdir()
+    (transaction / "owner.json").write_text(json.dumps(str(output_root.resolve())), encoding="utf-8")
+    output_root.rename(transaction / "backup")
+    (transaction / "staging").mkdir()
+    (transaction / "staging" / "510300.SH.parquet").write_bytes(b"partial batch")
+    assert generate_open_source_factors.main() == 0
+    assert {p.name: p.read_bytes() for p in output_root.glob("*")} == before
+    assert not transaction.exists()

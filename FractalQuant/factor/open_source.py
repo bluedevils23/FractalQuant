@@ -206,6 +206,23 @@ def _positive_frame(day: pd.DataFrame) -> pd.DataFrame:
     return work
 
 
+def _complete_session(session: pd.DataFrame) -> bool:
+    """Require the exact close-labelled minute grid and finite OHLCV."""
+    if len(session) != SESSION_BAR_COUNT:
+        return False
+    date = session.index[0].normalize()
+    expected = pd.date_range(date + pd.Timedelta(hours=9, minutes=31), periods=120, freq="min").append(
+        pd.date_range(date + pd.Timedelta(hours=13, minutes=1), periods=120, freq="min")
+    )
+    values = session[["open", "high", "low", "close", "volume"]].to_numpy(dtype=float)
+    return bool(
+        session.index.equals(expected)
+        and np.isfinite(values).all()
+        and (values[:, :4] > 0).all()
+        and (values[:, 4] >= 0).all()
+    )
+
+
 def _daily_return_series(
     session: pd.DataFrame, previous_close: float | None = None
 ) -> pd.Series:
@@ -273,7 +290,7 @@ def _smart_money_gap_for_sessions(
         return np.nan, 0
     rows: list[pd.DataFrame] = []
     for session in sessions:
-        if len(session) != SESSION_BAR_COUNT:
+        if not _complete_session(session):
             continue
         adjustment = _daily_adjustment_factor(session)
         if not np.isfinite(adjustment):
@@ -346,9 +363,9 @@ def _history_zscore(
     *,
     minimum_history: int = STATE_HISTORY_WINDOW,
 ) -> np.ndarray:
-    if len(current) != SESSION_BAR_COUNT or len(history) < minimum_history:
+    if not _complete_session(current) or len(history) < minimum_history:
         return np.full(SESSION_BAR_COUNT, np.nan, dtype=float)
-    valid_history = [day for day in history[-minimum_history:] if len(day) == SESSION_BAR_COUNT]
+    valid_history = [day for day in history[-minimum_history:] if _complete_session(day)]
     if len(valid_history) < minimum_history:
         return np.full(SESSION_BAR_COUNT, np.nan, dtype=float)
     matrix = np.vstack(
@@ -414,7 +431,7 @@ def _state_daily_metrics(
         "price_ridge_interval_skew_raw": np.nan,
         "price_jump_amount_leadlag_corr_raw": np.nan,
     }
-    if len(current) != SESSION_BAR_COUNT:
+    if not _complete_session(current):
         return missing
     volume_z = _history_zscore(history, current, "volume")
     amplitude_z = _history_zscore(history, current, "_minute_amplitude")
@@ -441,9 +458,10 @@ def _state_daily_metrics(
 
     day_vwap = _weighted_vwap(np.isfinite(close))
     valley_vwap = _weighted_vwap(volume_valley)
-    amount_safe = np.where(np.isfinite(amount) & (amount > 0), amount, np.nan)
-    ridge_amount = np.nansum(np.where(volume_ridge, amount_safe, np.nan))
-    peak_amount = np.nansum(np.where(volume_peak, amount_safe, np.nan))
+    amount_safe = np.where(np.isfinite(amount) & (amount >= 0), amount, np.nan)
+    # Empty event sets sum to zero; missing amounts on actual events stay unknown.
+    ridge_amount = np.sum(amount_safe[volume_ridge])
+    peak_amount = np.sum(amount_safe[volume_peak])
     next_amount = _shift_with_session_boundary(amount_safe, -1)
     follow_events = eruption & np.isfinite(amount_safe) & np.isfinite(next_amount)
     eruption_amount = np.sum(amount_safe[follow_events])
@@ -564,6 +582,8 @@ def build_daily_raw_features(
         day = _positive_frame(raw_day)
         session = _regular_session_frame(day).copy()
         opening_bar = day.loc[day.index == pd.Timestamp(trade_date) + pd.Timedelta(hours=9, minutes=30)]
+        day = pd.concat([opening_bar, session]).sort_index()
+        complete = _complete_session(session)
         previous_close = float(opening_bar["close"].iloc[-1]) if not opening_bar.empty else None
         session["_minute_return"] = _daily_return_series(session, previous_close)
         session["adj_factor"] = adjustment_factor
@@ -573,35 +593,36 @@ def build_daily_raw_features(
         close = day["close"].dropna()
         daily_close = (
             float(close.iloc[-1]) * adjustment_factor
-            if not close.empty and np.isfinite(adjustment_factor)
+            if complete and not close.empty and np.isfinite(adjustment_factor)
             else np.nan
         )
         high = day["high"].max(skipna=True)
         low = day["low"].min(skipna=True)
         daily_amplitude = (
-            float(high / low - 1.0) if np.isfinite(high) and np.isfinite(low) and low > 0 else np.nan
+            float(high / low - 1.0) if complete and np.isfinite(high) and np.isfinite(low) and low > 0 else np.nan
+        )
+        amount_available = bool(
+            complete and "amount" in day and np.isfinite(day["amount"]).all()
         )
         daily_amount = (
-            float(day["amount"].sum(min_count=1)) if "amount" in day else np.nan
+            float(day["amount"].sum()) if amount_available else np.nan
         )
-        if len(session) == SESSION_BAR_COUNT:
+        if complete:
             session_returns = session["_minute_return"]
             gu, gd, avg_up, avg_down = _time_centers(session_returns)
             extreme_return, prior_return = _extreme_returns(session_returns)
             r1 = float(session_returns.iloc[:30].sum(min_count=1))
             r2 = float(session_returns.iloc[30:60].sum(min_count=1))
-            session_open_candidates = raw_day["open"].dropna()
+            session_open_candidates = day["open"].dropna()
             session_open = (
                 float(session_open_candidates.iloc[0]) * adjustment_factor
                 if not session_open_candidates.empty and np.isfinite(adjustment_factor)
                 else np.nan
             )
-            amount_available = bool("amount" in day and day["amount"].notna().any())
         else:
             gu = gd = avg_up = avg_down = np.nan
             extreme_return = prior_return = r1 = r2 = np.nan
             session_open = np.nan
-            amount_available = bool("amount" in day and day["amount"].notna().any())
         daily_records.append(
             {
                 "trade_date": pd.Timestamp(trade_date),
@@ -624,6 +645,7 @@ def build_daily_raw_features(
                 "_extreme_return_raw": extreme_return,
                 "_extreme_prior_return_raw": prior_return,
                 "valid_session_bars": int(len(session)),
+                "_session_complete": complete,
                 "amount_available": amount_available,
                 "_session_open": session_open,
             }
@@ -641,6 +663,9 @@ def build_daily_raw_features(
         result.groupby("ts_code", sort=False)["_extreme_prior_return_raw"]
         .transform(lambda series: series.rolling(factor_window, min_periods=extreme_min_periods).mean())
     )
+    result.loc[
+        ~result["_session_complete"], ["extreme_return_m20", "extreme_prior_return_m20"]
+    ] = np.nan
 
     ideal_amplitude = _rolling_cut_difference(
         result["daily_amplitude"], result["daily_close"], factor_window, 0.25
@@ -836,6 +861,8 @@ def build_open_source_factor_panel(
 
     source_level = frame.get("_source_level", "minute_ohlcv_proxy")
     frame["source_level"] = source_level
+    if "_session_complete" in frame:
+        frame.loc[~frame["_session_complete"], list(OPEN_SOURCE_FACTOR_COLUMNS)] = np.nan
     frame = frame.drop(
         columns=[
             column
@@ -846,6 +873,7 @@ def build_open_source_factor_panel(
                 "_extreme_prior_return_raw",
                 "_tgd_daily_residual",
                 "_source_level",
+                "_session_complete",
             )
             if column in frame.columns
         ]

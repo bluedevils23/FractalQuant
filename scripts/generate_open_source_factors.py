@@ -8,8 +8,10 @@ import json
 import logging
 import os
 import re
+import shutil
 import sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from contextlib import contextmanager
 from importlib.metadata import version
 from pathlib import Path
 
@@ -35,7 +37,7 @@ DEFAULT_OUTPUT_ROOT = Path(
     r"D:\workspace\stockdata\etf-factors\etf_open_source_factors"
 )
 SYMBOL_PATTERN = re.compile(r"^\d{6}\.[A-Z]{2}$")
-FACTOR_VERSION = "2"
+FACTOR_VERSION = "3"
 
 
 def normalize_symbol(value: str) -> str:
@@ -151,6 +153,58 @@ def _filter_dates(
     return result
 
 
+@contextmanager
+def _output_lock(output_root: Path):
+    """Serialize writers; OS locks are released even if the process is killed."""
+    output_root.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = output_root.with_name(f".{output_root.name}.open-source.lock")
+    with lock_path.open("a+b") as handle:
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() == 0:
+            handle.write(b"0")
+            handle.flush()
+        handle.seek(0)
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            yield
+        finally:
+            handle.seek(0)
+            if os.name == "nt":
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _transaction_path(output_root: Path) -> Path:
+    return output_root.with_name(f".{output_root.name}.open-source-transaction")
+
+
+def _recover_outputs(output_root: Path) -> None:
+    """Restore an interrupted directory swap, or clean up a completed one."""
+    transaction = _transaction_path(output_root)
+    if not transaction.exists():
+        return
+    # Validate ownership and resolved deletion/move targets before touching them.
+    marker = transaction / "owner.json"
+    if (
+        transaction.resolve() != transaction.absolute()
+        or not marker.is_file()
+        or json.loads(marker.read_text(encoding="utf-8")) != str(output_root.resolve())
+    ):
+        raise ValueError(f"Unrecognized output transaction: {transaction}")
+    backup = transaction / "backup"
+    if backup.resolve().parent != transaction.resolve():
+        raise ValueError(f"Invalid backup path: {backup}")
+    if backup.exists() and not output_root.exists():
+        backup.rename(output_root)
+    shutil.rmtree(transaction)
+
+
 def write_outputs(
     panel: pd.DataFrame,
     output_root: Path,
@@ -158,18 +212,45 @@ def write_outputs(
     date_from: str | None,
     date_to: str | None,
     overwrite: bool,
+    contract: dict,
+    output_symbols: set[str],
 ) -> list[Path]:
     selected = select_output_columns(_filter_dates(panel, date_from, date_to))
+    missing = output_symbols - set(selected["ts_code"])
+    if missing:
+        raise ValueError("No output rows in the requested date range for: " + ", ".join(sorted(missing)))
+    transaction = _transaction_path(output_root)
+    transaction.mkdir()
+    (transaction / "owner.json").write_text(json.dumps(str(output_root.resolve())), encoding="utf-8")
+    staging = transaction / "staging"
     written: list[Path] = []
-    for symbol, frame in selected.groupby("ts_code", sort=True):
-        output_path = output_root / f"{symbol}.parquet"
-        if output_path.exists() and not overwrite:
-            LOGGER.info("Skipping existing output: %s", output_path)
-            continue
-        output_root.mkdir(parents=True, exist_ok=True)
-        frame.to_parquet(output_path, index=False)
-        written.append(output_path)
-        LOGGER.info("Wrote %s rows to %s", len(frame), output_path)
+    try:
+        if output_root.exists():
+            shutil.copytree(output_root, staging)
+        else:
+            staging.mkdir()
+        for symbol, frame in selected.groupby("ts_code", sort=True):
+            output_path = output_root / f"{symbol}.parquet"
+            staged_path = staging / output_path.name
+            if output_path.exists() and not overwrite:
+                existing = pd.read_parquet(staged_path)
+                pd.testing.assert_frame_equal(existing, frame.reset_index(drop=True))
+                LOGGER.info("Skipping verified existing output: %s", output_path)
+                continue
+            frame = frame.reset_index(drop=True)
+            if frame.duplicated(["ts_code", "trade_date"]).any():
+                raise ValueError(f"Duplicate output keys: {symbol}")
+            frame.to_parquet(staged_path, index=False)
+            pd.testing.assert_frame_equal(pd.read_parquet(staged_path), frame)
+            written.append(output_path)
+        (staging / "manifest.json").write_text(
+            json.dumps(contract, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+        )
+        if output_root.exists():
+            output_root.rename(transaction / "backup")
+        staging.rename(output_root)
+    finally:
+        _recover_outputs(output_root)
     return written
 
 
@@ -202,6 +283,13 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     args = parse_args()
+    args.output_root = args.output_root.resolve()
+    with _output_lock(args.output_root):
+        _recover_outputs(args.output_root)
+        return _generate(args)
+
+
+def _generate(args: argparse.Namespace) -> int:
     date_from = normalize_trade_date(args.date_from)
     date_to = normalize_trade_date(args.date_to)
     if date_from and date_to and date_from > date_to:
@@ -220,6 +308,9 @@ def main() -> int:
     )
     files = discover_input_files(args.input_root, calculation_symbols)
     universe = [path.stem for path in files]
+    missing = output_symbols - set(universe)
+    if missing:
+        raise ValueError("Output symbols outside calculation universe: " + ", ".join(sorted(missing)))
     contract = {
         "factor_version": FACTOR_VERSION,
         "input_root": str(resolve_input_root(args.input_root).resolve()),
@@ -251,9 +342,9 @@ def main() -> int:
         date_from=date_from,
         date_to=date_to,
         overwrite=args.overwrite,
+        contract=contract,
+        output_symbols=output_symbols,
     )
-    if written:
-        manifest_path.write_text(json.dumps(contract, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     LOGGER.info("Completed: %s files written, %s failures", len(written), len(failures))
     return 1 if failures else 0
 
