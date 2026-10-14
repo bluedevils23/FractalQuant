@@ -13,6 +13,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -414,29 +415,42 @@ def load_etf_daily_histories(
 def load_etf_daily_states(
     state_path: Path,
     member_paths: dict[str, Path],
+    trade_calendars: dict[str, pd.DatetimeIndex] | None = None,
 ) -> dict[str, pd.DataFrame]:
     """Load precomputed previous-day states produced by generate_etf_daily_states."""
     if not state_path.exists():
         raise FileNotFoundError(f"ETF daily state parquet does not exist: {state_path}")
-    symbols = sorted(member_paths)
+    if "source_trade_date" not in pq.read_schema(state_path).names:
+        raise ValueError(
+            "Daily state file has no source_trade_date; rebuild with "
+            "generate_etf_daily_states.py --etf-root using the same ETF minute data"
+        )
+    symbols = sorted(set(member_paths) | {path.stem.upper() for path in member_paths.values()})
     raw = pd.read_parquet(
         state_path,
-        columns=["ts_code", "trade_date", *DAILY_STATE_COLUMNS],
+        columns=["ts_code", "trade_date", *DAILY_STATE_COLUMNS, "source_trade_date"],
         filters=[("ts_code", "in", symbols)],
     )
     required = ("ts_code", "trade_date", *DAILY_STATE_COLUMNS)
     missing = [column for column in required if column not in raw.columns]
     if missing:
         raise ValueError(f"ETF daily state frame is missing columns: {missing}")
-    raw["ts_code"] = raw["ts_code"].astype(str).str.strip().str.upper()
+    raw["ts_code"] = raw["ts_code"].map(normalize_fund_code)
     raw["trade_date"] = pd.to_datetime(raw["trade_date"], errors="coerce").dt.normalize()
+    raw["source_trade_date"] = pd.to_datetime(raw["source_trade_date"], errors="coerce").dt.normalize()
     for column in DAILY_STATE_COLUMNS:
         raw[column] = pd.to_numeric(raw[column], errors="coerce")
     histories: dict[str, pd.DataFrame] = {}
     for symbol in member_paths:
-        rows = raw.loc[raw["ts_code"].eq(symbol), ["trade_date", *DAILY_STATE_COLUMNS]]
+        rows = raw.loc[raw["ts_code"].eq(symbol), ["trade_date", *DAILY_STATE_COLUMNS, "source_trade_date"]].copy()
         rows = rows.dropna(subset=["trade_date"]).drop_duplicates("trade_date", keep="last")
-        histories[symbol] = rows.set_index("trade_date").sort_index()
+        calendar = (trade_calendars[symbol] if trade_calendars is not None else
+                    normalize_minute_frame(pd.read_parquet(member_paths[symbol])).index)
+        calendar = calendar.normalize().unique().sort_values()
+        previous = pd.Series(calendar, index=calendar).shift(1)
+        expected = rows["trade_date"].map(previous)
+        rows.loc[~rows["source_trade_date"].eq(expected), list(DAILY_STATE_COLUMNS)] = np.nan
+        histories[symbol] = rows.set_index("trade_date").loc[:, DAILY_STATE_COLUMNS].sort_index()
     return histories
 
 
@@ -477,6 +491,16 @@ def _log_return(close: pd.Series, periods: int = 1) -> pd.Series:
         lambda values: values.gt(0)
     )
     return np.log(valid_close).diff(periods)
+
+
+def trading_minute_grid(index: pd.DatetimeIndex) -> pd.DatetimeIndex:
+    """Retain missing trading bars, excluding the scheduled mainland lunch break."""
+    if index.empty:
+        return index
+    grid = pd.date_range(index.min(), index.max(), freq="min", name=index.name)
+    minute = grid.hour * 60 + grid.minute
+    grid = grid[(minute <= 11 * 60 + 30) | (minute >= 13 * 60 + 1)]
+    return grid.union(index).sort_values()
 
 
 def _simple_return(close: pd.Series, periods: int = 1) -> pd.Series:
@@ -608,7 +632,7 @@ def _calculate_day_relative_value_factors(
         )
         intraday_gap = etf_close.div(
             intraday_proxy.where(intraday_proxy.gt(0))
-        ).sub(1.0)
+        ).sub(1.0).where(etf_close.index >= base_time)
         result["etf_index_intraday_price_gap"] = intraday_gap
         result["etf_index_intraday_price_gap_zscore_60m"] = (
             _rolling_zscore(intraday_gap)
@@ -654,6 +678,10 @@ def calculate_related_etf_factor_frames(
         return results
 
     for day_frames in _group_frames_by_trade_day(member_frames).values():
+        day_frames = {
+            code: frame.reindex(trading_minute_grid(frame.index))
+            for code, frame in day_frames.items()
+        }
         return_panel = pd.concat(
             {
                 code: _simple_return(frame["close"])
@@ -755,8 +783,9 @@ def calculate_related_etf_factor_frames(
                 },
                 index=return_panel.index,
             )
-            results[fund_code].loc[frame.index, RELATED_ETF_FACTOR_COLUMNS] = (
-                related.reindex(frame.index)
+            output_index = results[fund_code].index.intersection(frame.index)
+            results[fund_code].loc[output_index, RELATED_ETF_FACTOR_COLUMNS] = (
+                related.reindex(output_index)
             )
     return {
         code: frame.replace([np.inf, -np.inf], np.nan)
@@ -781,7 +810,8 @@ def _day_cumulative_return(frame: pd.DataFrame) -> pd.Series:
     )
     if not open_price.notna().any():
         return pd.Series(np.nan, index=frame.index, dtype=float)
-    return close.div(open_price.dropna().iloc[0]).sub(1.0)
+    base_time = open_price.first_valid_index()
+    return close.div(open_price.loc[base_time]).sub(1.0).where(close.index >= base_time)
 
 
 def _calculate_day_factors(
@@ -818,8 +848,8 @@ def _calculate_day_factors(
     if valid.sum() < 50:
         return result
 
-    current_input = etf_day.loc[valid]
-    reference_input = aligned_reference.loc[valid]
+    current_input = etf_day.where(valid, axis=0)
+    reference_input = aligned_reference.where(valid, axis=0)
     for factor in build_crossmarket_factors():
         with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
             values = factor.calculate(current_input, reference_input)
@@ -862,11 +892,11 @@ def calculate_crossmarket_factor_frame(
         if reference_day.empty:
             continue
         result.loc[etf_day.index] = _calculate_day_factors(
-            etf_day,
+            etf_day.reindex(trading_minute_grid(etf_day.index)),
             reference_day,
-            daily_state_frame.reindex(etf_day.index),
+            daily_state_frame.reindex(trading_minute_grid(etf_day.index)),
             _previous_reference_close(reference_frame, trade_day),
-        )
+        ).reindex(etf_day.index)
     return result.replace([np.inf, -np.inf], np.nan)
 
 
@@ -904,7 +934,7 @@ def build_output_frame(
         ],
         axis=1,
     )
-    return result.replace([np.inf, -np.inf], np.nan)
+    return restrict_to_reference_minutes(result, reference_frame).replace([np.inf, -np.inf], np.nan)
 
 
 def restrict_to_reference_minutes(
@@ -918,14 +948,37 @@ def no_overlap_result(
     etf_path: Path,
     output_path: Path,
     overwrite: bool,
+    date_from: str | None = None,
+    date_to: str | None = None,
 ) -> dict[str, object]:
     if overwrite and output_path.exists():
-        output_path.unlink()
+        if date_from is None and date_to is None:
+            output_path.unlink()
+        else:
+            existing = pd.read_parquet(output_path)
+            selected = filter_date_range(existing, date_from, date_to).index
+            existing.drop(index=selected).to_parquet(output_path)
     return {
         "status": "no_overlap",
         "etf_code": etf_path.stem,
         "output_path": output_path,
     }
+
+
+def write_crossmarket_output(
+    result: pd.DataFrame,
+    output_path: Path,
+    date_from: str | None,
+    date_to: str | None,
+) -> None:
+    """Replace selected primary rows while preserving history and supplemental columns."""
+    if output_path.exists():
+        existing = pd.read_parquet(output_path)
+        extra = existing.columns.difference(result.columns)
+        result = result.join(existing.loc[:, extra], how="left")
+        outside = existing.drop(index=filter_date_range(existing, date_from, date_to).index)
+        result = pd.concat([outside, result]).sort_index()
+    result.to_parquet(output_path)
 
 
 def process_mapping_record(
@@ -960,12 +1013,11 @@ def process_mapping_record(
         etf_frame.index.min(),
         etf_frame.index.max(),
     )
-    etf_frame = restrict_to_reference_minutes(etf_frame, reference_frame)
-    if etf_frame.empty:
-        return no_overlap_result(etf_path, output_path, overwrite)
+    if etf_frame.index.intersection(reference_frame.index).empty:
+        return no_overlap_result(etf_path, output_path, overwrite, date_from, date_to)
     fund_code = normalize_fund_code(etf_path.name)
     if etf_daily_state_path is not None and etf_daily_state_path.exists():
-        state = load_etf_daily_states(etf_daily_state_path, {fund_code: etf_path})[
+        state = load_etf_daily_states(etf_daily_state_path, {fund_code: etf_path}, {fund_code: raw_etf_frame.index})[
             fund_code
         ]
         daily_state_frame = state.reindex(
@@ -994,7 +1046,7 @@ def process_mapping_record(
     )
 
     output_root.mkdir(parents=True, exist_ok=True)
-    result.to_parquet(output_path)
+    write_crossmarket_output(result, output_path, date_from, date_to)
     factor_values = result.loc[:, ALL_FACTOR_COLUMNS]
     return {
         "status": "written",
@@ -1065,13 +1117,9 @@ def process_mapping_group(
         max(frame.index.max() for frame in member_frames.values()),
     )
     member_frames = {
-        fund_code: restrict_to_reference_minutes(frame, reference_frame)
-        for fund_code, frame in member_frames.items()
-    }
-    member_frames = {
         fund_code: frame
         for fund_code, frame in member_frames.items()
-        if not frame.empty
+        if not frame.index.intersection(reference_frame.index).empty
     }
     if not member_frames:
         return results + [
@@ -1079,6 +1127,8 @@ def process_mapping_group(
                 member_paths[fund_code],
                 output_root / member_paths[fund_code].name,
                 overwrite,
+                date_from,
+                date_to,
             )
             for fund_code in writable_targets
         ]
@@ -1087,7 +1137,8 @@ def process_mapping_group(
         for fund_code in member_frames
     }
     if etf_daily_state_path is not None and etf_daily_state_path.exists():
-        daily_histories = load_etf_daily_states(etf_daily_state_path, state_members)
+        daily_histories = load_etf_daily_states(etf_daily_state_path, state_members,
+            {code: raw_member_frames[code].index for code in state_members})
         # Precomputed rows are keyed by the current trade date, so align directly.
         daily_state_frames = {
             fund_code: daily_histories[fund_code]
@@ -1115,7 +1166,7 @@ def process_mapping_group(
         if etf_frame is None:
             results.append(
                 no_overlap_result(
-                    member_paths[fund_code], output_path, overwrite
+                    member_paths[fund_code], output_path, overwrite, date_from, date_to
                 )
             )
             continue
@@ -1135,7 +1186,7 @@ def process_mapping_group(
             factor_frame,
             daily_state_frames[fund_code],
         )
-        result.to_parquet(output_path)
+        write_crossmarket_output(result, output_path, date_from, date_to)
         results.append(
             {
                 "status": "written",

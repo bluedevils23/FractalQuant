@@ -238,9 +238,9 @@ def _calculate_single_ofi_panel(
         own_ofi = ofi_panel[fund_code]
         own_weight = effective_weights[fund_code]
         own_weighted_ofi = weighted_ofi[fund_code]
-        peer_weight = total_weight.sub(own_weight, fill_value=np.nan)
+        peer_weight = total_weight.sub(own_weight.fillna(0))
         peer_weighted_ofi = total_weighted_ofi.sub(
-            own_weighted_ofi, fill_value=np.nan
+            own_weighted_ofi.fillna(0)
         )
         peer_count = dispersion_count.sub(valid_weight[fund_code].astype(int))
         market_ofi = peer_weighted_ofi.div(peer_weight.where(peer_weight.gt(0)))

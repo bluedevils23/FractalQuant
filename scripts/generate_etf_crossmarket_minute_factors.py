@@ -36,6 +36,7 @@ from scripts.generate_etf_crossmarket_factors import (  # noqa: E402
     normalize_fund_code,
     normalize_reference_frame,
     resolve_reference_path,
+    trading_minute_grid,
 )
 from scripts.generate_etf_minute_factors import normalize_minute_frame  # noqa: E402
 
@@ -212,16 +213,17 @@ def calculate_benchmark_factor_frame(
     for _, day_index in pd.Series(common_index, index=common_index).groupby(
         common_index.normalize(), sort=False
     ):
-        timestamps = pd.DatetimeIndex(day_index.to_numpy())
+        output_index = pd.DatetimeIndex(day_index.to_numpy())
+        timestamps = trading_minute_grid(output_index)
         etf_close = pd.to_numeric(
-            etf_frame.loc[timestamps, "close"], errors="coerce"
+            etf_frame["close"].reindex(timestamps), errors="coerce"
         )
         reference_close = pd.to_numeric(
-            reference_frame.loc[timestamps, "close"], errors="coerce"
+            reference_frame["close"].reindex(timestamps), errors="coerce"
         )
-        result.loc[timestamps] = _calculate_day_factors(
+        result.loc[output_index] = _calculate_day_factors(
             etf_close, reference_close
-        )
+        ).reindex(output_index)
     return result
 
 
@@ -307,11 +309,13 @@ def process_reference_group(
             etf_frame, reference_frame
         )
         output_path = crossmarket_files[fund_code]
+        existing = pd.read_parquet(output_path)
+        scope = pd.DataFrame(index=_timestamps_from_frame(existing))
         output = merge_factor_columns(
-            pd.read_parquet(output_path),
+            existing,
             factor_frame,
             overwrite,
-            update_index=etf_frame.index,
+            update_index=filter_date_range(scope, date_from, date_to).index,
         )
         output.to_parquet(output_path)
         results.append(
